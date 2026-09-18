@@ -84,6 +84,10 @@ private:
 
 	bool bootPending_ = false;
 
+#if PPSSPP_PLATFORM(SWITCH)
+	bool frameGenerationEnabled_ = false;
+#endif
+
 	std::string saveStatePrefix_;
 	double createdTime_ = 0.0;
 };

@@ -49,6 +49,9 @@ static constexpr BindingType g_bindingTypes[] = {
 
 VkPresentModeKHR ConfigPresentModeToVulkan(Draw::DrawContext *draw) {
 	g_frameTiming.ComputePresentMode(draw, false);
+#if PPSSPP_PLATFORM(SWITCH)
+	return VK_PRESENT_MODE_FIFO_KHR;
+#endif
 	Draw::PresentMode presentMode = g_frameTiming.PresentMode();
 	switch (presentMode) {
 	case Draw::PresentMode::IMMEDIATE:

@@ -37,6 +37,7 @@ bool MainThread_Ready() {
 }
 
 static void EmuThreadFunc(GraphicsContext *graphicsContext, Application *application, std::function<bool (GraphicsContext *)> frame) {
+	SetCurrentThreadAffinity(ThreadAffinityRole::EMULATION);
 	INFO_LOG(Log::G3D, "Entering separate emu thread");
 	SetCurrentThreadName("EmuThread");
 
@@ -103,6 +104,7 @@ void EmuThread_Join(GraphicsContext *graphicsContext, std::thread &emuThread) {
 }
 
 bool RunMainLoop(GraphicsContext *graphicsContext, Application *application, std::function<bool(GraphicsContext *)> frame) {
+	SetCurrentThreadAffinity(ThreadAffinityRole::EMULATION);
 	// This is the main loop for graphics context that handle their own threading.
 	// InitFromRenderThread/ShutdownFromRenderThread are not used.
 
@@ -134,6 +136,7 @@ bool MainThreadFunc(GraphicsContext *graphicsContext, Application *application, 
 		return false;
 	}
 	if (graphicsContext->NeedsSeparateEmuThread()) {
+		SetCurrentThreadAffinity(ThreadAffinityRole::RENDER);
 		SetCurrentThreadName("RenderThread");
 
 		g_inLoop = true;

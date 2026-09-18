@@ -131,6 +131,7 @@ namespace Reporting
 	}
 
 	static int CalculateCRCThread() {
+		SetCurrentThreadAffinity(ThreadAffinityRole::COMPUTE);
 		SetCurrentThreadName("ReportCRC");
 
 		AndroidJNIThreadContext jniContext;
@@ -542,6 +543,9 @@ namespace Reporting
 
 	bool IsSupported()
 	{
+#if PPSSPP_PLATFORM(SWITCH)
+		return false;
+#endif
 		// Disabled when using certain hacks, because they make for poor reports.
 		if (CheatsInEffect() || HLEPlugins::HasEnabled())
 			return false;

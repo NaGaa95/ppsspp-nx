@@ -221,7 +221,13 @@ void __VideocodecDoState(PointerWrap &p) {
 	// The Media Engine's memory and who holds what of it. Empty until a video plays, and then it
 	// is the one copy - the contexts above only carry addresses into it.
 	Do(p, g_meRam);
-	g_meAlloc.DoState(p);
+	if (g_meRam.empty()) {
+		if (p.mode == p.MODE_READ) {
+			g_meAlloc.Shutdown();
+		}
+	} else {
+		g_meAlloc.DoState(p);
+	}
 }
 
 u32 VideocodecFrameBufferLayout(int width, int height, int sizes[8], u32 offsets[8]) {

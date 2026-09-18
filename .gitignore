@@ -158,3 +158,6 @@ RAPrefs_PPSSPP.cfg
 cmake-build-*/
 
 /.vscode/
+
+/dist/PPSSPP.nro
+/dist/PPSSPP-build.txt

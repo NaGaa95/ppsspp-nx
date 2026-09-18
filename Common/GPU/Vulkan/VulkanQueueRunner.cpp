@@ -84,6 +84,11 @@ bool VulkanQueueRunner::InitBackbufferFramebuffers(int width, int height, FrameD
 	// We share the same depth buffer but have multiple color buffers, see the loop below.
 	VkImageView attachments[2] = { VK_NULL_HANDLE, depth_.view };
 
+	if (!GetCompatibleRenderPass()) {
+		ERROR_LOG(Log::G3D, "No compatible backbuffer render pass");
+		return false;
+	}
+
 	VkFramebufferCreateInfo fb_info = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
 	fb_info.renderPass = GetCompatibleRenderPass()->Get(vulkan_, RenderPassType::BACKBUFFER, VK_SAMPLE_COUNT_1_BIT);
 	fb_info.attachmentCount = 2;
@@ -99,6 +104,7 @@ bool VulkanQueueRunner::InitBackbufferFramebuffers(int width, int height, FrameD
 		res = vkCreateFramebuffer(vulkan_->GetDevice(), &fb_info, nullptr, &framebuffers_[i]);
 		_dbg_assert_(res == VK_SUCCESS);
 		if (res != VK_SUCCESS) {
+			ERROR_LOG(Log::G3D, "vkCreateFramebuffer failed: %s", VulkanResultToString(res));
 			framebuffers_.clear();
 			return false;
 		}
@@ -133,9 +139,15 @@ bool VulkanQueueRunner::InitDepthStencilBuffer(VkCommandBuffer cmd, VulkanBarrie
 	allocCreateInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
 
 	VkResult res = vmaCreateImage(vulkan_->Allocator(), &image_info, &allocCreateInfo, &depth_.image, &depth_.alloc, &allocInfo);
+	if (res != VK_SUCCESS) {
+		image_info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+		res = vmaCreateImage(vulkan_->Allocator(), &image_info, &allocCreateInfo, &depth_.image, &depth_.alloc, &allocInfo);
+	}
 	_dbg_assert_(res == VK_SUCCESS);
-	if (res != VK_SUCCESS)
+	if (res != VK_SUCCESS) {
+		ERROR_LOG(Log::G3D, "Backbuffer depth allocation failed: %s", VulkanResultToString(res));
 		return false;
+	}
 
 	vulkan_->SetDebugName(depth_.image, VK_OBJECT_TYPE_IMAGE, "BackbufferDepth");
 
@@ -170,8 +182,10 @@ bool VulkanQueueRunner::InitDepthStencilBuffer(VkCommandBuffer cmd, VulkanBarrie
 	res = vkCreateImageView(device, &depth_view_info, NULL, &depth_.view);
 	vulkan_->SetDebugName(depth_.view, VK_OBJECT_TYPE_IMAGE_VIEW, "depth_stencil_backbuffer");
 	_dbg_assert_(res == VK_SUCCESS);
-	if (res != VK_SUCCESS)
+	if (res != VK_SUCCESS) {
+		ERROR_LOG(Log::G3D, "Backbuffer depth view creation failed: %s", VulkanResultToString(res));
 		return false;
+	}
 
 	return true;
 }

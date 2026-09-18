@@ -93,4 +93,7 @@ private:
 	bool portrait_ = false;
 	Path aliasMatch_;
 	std::string aliasDisplay_;
+#if PPSSPP_PLATFORM(SWITCH)
+	uint64_t libraryGeneration_ = 0;
+#endif
 };

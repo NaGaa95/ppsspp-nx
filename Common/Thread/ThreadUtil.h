@@ -16,6 +16,22 @@ const char *GetCurrentThreadName();
 // exactly what it is is badly specified and not useful for anything.
 int GetCurrentThreadIdForDebug();
 
+enum class ThreadAffinityRole {
+	PROCESS,
+	EVENT,
+	EMULATION,
+	RENDER,
+	SHADER_COMPILER,
+	PRESENT,
+	AUDIO,
+	COMPUTE,
+	IO,
+	BACKGROUND,
+};
+
+void SetCurrentThreadAffinity(ThreadAffinityRole role);
+void SetCurrentThreadToProcessAffinity();
+
 typedef void (*AttachDetachFunc)();
 
 void RegisterAttachDetach(AttachDetachFunc attach, AttachDetachFunc detach);

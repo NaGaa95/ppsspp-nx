@@ -62,6 +62,7 @@ protected:
 	void dialogFinished(const Screen *dialog, DialogResult result) override;
 
 private:
+	void StartCheatDatabaseDownload();
 	void OnCheckBox(int index);
 	bool ImportCheats(const Path &cheatFile, int *cheatsFound);
 

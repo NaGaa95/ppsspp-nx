@@ -72,6 +72,7 @@
 #include "Common/StringUtils.h"
 #include "Core/Config.h"
 #include "Core/ConfigValues.h"
+#include "Core/ControlMapper.h"
 #include "Core/KeyMap.h"
 #include "Core/TiltEventProcessor.h"
 #include "Core/Instance.h"
@@ -83,6 +84,11 @@
 #include "Core/Util/PortManager.h"
 #include "GPU/Common/PostShader.h"
 #include "GPU/GPU.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "Common/GPU/Vulkan/SwitchLSFG.h"
+#include "SDL/SDLJoystick.h"
+#include "UI/SwitchUpdate.h"
+#endif
 
 #if PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(IOS)
 #include "Core/Util/DarwinFileSystemServices.h"
@@ -117,6 +123,11 @@ void SetMemStickDirDarwin(int requesterToken) {
 
 GameSettingsScreen::GameSettingsScreen(const Path &gamePath, std::string gameID, bool editThenRestore)
 	: UITabbedBaseDialogScreen(gamePath, &g_Config.iSettingsCurrentTab, TabDialogFlags::HorizontalOnlyIcons | TabDialogFlags::VerticalShowIcons), gameID_(gameID), editGameSpecificThenRestore_(editThenRestore) {
+#if PPSSPP_PLATFORM(SWITCH)
+	runningGPUBackend_ = g_Config.iGPUBackend;
+#else
+	runningGPUBackend_ = (int)GetGPUBackend();
+#endif
 	prevInflightFrames_ = g_Config.iInflightFrames;
 	analogSpeedMapped_ = KeyMap::InputMappingsFromPspButton(VIRTKEY_SPEED_ANALOG, nullptr, true);
 
@@ -160,6 +171,19 @@ GameSettingsScreen::~GameSettingsScreen() {
 void GameSettingsScreen::PreCreateViews() {
 	ReloadAllPostShaderInfo(screenManager()->getDrawContext());
 	ReloadAllThemeInfo();
+}
+
+void GameSettingsScreen::CreateExtraButtons(UI::ViewGroup *verticalLayout, int margins) {
+#if PPSSPP_PLATFORM(SWITCH)
+	if (gamePath_.empty() && gameID_.empty()) {
+		auto ms = GetI18NCategory(I18NCat::MAINSETTINGS);
+		UI::Choice *update = verticalLayout->Add(new UI::Choice(ms->T("Check for updates"), ImageID("I_DOWNLOAD"),
+			new UI::LinearLayoutParams(UI::FILL_PARENT, UI::WRAP_CONTENT, 0.0f, UI::Margins(0, 0, margins, margins))));
+		update->OnClick.Add([this](UI::EventParams &) {
+			screenManager()->push(new SwitchUpdateScreen());
+		});
+	}
+#endif
 }
 
 static bool UsingHardwareTextureScaling() {
@@ -279,7 +303,7 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 	Draw::DrawContext *draw = screenManager()->getDrawContext();
 
 #if !PPSSPP_PLATFORM(UWP)
-	static const char *renderingBackend[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan" };
+	static const char *renderingBackend[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan", "Zink" };
 	PopupMultiChoice *renderingBackendChoice = graphicsSettings->Add(new PopupMultiChoice(&g_Config.iGPUBackend, gr->T("Backend"), renderingBackend, (int)GPUBackend::OPENGL, ARRAY_SIZE(renderingBackend), I18NCat::GRAPHICS, screenManager()));
 	renderingBackendChoice->SetPreOpenCallback([this](UI::PopupMultiChoice *choice) {
 		// Don't filter until the last possible moment, since it involves trying to initialize Vulkan, if we were
@@ -293,11 +317,28 @@ void GameSettingsScreen::CreateGraphicsSettings(UI::ViewGroup *graphicsSettings)
 			choice->HideChoice((int)GPUBackend::DIRECT3D11);
 		if (!g_Config.IsBackendEnabled(GPUBackend::VULKAN))
 			choice->HideChoice((int)GPUBackend::VULKAN);
+		if (!g_Config.IsBackendEnabled(GPUBackend::ZINK))
+			choice->HideChoice((int)GPUBackend::ZINK);
 	});
 
 	if (!IsFirstInstance()) {
 		// If we're not the first instance, can't save the setting, and it requires a restart, so...
 		renderingBackendChoice->SetEnabled(false);
+	}
+#endif
+
+#if PPSSPP_PLATFORM(SWITCH)
+	if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN) {
+		CheckBox *frameGeneration = graphicsSettings->Add(new CheckBox(&g_Config.bSwitchFrameGeneration, gr->T("Frame Generation")));
+		frameGeneration->SetEnabledFunc([] {
+			return !PSP_IsInited() && SwitchLSFG_IsInstalled();
+		});
+		frameGeneration->OnClick.Add([this](UI::EventParams &) {
+			TriggerRestartOrDo([this]() {
+				g_Config.bSwitchFrameGeneration = !g_Config.bSwitchFrameGeneration;
+				RecreateViews();
+			});
+		});
 	}
 #endif
 
@@ -819,6 +860,16 @@ void GameSettingsScreen::CreateControlsSettings(UI::ViewGroup *controlsSettings)
 	}
 
 	controlsSettings->Add(new ItemHeader(co->T("Analog to digital mapping")));
+#if PPSSPP_PLATFORM(SWITCH)
+	CheckBox *rightStickFaceButtons = controlsSettings->Add(new CheckBox(&g_Config.bRightStickFaceButtons, co->T("Right stick controls face buttons")));
+	rightStickFaceButtons->OnClick.Add([](UI::EventParams &) {
+		if (joystick) {
+			joystick->releaseRightStickFaceButtons();
+		}
+		g_controlMapper.ReleaseAll();
+	});
+	controlsSettings->Add(new SettingHint(co->T("Up: Triangle, Down: Cross, Left: Square, Right: Circle"), rightStickFaceButtons));
+#endif
 	controlsSettings->Add(new PopupSliderChoiceFloat(&g_Config.fAnalogTriggerThreshold, 0.02f, 0.98f, 0.75f, co->T("Analog trigger threshold"), screenManager()));
 	controlsSettings->Add(new PopupSliderChoiceFloat(&g_Config.fAnalogStickThreshold, 0.2f, 0.98f, 0.75f, co->T("Analog stick threshold"), screenManager()));
 
@@ -979,12 +1030,14 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
 
 	networkingSettings->Add(new ItemHeader(ms->T("Networking")));
 
+#if !PPSSPP_PLATFORM(SWITCH)
 	Choice *quickstart = networkingSettings->Add(new Choice(n->T("Quick start guide for multiplayer"), ImageID("I_LINK_OUT")));
 	quickstart->OnClick.Add([](EventParams &e) {
 		auto n = GetI18NCategory(I18NCat::NETWORKING);
 		std::string url(n->T("MultiplayerQuickStartURL", "https://www.ppsspp.org/docs/multiplayer/quickstart/"));
 		System_LaunchUrl(LaunchUrlType::BROWSER_URL, url);
 	});
+#endif
 
 	networkingSettings->Add(new CheckBox(&g_Config.bEnableWlan, n->T("Enable networking", "Enable networking/wlan (beta)")));
 	networkingSettings->Add(new MacAddressChooser(GetRequesterToken(), gamePath_, &g_Config.sMACAddress, n->T("MAC address"), screenManager()));
@@ -1083,12 +1136,14 @@ void GameSettingsScreen::CreateNetworkingSettings(UI::ViewGroup *networkingSetti
 	}
 
 	networkingSettings->Add(new ItemHeader(n->T("Misc", "Misc (default = compatibility)")));
+#if !PPSSPP_PLATFORM(SWITCH)
 	Choice *wiki = networkingSettings->Add(new Choice(n->T("Open PPSSPP Multiplayer Wiki Page"), ImageID("I_LINK_OUT")));
 	wiki->OnClick.Add([](EventParams &e) {
 		auto n = GetI18NCategory(I18NCat::NETWORKING);
 		std::string url(n->T("MultiplayerHowToURL", "https://github.com/hrydgard/ppsspp/wiki/How-to-play-multiplayer-games-with-PPSSPP"));
 		System_LaunchUrl(LaunchUrlType::BROWSER_URL, url);
 	});
+#endif
 	static const char *wlanChannels[] = {"Auto", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"};
 	auto wlanChannelChoice = networkingSettings->Add(new PopupMultiChoice(&g_Config.iWlanAdhocChannel, n->T("WLAN Channel"), wlanChannels, 0, ARRAY_SIZE(wlanChannels), I18NCat::NETWORKING, screenManager()));
 	wlanChannelChoice->SetChoicesUntranslated(1, (int)ARRAY_SIZE(wlanChannels) - 1);
@@ -1356,6 +1411,7 @@ void GameSettingsScreen::CreateSystemSettings(UI::ViewGroup *systemSettings) {
 	UI::PopupSliderChoice *sizeChoice = systemSettings->Add(new PopupSliderChoice(&g_Config.iMemStickSizeGB, 1, 32, 16, sy->T("Memory Stick size", "Memory Stick size"), screenManager(), "GB"));
 	sizeChoice->SetFormat("%d GB");
 
+#if !PPSSPP_PLATFORM(SWITCH)
 	systemSettings->Add(new ItemHeader(sy->T("Help the PPSSPP team")));
 	if (!enableReportsSet_)
 		enableReports_ = Reporting::IsEnabled();
@@ -1364,6 +1420,7 @@ void GameSettingsScreen::CreateSystemSettings(UI::ViewGroup *systemSettings) {
 	enableReportsCheckbox = new CheckBox(&enableReports_, sy->T("Enable Compatibility Server Reports"));
 	enableReportsCheckbox->SetEnabledFunc([]() { return Reporting::IsSupported(); });
 	systemSettings->Add(enableReportsCheckbox);
+#endif
 
 	systemSettings->Add(new ItemHeader(sy->T("Emulation")));
 
@@ -1762,9 +1819,9 @@ void GameSettingsScreen::TriggerRestartOrDo(std::function<void()> callback) {
 
 void GameSettingsScreen::OnRenderingBackend(UI::EventParams &e) {
 	// It only makes sense to show the restart prompt if the backend was actually changed.
-	if (g_Config.iGPUBackend != (int)GetGPUBackend()) {
-		TriggerRestartOrDo([]() {
-			g_Config.iGPUBackend = (int)GetGPUBackend();
+	if (g_Config.iGPUBackend != runningGPUBackend_) {
+		TriggerRestartOrDo([this]() {
+			g_Config.iGPUBackend = runningGPUBackend_;
 		});
 	}
 }

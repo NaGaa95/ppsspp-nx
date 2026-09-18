@@ -37,6 +37,7 @@ enum InputDeviceID {
 	DEVICE_ID_XR_CONTROLLER_LEFT = 40,
 	DEVICE_ID_XR_CONTROLLER_RIGHT = 41,
 	DEVICE_ID_TOUCH = 42,
+	DEVICE_ID_SWITCH_RIGHT_STICK = 43,
 	DEVICE_ID_COUNT,
 };
 
@@ -254,7 +255,7 @@ public:
 		return -1;
 	}
 
-	int RemoveTouch(unsigned touch) {
+	int RemoveTouch(uint64_t touch) {
 		for (int touchIx = 0; touchIx < maxTouches; touchIx++) {
 			if (touches[touchIx].inUse && touches[touchIx].uid == touch) {
 				touches[touchIx].inUse = false;

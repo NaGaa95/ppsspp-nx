@@ -13,8 +13,18 @@
 
 #include "SDL/SDLUtil.h"
 
+#if PPSSPP_PLATFORM(SWITCH)
+#include <switch.h>
+#endif
+
 bool DetermineVulkanWindowSystem(SDL_Window *window, WindowDesc *desc, std::string *errorMessage) {
 	_dbg_assert_(window);
+#if PPSSPP_PLATFORM(SWITCH)
+	desc->winsys = WINDOWSYSTEM_SWITCH;
+	desc->data1 = nwindowGetDefault();
+	desc->data2 = nullptr;
+	return true;
+#endif
 	SDL_PropertiesID windowProps = SDL_GetWindowProperties(window);
 	void *x11Display = SDL_GetPointerProperty(windowProps, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, nullptr);
 	if (x11Display != nullptr) {

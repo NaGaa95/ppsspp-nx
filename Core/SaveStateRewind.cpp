@@ -89,6 +89,7 @@ void StateRingbuffer::ScheduleCompress(std::vector<u8> *result, const std::vecto
 	if (compressThread_.joinable())
 		compressThread_.join();
 	compressThread_ = std::thread([=] {
+		SetCurrentThreadAffinity(ThreadAffinityRole::COMPUTE);
 		SetCurrentThreadName("SaveStateCompress");
 
 		// Should do no I/O, so no JNI thread context needed.

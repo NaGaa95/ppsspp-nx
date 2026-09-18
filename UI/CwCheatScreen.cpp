@@ -26,6 +26,7 @@
 #include "Common/Net/HTTPClient.h"
 #include "Common/StringUtils.h"
 #include "Common/System/System.h"
+#include "Common/System/OSD.h"
 #include "Common/System/Request.h"
 #include "Common/UI/ScreenManager.h"
 #include "Core/System.h"
@@ -46,6 +47,7 @@
 static const int FILE_CHECK_FRAME_INTERVAL = 53;
 
 constexpr char g_cheatDBListUrl[] = "https://metadata.ppsspp.org/cheats.json";
+constexpr char g_defaultCheatDBUrl[] = "https://raw.githubusercontent.com/Saramagrean/CWCheat-Database-Plus-/master/cheat.db";
 
 static Path GetGlobalCheatFilePath() {
 	return GetSysDirectory(DIRECTORY_CHEATS) / "cheat.db";
@@ -216,6 +218,13 @@ void CwCheatScreen::dialogFinished(const Screen *dialog, DialogResult result) {
 	}
 }
 
+void CwCheatScreen::StartCheatDatabaseDownload() {
+	if (downloadRequest_)
+		return;
+	downloadRequest_ = g_DownloadManager.StartDownload(g_defaultCheatDBUrl, Path(),
+		http::RequestFlags::ProgressBar | http::RequestFlags::KeepInMemory, nullptr, "cheatdbdownload");
+}
+
 void CwCheatScreen::CreateSettingsViews(UI::ViewGroup *leftColumn) {
 	using namespace UI;
 	auto cw = GetI18NCategory(I18NCat::CWCHEATS);
@@ -226,7 +235,23 @@ void CwCheatScreen::CreateSettingsViews(UI::ViewGroup *leftColumn) {
 	leftColumn->Add(new ItemHeader(cw->T("Import Cheats")));
 
 	leftColumn->Add(new Choice(cw->T("Download cheat database")))->OnClick.Add([this](UI::EventParams &) {
+#if PPSSPP_PLATFORM(SWITCH)
+		auto startDownload = [this]() { StartCheatDatabaseDownload(); };
+		if (File::Exists(GetGlobalCheatFilePath())) {
+			auto cw = GetI18NCategory(I18NCat::CWCHEATS);
+			auto di = GetI18NCategory(I18NCat::DIALOG);
+			screenManager()->push(new UI::MessagePopupScreen(cw->T("Download cheat database"),
+				cw->T("A cheat database already exists. Downloading a new one will overwrite it."),
+				di->T("Download"), di->T("Cancel"), [startDownload](bool yes) {
+					if (yes)
+						startDownload();
+				}));
+		} else {
+			startDownload();
+		}
+#else
 		screenManager()->push(new CwCheatDownloadPopupScreen());
+#endif
 	});
 
 	Path cheatPath = GetGlobalCheatFilePath();
@@ -343,12 +368,45 @@ void CwCheatScreen::update() {
 	}
 
 	if (downloadRequest_ && downloadRequest_->Done()) {
+#if PPSSPP_PLATFORM(SWITCH)
+		std::string data;
+		downloadRequest_->buffer().TakeAll(&data);
+		bool valid = !downloadRequest_->Failed() && downloadRequest_->ResultCode() == 200 &&
+			data.size() > 1024 && data.find("_S ") != std::string::npos && data.find("_G ") != std::string::npos;
+		Path cheatPath = GetGlobalCheatFilePath();
+		Path temporary(cheatPath.ToString() + ".download");
+		Path backup(cheatPath.ToString() + ".backup");
+		if (valid)
+			valid = File::WriteStringToFile(true, data, temporary);
+		if (valid) {
+			File::Delete(backup, true);
+			bool hadExisting = File::Exists(cheatPath);
+			if (hadExisting)
+				valid = File::Rename(cheatPath, backup);
+			if (valid)
+				valid = File::Rename(temporary, cheatPath);
+			if (!valid && hadExisting && File::Exists(backup))
+				File::Rename(backup, cheatPath);
+			if (valid)
+				File::Delete(backup, true);
+		}
+		File::Delete(temporary, true);
+		if (valid) {
+			INFO_LOG(Log::CwCheats, "Cheat database downloaded successfully to %s.", cheatPath.ToVisualString().c_str());
+			g_OSD.Show(OSDType::MESSAGE_SUCCESS, "Cheat database downloaded");
+			RecreateViews();
+		} else {
+			ERROR_LOG(Log::CwCheats, "Failed to download or validate cheat database (HTTP %d)", downloadRequest_->ResultCode());
+			g_OSD.Show(OSDType::MESSAGE_ERROR, "Cheat database download failed");
+		}
+#else
 		if (!downloadRequest_->Failed()) {
 			INFO_LOG(Log::CwCheats, "Cheat database downloaded successfully to %s.", GetGlobalCheatFilePath().ToVisualString().c_str());
 			RecreateViews();
 		} else {
 			ERROR_LOG(Log::CwCheats, "Failed to download cheat database");
 		}
+#endif
 		downloadRequest_.reset();
 	}
 

@@ -4,6 +4,7 @@
 *.m              text diff=objc
 *.java           text diff=java
 *.sh             text eol=lf
+*.patch          text eol=lf
 *.vcproj         text eol=crlf
 *.vcproj.filters text eol=crlf
 *.sln            text eol=crlf

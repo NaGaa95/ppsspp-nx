@@ -24,6 +24,10 @@
 #include "Common/Thread/ThreadUtil.h"
 #include "Common/Data/Encoding/Utf8.h"
 
+#if PPSSPP_PLATFORM(SWITCH)
+#include <switch.h>
+#endif
+
 AttachDetachFunc g_attach;
 AttachDetachFunc g_detach;
 
@@ -49,6 +53,110 @@ void RegisterAttachDetach(AttachDetachFunc attach, AttachDetachFunc detach) {
 	g_detach = detach;
 }
 
+#if PPSSPP_PLATFORM(SWITCH)
+static uint32_t SwitchProcessCoreMask() {
+	uint64_t coreMask = 0;
+	if (R_SUCCEEDED(svcGetInfo(&coreMask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && coreMask) {
+		return (uint32_t)coreMask;
+	}
+	return 1;
+}
+
+static int SwitchCoreAt(uint32_t mask, int index) {
+	int lastCore = __builtin_ctz(mask);
+	for (int core = 0; core < 32; ++core) {
+		if ((mask & (1U << core)) == 0) {
+			continue;
+		}
+		lastCore = core;
+		if (index-- == 0) {
+			return core;
+		}
+	}
+	return lastCore;
+}
+
+static uint32_t SwitchThreeCoreMask(uint32_t processMask) {
+	uint32_t mask = 0;
+	for (int core = 0; core < 32 && __builtin_popcount(mask) < 3; ++core) {
+		if (processMask & (1U << core)) {
+			mask |= 1U << core;
+		}
+	}
+	return mask;
+}
+#endif
+
+void SetCurrentThreadAffinity(ThreadAffinityRole role) {
+#if PPSSPP_PLATFORM(SWITCH)
+	const uint32_t processMask = SwitchThreeCoreMask(SwitchProcessCoreMask());
+	const int emulationCore = SwitchCoreAt(processMask, 0);
+	const int renderCore = SwitchCoreAt(processMask, 1);
+	const int workerCore = SwitchCoreAt(processMask, 2);
+
+	int idealCore = -1;
+	uint32_t affinityMask = processMask;
+	int priority = -1;
+
+	switch (role) {
+	case ThreadAffinityRole::PROCESS:
+		break;
+	case ThreadAffinityRole::EVENT:
+		idealCore = workerCore;
+		affinityMask = 1U << workerCore;
+		priority = 47;
+		break;
+	case ThreadAffinityRole::EMULATION:
+		idealCore = emulationCore;
+		affinityMask = 1U << emulationCore;
+		break;
+	case ThreadAffinityRole::RENDER:
+		idealCore = renderCore;
+		affinityMask = 1U << renderCore;
+		break;
+	case ThreadAffinityRole::SHADER_COMPILER:
+		idealCore = workerCore;
+		affinityMask = 1U << workerCore;
+		break;
+	case ThreadAffinityRole::PRESENT:
+		idealCore = renderCore;
+		affinityMask = 1U << renderCore;
+		priority = 45;
+		break;
+	case ThreadAffinityRole::AUDIO:
+		idealCore = workerCore;
+		affinityMask = 1U << workerCore;
+		priority = 40;
+		break;
+	case ThreadAffinityRole::COMPUTE:
+	case ThreadAffinityRole::IO:
+	case ThreadAffinityRole::BACKGROUND:
+		idealCore = workerCore;
+		affinityMask = 1U << workerCore;
+		priority = 63;
+		break;
+	}
+
+	if (!affinityMask) {
+		affinityMask = processMask;
+		idealCore = -1;
+	}
+	if (R_FAILED(svcSetThreadCoreMask(CUR_THREAD_HANDLE, idealCore, affinityMask))) {
+		svcSetThreadCoreMask(CUR_THREAD_HANDLE, -1, processMask);
+		return;
+	}
+	if (priority >= 0) {
+		svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
+	}
+#else
+	(void)role;
+#endif
+}
+
+void SetCurrentThreadToProcessAffinity() {
+	SetCurrentThreadAffinity(ThreadAffinityRole::PROCESS);
+}
+
 #if (PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(LINUX)) && !defined(_GNU_SOURCE)
 #define _GNU_SOURCE
 #endif
@@ -57,7 +165,9 @@ void RegisterAttachDetach(AttachDetachFunc attach, AttachDetachFunc detach) {
 #include <pthread.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if !PPSSPP_PLATFORM(SWITCH)
 #include <sys/syscall.h>
+#endif
 #endif
 
 #if defined(__DragonFly__) || defined(__FreeBSD__) || defined(__OpenBSD__)

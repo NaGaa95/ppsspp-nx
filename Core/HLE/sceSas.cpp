@@ -86,6 +86,7 @@ bool *__SasGetGlobalMuteFlag() {
 }
 
 int __SasThread() {
+	SetCurrentThreadAffinity(ThreadAffinityRole::AUDIO);
 	SetCurrentThreadName("SAS");
 
 	std::unique_lock<std::mutex> guard(sasWakeMutex);

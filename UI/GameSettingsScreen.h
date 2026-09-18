@@ -46,6 +46,7 @@ protected:
 	void dialogFinished(const Screen *dialog, DialogResult result) override;
 
 	void CreateTabs() override;
+	void CreateExtraButtons(UI::ViewGroup *verticalLayout, int margins) override;
 	bool ShowSearchControls() const override { return true; }
 
 private:
@@ -92,6 +93,7 @@ private:
 	int iAlternateSpeedPercent1_ = 0;
 	int iAlternateSpeedPercent2_ = 0;
 	int iAlternateSpeedPercentAnalog_ = 0;
+	int runningGPUBackend_ = 0;
 	int prevInflightFrames_ = -1;
 	bool enableReports_ = false;
 	bool enableReportsSet_ = false;

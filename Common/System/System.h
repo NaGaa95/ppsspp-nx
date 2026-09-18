@@ -194,6 +194,7 @@ enum SystemProperty {
 
 	SYSPROP_DEVICE_TYPE,
 	SYSPROP_APP_GOLD,  // To avoid having #ifdef GOLD other than in main.cpp and similar.
+	SYSPROP_APPLET_MODE,
 
 	// Exposed on Android. Choosing the optimal sample rate for audio
 	// will result in lower latencies. Buffer size is automatically matched

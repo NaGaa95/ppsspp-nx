@@ -59,7 +59,7 @@ static GPUCommon *CreateGPUCore(GPUCore gpuCore, GraphicsContext *ctx, Draw::Dra
 #else
 		return nullptr;
 #endif
-#if !PPSSPP_PLATFORM(SWITCH) && !PPSSPP_PLATFORM(UWP)
+#if !PPSSPP_PLATFORM(UWP)
 	case GPUCORE_VULKAN:
 		if (!ctx) {
 			// Can this happen?

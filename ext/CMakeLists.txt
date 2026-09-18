@@ -1,6 +1,6 @@
 set(ARMIPS_REGEXP OFF CACHE BOOL "" FORCE)
 set(ARMIPS_LIBRARY_ONLY ON CACHE BOOL "" FORCE)
-if(WIN32)
+if(WIN32 OR USE_LIBNX)
 	set(ARMIPS_USE_STD_FILESYSTEM ON CACHE BOOL "" FORCE)
 endif()
 
@@ -28,7 +28,15 @@ add_subdirectory(cmake/cpu_features EXCLUDE_FROM_ALL)
 
 set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "" FORCE)
 set(ENABLE_GLSLANG_INSTALL OFF)
+if(USE_LIBNX)
+	set(PPSSPP_SAVED_UNIX "${UNIX}")
+	set(UNIX ON)
+endif()
 add_subdirectory(glslang EXCLUDE_FROM_ALL)
+if(USE_LIBNX)
+	set(UNIX "${PPSSPP_SAVED_UNIX}")
+	unset(PPSSPP_SAVED_UNIX)
+endif()
 add_subdirectory(snappy)
 add_subdirectory(lua-build)
 add_subdirectory(minimp3)
@@ -65,7 +73,7 @@ if(WIN32)
 	)
 endif()
 
-if(LINUX OR ANDROID OR MACOSX OR IOS OR BSD)
+if(LINUX OR ANDROID OR MACOSX OR IOS OR BSD OR USE_LIBNX)
 	list(APPEND aemu_postoffice_client_obj
 		aemu_postoffice/client/sock_impl_linux.c
 	)
@@ -74,6 +82,10 @@ endif()
 add_library(aemu_postoffice_client STATIC
 	${aemu_postoffice_client_obj}
 )
+
+if(USE_LIBNX)
+	target_compile_definitions(aemu_postoffice_client PRIVATE __unix)
+endif()
 
 set(FT_REQUIRE_ZLIB OFF CACHE BOOL "" FORCE)
 set(FT_REQUIRE_BZIP2 OFF CACHE BOOL "" FORCE)
@@ -87,7 +99,7 @@ endif()
 if(NOT LIBRETRO)
     add_subdirectory(imgui)
 endif()
-if(NOT HTTPS_NOT_AVAILABLE)
+if(NOT HTTPS_NOT_AVAILABLE AND NOT USE_LIBNX)
 	add_subdirectory(naett-build)
 endif()
 if(USE_DISCORD AND NOT IOS AND NOT LIBRETRO)

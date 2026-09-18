@@ -16,6 +16,7 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <atomic>
+#include <climits>
 #include "ppsspp_config.h"
 
 #ifdef _WIN32
@@ -137,6 +138,9 @@ GlobalUIState GetUIState() {
 }
 
 void SetGPUBackend(GPUBackend type, std::string_view device) {
+	if (type == GPUBackend::ZINK) {
+		type = GPUBackend::OPENGL;
+	}
 	gpuBackend = type;
 	gpuBackendDevice = device;
 }
@@ -726,6 +730,7 @@ bool PSP_InitStart(const CoreParameter &coreParam) {
 	Core_NotifyLifecycle(CoreLifecycle::STARTING);
 
 	g_loadingThread = std::thread([errorString]() {
+		SetCurrentThreadAffinity(ThreadAffinityRole::IO);
 		SetCurrentThreadName("ExecLoader");
 
 		AndroidJNIThreadContext jniContext;

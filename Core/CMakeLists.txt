@@ -743,7 +743,7 @@ if(WIN32)
 	target_link_libraries(Core ws2_32)
 endif()
 
-if(NOT HTTPS_NOT_AVAILABLE)
+if(NOT HTTPS_NOT_AVAILABLE AND NOT USE_LIBNX)
 	target_link_libraries(Core naett)
 endif()
 
@@ -764,6 +764,9 @@ if(FFmpeg_FOUND)
 		FFmpeg::swscale
 		${ZLIB_LIBRARY}
 	)
+	if(USE_LIBNX)
+		target_link_libraries(Core bz2 dav1d)
+	endif()
 elseif(BUILD_BUNDLED_FFMPEG)
 	target_compile_definitions(Core PRIVATE USE_FFMPEG=1)
 	set_target_properties(Core PROPERTIES NO_SYSTEM_FROM_IMPORTED true)

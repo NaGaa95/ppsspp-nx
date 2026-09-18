@@ -276,6 +276,7 @@ void CachingFileLoader::StartReadAhead(s64 pos) {
 	if (aheadThread_.joinable())
 		aheadThread_.join();
 	aheadThread_ = std::thread([this, pos] {
+		SetCurrentThreadAffinity(ThreadAffinityRole::IO);
 		SetCurrentThreadName("FileLoaderReadAhead");
 
 		AndroidJNIThreadContext jniContext;

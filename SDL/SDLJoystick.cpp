@@ -190,7 +190,27 @@ void SDLJoystick::releaseAllKeys() {
 		NativeAxis(&axis, 1);
 	}
 	prevAxisValue_.clear();
+#if PPSSPP_PLATFORM(SWITCH)
+	releaseRightStickFaceButtons();
+#endif
 }
+
+#if PPSSPP_PLATFORM(SWITCH)
+void SDLJoystick::updateRightStickFaceButton(InputKeyCode keyCode, bool down, bool *pressed) {
+	if (*pressed == down) {
+		return;
+	}
+	*pressed = down;
+	NativeKey(KeyInput(DEVICE_ID_SWITCH_RIGHT_STICK, keyCode, down ? KeyInputFlags::DOWN : KeyInputFlags::UP));
+}
+
+void SDLJoystick::releaseRightStickFaceButtons() {
+	updateRightStickFaceButton(NKCODE_DPAD_UP, false, &rightStickUp_);
+	updateRightStickFaceButton(NKCODE_DPAD_DOWN, false, &rightStickDown_);
+	updateRightStickFaceButton(NKCODE_DPAD_LEFT, false, &rightStickLeft_);
+	updateRightStickFaceButton(NKCODE_DPAD_RIGHT, false, &rightStickRight_);
+}
+#endif
 
 void SDLJoystick::ProcessInput(const SDL_Event &event){
 	switch (event.type) {
@@ -213,15 +233,52 @@ void SDLJoystick::ProcessInput(const SDL_Event &event){
 		const int padId = 0;  // previously getDeviceIndex(event.gaxis.which), but for now we force all pads to pad0 for config compatibility.
 		InputDeviceID deviceId = DEVICE_ID_PAD_0 + padId;
 		InputAxis axisId = (InputAxis)event.gaxis.axis;
+#if PPSSPP_PLATFORM(SWITCH)
+		switch ((SDL_GamepadAxis)event.gaxis.axis) {
+		case SDL_GAMEPAD_AXIS_RIGHTX:
+			axisId = JOYSTICK_AXIS_Z;
+			break;
+		case SDL_GAMEPAD_AXIS_RIGHTY:
+			axisId = JOYSTICK_AXIS_RZ;
+			break;
+		case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:
+			axisId = JOYSTICK_AXIS_LTRIGGER;
+			break;
+		case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:
+			axisId = JOYSTICK_AXIS_RTRIGGER;
+			break;
+		default:
+			break;
+		}
+		if ((event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTX || event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTY) && g_Config.bRightStickFaceButtons) {
+			static constexpr Sint16 threshold = 12000;
+			if (event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTX) {
+				updateRightStickFaceButton(NKCODE_DPAD_LEFT, event.gaxis.value < -threshold, &rightStickLeft_);
+				updateRightStickFaceButton(NKCODE_DPAD_RIGHT, event.gaxis.value > threshold, &rightStickRight_);
+			} else {
+				updateRightStickFaceButton(NKCODE_DPAD_UP, event.gaxis.value < -threshold, &rightStickUp_);
+				updateRightStickFaceButton(NKCODE_DPAD_DOWN, event.gaxis.value > threshold, &rightStickDown_);
+			}
+			auto axisKey = std::pair<InputDeviceID, InputAxis>(deviceId, axisId);
+			auto previous = prevAxisValue_.find(axisKey);
+			if (previous != prevAxisValue_.end() && previous->second != 0.0f) {
+				previous->second = 0.0f;
+				AxisInput axis{deviceId, axisId, 0.0f};
+				NativeAxis(&axis, 1);
+			}
+			break;
+		}
+		if (event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTX || event.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHTY) {
+			releaseRightStickFaceButtons();
+		}
+#endif
 		float value = event.gaxis.value * (1.f / 32767.f);
 		if (value > 1.0f) value = 1.0f;
 		if (value < -1.0f) value = -1.0f;
 		auto key = std::pair<InputDeviceID, InputAxis>(deviceId, axisId);
 		auto iter = prevAxisValue_.find(key);
-		if (iter == prevAxisValue_.end()) {
+		if (iter == prevAxisValue_.end() || iter->second != value) {
 			prevAxisValue_[key] = value;
-		} else if (iter->second != value) {
-			iter->second = value;
 			AxisInput axis;
 			axis.axisId = axisId;
 			axis.value = value;

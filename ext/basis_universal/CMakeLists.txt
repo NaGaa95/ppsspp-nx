@@ -19,10 +19,11 @@ add_library(basis_universal STATIC
 	basisu_transcoder_uastc.h
 )
 
-# basisu_transcoder.cpp calls ZSTD_decompress()/ZSTD_isError() directly for KTX2 supercompression.
 if(USE_SYSTEM_ZSTD)
-	target_include_directories(basis_universal PRIVATE ${ZSTD_INCLUDE_DIR})
-	target_link_libraries(basis_universal ${ZSTD_LIBRARY})
+	find_path(BASIS_ZSTD_INCLUDE_DIR NAMES zstd.h REQUIRED)
+	find_library(BASIS_ZSTD_LIBRARY NAMES zstd REQUIRED)
+	target_include_directories(basis_universal PRIVATE ${BASIS_ZSTD_INCLUDE_DIR})
+	target_link_libraries(basis_universal ${BASIS_ZSTD_LIBRARY})
 else()
 	target_link_libraries(basis_universal libzstd_static)
 endif()

@@ -416,7 +416,7 @@ SDL_Window *CreateSDLGLWindowAndContext(int x, int y, int w, int h, int mode, in
 		SDL_SetWindowPosition(window, x, y);
 	}
 
-#ifdef USING_EGL
+#if defined(USING_EGL) && !PPSSPP_PLATFORM(SWITCH)
 	// EGL is optional here - if it fails, we just keep using the regular SDL/GLX swap set up above.
 	std::string eglError;
 	if (EGL_Open(window, &eglError) != 0) {
@@ -510,7 +510,7 @@ bool SDLGLGraphicsContext::InitAPI(void *ctx, std::string *deviceName, std::stri
 }
 
 void SDLGLGraphicsContext::ShutdownAPI() {
-#ifdef USING_EGL
+#if defined(USING_EGL) && !PPSSPP_PLATFORM(SWITCH)
 	EGL_Close();
 #endif
 	SDL_GL_DestroyContext(glContext_);

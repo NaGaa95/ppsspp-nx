@@ -103,7 +103,7 @@ void DrawGPUProfilerVis(UIContext *ui, GPUCommon *gpu) {
 	ui->Begin();
 
 	float scale = 0.4f;
-	if (g_Config.iGPUBackend == (int)GPUBackend::OPENGL) {
+	if (GetGPUBackend() == GPUBackend::OPENGL) {
 		// Don't have as much info, let's go bigger.
 		scale = 0.7f;
 	}

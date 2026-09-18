@@ -154,7 +154,7 @@ PaneTitleBar::PaneTitleBar(const Path &gamePath, std::string_view title, const s
 		Add(new SimpleGameIconView(gamePath_, new LinearLayoutParams(WRAP_CONTENT, WRAP_CONTENT)));
 	}
 
-	if (!settingsCategory.empty()) {
+	if (!settingsCategory.empty() && !PPSSPP_PLATFORM(SWITCH)) {
 		std::string settingsUrl;
 		if (settingsCategory[0] == '/') {
 			settingsUrl = join("https://www.ppsspp.org", settingsCategory);

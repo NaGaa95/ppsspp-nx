@@ -44,6 +44,9 @@
 #include "UI/SavedataScreen.h"
 #include "UI/Store.h"
 #include "UI/UploadScreen.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "UI/SwitchLibrary.h"
+#endif
 #include "UI/Background.h"
 #include "Core/Config.h"
 #include "Common/Data/Text/I18n.h"
@@ -652,11 +655,22 @@ bool GameBrowser::HasSpecialFiles(std::vector<Path> &filenames) {
 		}
 		return true;
 	}
+#if PPSSPP_PLATFORM(SWITCH)
+	if (path_.GetPath().ToString() == "!LIBRARY") {
+		filenames = SwitchLibrary::GetGames();
+		libraryGeneration_ = SwitchLibrary::Generation();
+		return true;
+	}
+#endif
 	return false;
 }
 
 void GameBrowser::Update() {
 	LinearLayout::Update();
+#if PPSSPP_PLATFORM(SWITCH)
+	if (path_.GetPath().ToString() == "!LIBRARY" && libraryGeneration_ != SwitchLibrary::Generation())
+		refreshPending_ = true;
+#endif
 	if (refreshPending_) {
 		path_.Refresh();
 	}
@@ -755,6 +769,10 @@ void GameBrowser::Refresh() {
 		const bool pathOnSeparateLine = g_display.dp_xres < 1050 || portrait_;
 
 		std::string pathStr = GetFriendlyPath(path_.GetPath(), aliasMatch_, aliasDisplay_);
+#if PPSSPP_PLATFORM(SWITCH)
+		if (path_.GetPath().ToString() == "!LIBRARY")
+			pathStr = mm->T("Library");
+#endif
 
 		if (pathOnSeparateLine) {
 			Add(new TextView(pathStr, ALIGN_VCENTER | FLAG_WRAP_TEXT, true, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(8, 0, 8, 0))));
@@ -811,6 +829,10 @@ void GameBrowser::Refresh() {
 		layoutChoice->SetSelection(*gridStyle_ ? 0 : 1, false);
 		layoutChoice->OnChoice.Handle(this, &GameBrowser::LayoutChange);
 		topBar->Add(new Choice(ImageID("I_ROTATE_LEFT"), new LayoutParams(64.0f, 64.0f)))->OnClick.Add([=](UI::EventParams &e) {
+#if PPSSPP_PLATFORM(SWITCH)
+			if (path_.GetPath().ToString() == "!LIBRARY")
+				SwitchLibrary::RequestScan();
+#endif
 			path_.Refresh();
 			refreshPending_ = true;
 		});
@@ -858,6 +880,10 @@ void GameBrowser::Refresh() {
 		for (size_t i = 0; i < filenames.size(); i++) {
 			gameButtons.push_back(new GameButton(filenames[i], *gridStyle_, new UI::LinearLayoutParams(*gridStyle_ == true ? UI::WRAP_CONTENT : UI::FILL_PARENT, UI::WRAP_CONTENT)));
 		}
+#if PPSSPP_PLATFORM(SWITCH)
+		if (path_.GetPath().ToString() == "!LIBRARY" && filenames.empty() && SwitchLibrary::IsScanning())
+			gameList_->Add(new UI::TextView(mm->T("Scanning library..."), ALIGN_CENTER, false, new UI::LinearLayoutParams(UI::FILL_PARENT, UI::FILL_PARENT)));
+#endif
 	} else if (!listingPending_) {
 		std::vector<File::FileInfo> fileInfo;
 		path_.GetListing(fileInfo, "iso:cso:chd:pbp:elf:prx:ppdmp:");

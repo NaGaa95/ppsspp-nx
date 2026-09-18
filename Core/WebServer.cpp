@@ -822,6 +822,7 @@ void OpenWebDebugger() {
 }
 
 static void WebServerThread() {
+	SetCurrentThreadAffinity(ThreadAffinityRole::IO);
 	SetCurrentThreadName("HTTPServer");
 
 	AndroidJNIThreadContext context;  // Destructor detaches.

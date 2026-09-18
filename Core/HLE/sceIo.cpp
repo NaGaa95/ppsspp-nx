@@ -581,6 +581,7 @@ static void __IoAsyncEndCallback(SceUID threadID, SceUID prevCallbackId) {
 }
 
 static void __IoManagerThread() {
+	SetCurrentThreadAffinity(ThreadAffinityRole::IO);
 	SetCurrentThreadName("IO");
 	INFO_LOG(Log::sceIo, "Entering __IoManagerThread");
 	AndroidJNIThreadContext jniContext;

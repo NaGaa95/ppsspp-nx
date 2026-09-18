@@ -97,6 +97,10 @@ using namespace std::placeholders;
 #include "UI/ChatScreen.h"
 #include "UI/DebugOverlay.h"
 
+#if PPSSPP_PLATFORM(SWITCH)
+#include "Common/GPU/Vulkan/SwitchLSFG.h"
+#endif
+
 #if PPSSPP_PLATFORM(WINDOWS) && !PPSSPP_PLATFORM(UWP)
 #include "Windows/MainWindow.h"
 #endif
@@ -207,6 +211,15 @@ void EmuScreen::ProcessGameBoot(const Path &filename) {
 		// but crash reports seem to indicate it.
 		return;
 	}
+	if (System_GetPropertyBool(SYSPROP_APPLET_MODE)) {
+		auto di = GetI18NCategory(I18NCat::DIALOG);
+		screenManager()->push(new PromptScreen(gamePath_,
+			"Games cannot be launched in applet mode.\n\nUse title override or a forwarder to give PPSSPP full memory access.",
+			di->T("OK"), ""));
+		bootPending_ = false;
+		quit_ = true;
+		return;
+	}
 
 	// Check permission status first, in case we came from a shortcut.
 	if (!bootAllowStorage(filename)) {
@@ -290,6 +303,7 @@ void EmuScreen::ProcessGameBoot(const Path &filename) {
 #if !PPSSPP_PLATFORM(UWP)
 #if PPSSPP_API(ANY_GL)
 	case GPUBackend::OPENGL:
+	case GPUBackend::ZINK:
 		coreParam.gpuCore = GPUCORE_GLES;
 		break;
 #endif
@@ -342,6 +356,9 @@ void EmuScreen::ProcessGameBoot(const Path &filename) {
 
 // Only call this on successful boot.
 void EmuScreen::bootComplete() {
+#if PPSSPP_PLATFORM(SWITCH)
+	SwitchLSFG_ResetSession();
+#endif
 	__DisplayListenFlip([](void *userdata) {
 		EmuScreen *scr = (EmuScreen *)userdata;
 		scr->HandleFlip();
@@ -434,6 +451,9 @@ void EmuScreen::bootComplete() {
 }
 
 EmuScreen::~EmuScreen() {
+#if PPSSPP_PLATFORM(SWITCH)
+	SwitchLSFG_ResetSession();
+#endif
 	g_controlMapper.RemoveListener(this);
 
 	std::string gameID = g_paramSFO.GetValueString("DISC_ID");

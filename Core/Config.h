@@ -298,6 +298,7 @@ public:
 	// vsync = true, low latency present = false: FIFO
 	bool bVSync;
 	bool bLowLatencyPresent;
+	bool bSwitchFrameGeneration = false;
 
 	bool bSoftwareRendering;
 	bool bSoftwareRenderingJit;
@@ -546,6 +547,7 @@ public:
 	// Thresholds for triggers and stick when mapped to digital button inputs.
 	float fAnalogTriggerThreshold;
 	float fAnalogStickThreshold;
+	bool bRightStickFaceButtons;
 
 	// Sets whether combo mapping is enabled.
 	bool bAllowMappingCombos;

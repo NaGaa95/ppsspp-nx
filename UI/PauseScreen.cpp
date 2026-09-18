@@ -27,6 +27,9 @@
 #include "Common/UI/Notice.h"
 #include "Common/UI/ScreenManager.h"
 #include "Common/GPU/thin3d.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "Common/GPU/Vulkan/SwitchLSFG.h"
+#endif
 
 #include "Common/Data/Text/I18n.h"
 #include "Common/Data/Text/Parsers.h"
@@ -46,6 +49,7 @@
 #include "Core/RetroAchievements.h"
 #include "Core/ELF/ParamSFO.h"
 #include "Core/HLE/sceDisplay.h"
+#include "Core/HW/Display.h"
 #include "Core/HLE/sceUmd.h"
 #include "Core/HLE/sceNet.h"
 #include "Core/HLE/sceNetInet.h"
@@ -721,6 +725,25 @@ void GamePauseScreen::CreateViews() {
 		createGameConfig->OnClick.Handle(this, &GamePauseScreen::OnCreateConfig);
 		createGameConfig->SetEnabled(!bootPending_);
 	}
+
+#if PPSSPP_PLATFORM(SWITCH)
+	if (g_Config.bSwitchFrameGeneration && g_Config.iGPUBackend == (int)GPUBackend::VULKAN) {
+		frameGenerationEnabled_ = SwitchLSFG_IsEnabled();
+		CheckBox *frameGeneration = rightColumnItems->Add(new CheckBox(&frameGenerationEnabled_, gr->T("Frame Generation")));
+		frameGeneration->SetEnabledFunc([this] {
+			float fps = 0.0f;
+			__DisplayGetFPS(nullptr, &fps, nullptr);
+			return !bootPending_ && SwitchLSFG_IsPrepared() && SwitchLSFG_IsAvailable() && fps >= 27.0f && fps <= 33.5f;
+		});
+		frameGeneration->OnClick.Add([this](UI::EventParams &) {
+			float fps = 0.0f;
+			__DisplayGetFPS(nullptr, &fps, nullptr);
+			if (!SwitchLSFG_RequestEnabled(frameGenerationEnabled_, fps)) {
+				frameGenerationEnabled_ = false;
+			}
+		});
+	}
+#endif
 
 	if (g_Config.bAchievementsEnable && Achievements::HasAchievementsOrLeaderboards()) {
 		rightColumnItems->Add(new Choice(ac->T("Achievements"), ImageID("I_ACHIEVEMENT")))->OnClick.Add([this](UI::EventParams &e) {

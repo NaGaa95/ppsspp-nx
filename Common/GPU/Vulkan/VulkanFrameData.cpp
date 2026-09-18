@@ -3,6 +3,9 @@
 #include "VulkanFrameData.h"
 #include "Common/Log.h"
 #include "Common/StringUtils.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "Common/GPU/Vulkan/SwitchLSFG.h"
+#endif
 
 #if 0 // def _DEBUG
 #define VLOG(...) NOTICE_LOG(Log::G3D, __VA_ARGS__)
@@ -147,6 +150,12 @@ VkResult FrameData::QueuePresent(VulkanContext *vulkan, FrameDataShared &shared)
 		}
 	}
 
+#if PPSSPP_PLATFORM(SWITCH)
+	VkResult result = VK_SUCCESS;
+	if (SwitchLSFG_Present(vulkan->GetGraphicsQueue(), present, result)) {
+		return result;
+	}
+#endif
 	return vkQueuePresentKHR(vulkan->GetGraphicsQueue(), &present);
 }
 

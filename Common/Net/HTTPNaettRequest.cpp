@@ -1,4 +1,143 @@
+#include "ppsspp_config.h"
+
 #ifndef HTTPS_NOT_AVAILABLE
+
+#if PPSSPP_PLATFORM(SWITCH)
+
+#include <cstring>
+
+#include <curl/curl.h>
+
+#include "Common/Log.h"
+#include "Common/Net/HTTPNaettRequest.h"
+#include "Common/Thread/ThreadUtil.h"
+
+namespace http {
+
+HTTPSRequest::HTTPSRequest(RequestMethod method, std::string_view url, std::string_view postData, std::string_view postMime, const Path &outfile, RequestFlags flags, std::string_view name)
+	: Request(method, url, name, outfile, &cancelled_, flags), postData_(postData), postMime_(postMime) {
+}
+
+HTTPSRequest::~HTTPSRequest() {
+	Join();
+}
+
+void HTTPSRequest::Start() {
+	thread_ = std::thread([this] { Do(); });
+}
+
+void HTTPSRequest::Join() {
+	if (thread_.joinable())
+		thread_.join();
+}
+
+bool HTTPSRequest::Done() {
+	return completed_.load(std::memory_order_acquire);
+}
+
+void HTTPSRequest::Cancel() {
+	Request::Cancel();
+}
+
+size_t HTTPSRequest::WriteCallback(char *data, size_t size, size_t count, void *userdata) {
+	if (count != 0 && size > SIZE_MAX / count)
+		return 0;
+	HTTPSRequest *request = static_cast<HTTPSRequest *>(userdata);
+	if (request->cancelled_)
+		return 0;
+	size_t bytes = size * count;
+	std::memcpy(request->buffer_.Append(bytes), data, bytes);
+	return bytes;
+}
+
+int HTTPSRequest::ProgressCallback(void *userdata, curl_off_t downloadTotal, curl_off_t downloaded, curl_off_t, curl_off_t) {
+	HTTPSRequest *request = static_cast<HTTPSRequest *>(userdata);
+	request->progress_.Update(downloaded, downloadTotal, false);
+	return request->cancelled_ ? 1 : 0;
+}
+
+void HTTPSRequest::Do() {
+	SetCurrentThreadAffinity(ThreadAffinityRole::IO);
+	SetCurrentThreadName("HTTPSDownload::Do");
+
+	CURL *curl = curl_easy_init();
+	if (!curl) {
+		failed_ = true;
+		resultCode_ = -1;
+		progress_.Update(0, 0, true);
+		completed_.store(true, std::memory_order_release);
+		return;
+	}
+
+	curl_slist *headers = nullptr;
+	if (acceptMime_ && std::strcmp(acceptMime_, "*/*") != 0) {
+		std::string accept = std::string("Accept: ") + acceptMime_;
+		headers = curl_slist_append(headers, accept.c_str());
+	}
+	if (!postMime_.empty()) {
+		std::string contentType = std::string("Content-Type: ") + postMime_;
+		headers = curl_slist_append(headers, contentType.c_str());
+	}
+
+	char error[CURL_ERROR_SIZE]{};
+	curl_easy_setopt(curl, CURLOPT_URL, url_.c_str());
+	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 180L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 128L);
+	curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
+	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+	curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
+	curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, error);
+	curl_easy_setopt(curl, CURLOPT_USERAGENT, userAgent_.empty() ? "PPSSPP" : userAgent_.c_str());
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, this);
+	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, ProgressCallback);
+	curl_easy_setopt(curl, CURLOPT_XFERINFODATA, this);
+	if (headers)
+		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+#if LIBCURL_VERSION_NUM >= 0x075500
+	curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+	curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+	curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+	curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
+#endif
+	if (method_ == RequestMethod::POST) {
+		curl_easy_setopt(curl, CURLOPT_POST, 1L);
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData_.data());
+		curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)postData_.size());
+	}
+
+	CURLcode result = curl_easy_perform(curl);
+	long responseCode = 0;
+	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &responseCode);
+	resultCode_ = result == CURLE_OK ? (int)responseCode : -(int)result;
+	failed_ = result != CURLE_OK || responseCode != 200 || cancelled_;
+	if (!failed_ && !outfile_.empty()) {
+		bool clear = !(flags_ & RequestFlags::KeepInMemory);
+		if (!buffer_.FlushToFile(outfile_, clear)) {
+			ERROR_LOG(Log::HTTP, "Failed writing download to '%s'", outfile_.c_str());
+			failed_ = true;
+		}
+	}
+	if (failed_) {
+		ERROR_LOG(Log::HTTP, "HTTPS request failed for %s: %s (curl %d, HTTP %ld)", url_.c_str(),
+			error[0] ? error : curl_easy_strerror(result), (int)result, responseCode);
+	}
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+	progress_.Update((int64_t)buffer_.size(), (int64_t)buffer_.size(), true);
+	completed_.store(true, std::memory_order_release);
+}
+
+}  // namespace http
+
+#else
 
 #include <atomic>
 #include <cstring>
@@ -217,5 +356,7 @@ bool HTTPSRequest::Done() {
 }
 
 }  // namespace http
+
+#endif  // PPSSPP_PLATFORM(SWITCH)
 
 #endif  // HTTPS_NOT_AVAILABLE

@@ -19,8 +19,13 @@ SDLJoystick *joystick = NULL;
 #include <csignal>
 #include <thread>
 #include <locale>
+#if PPSSPP_PLATFORM(SWITCH)
+#include <cstdio>
+#endif
 
+#if !PPSSPP_PLATFORM(SWITCH)
 #include "ext/portable-file-dialogs/portable-file-dialogs.h"
+#endif
 
 #include "ext/imgui/imgui.h"
 #include "ext/imgui/imgui_impl_platform.h"
@@ -81,8 +86,81 @@ SDLJoystick *joystick = NULL;
 #endif
 
 #if PPSSPP_PLATFORM(SWITCH)
+#include <switch.h>
+#include "Common/GPU/Vulkan/SwitchLSFG.h"
+#include "UI/SwitchLibrary.h"
+#include "UI/SwitchUpdate.h"
+
 #define LIBNX_SWKBD_LIMIT 500 // enforced by HOS
-extern u32 __nx_applet_type; // Not exposed through a header?
+extern "C" {
+u32 __nx_applet_type = AppletType_Application;
+size_t __nx_heap_size = 0;
+}
+
+static ViDisplay g_switchDisplay;
+static ViLayer g_switchLayer;
+static NWindow g_switchWindow;
+static AppletOperationMode g_switchOperationMode;
+
+static void SwitchOutputSize(AppletOperationMode operationMode, u32 *width, u32 *height) {
+	if (operationMode == AppletOperationMode_Handheld) {
+		*width = 1280;
+		*height = 720;
+	} else {
+		*width = 1920;
+		*height = 1080;
+	}
+}
+
+extern "C" NWindow *nwindowGetDefault() {
+	return &g_switchWindow;
+}
+
+extern "C" void __nx_win_init() {
+	Result rc = viInitialize(ViServiceType_Default);
+	if (R_SUCCEEDED(rc)) {
+		rc = viOpenDefaultDisplay(&g_switchDisplay);
+		if (R_SUCCEEDED(rc)) {
+			rc = viCreateLayer(&g_switchDisplay, &g_switchLayer);
+			if (R_SUCCEEDED(rc)) {
+				rc = viSetLayerScalingMode(&g_switchLayer, ViScalingMode_FitToLayer);
+				if (R_SUCCEEDED(rc)) {
+					s32 maxZ = 0;
+					if (R_SUCCEEDED(viGetZOrderCountMax(&g_switchDisplay, &maxZ)) && maxZ > 0) {
+						viSetLayerZ(&g_switchLayer, maxZ - 1);
+					}
+					rc = nwindowCreateFromLayer(&g_switchWindow, &g_switchLayer);
+					if (R_SUCCEEDED(rc)) {
+						u32 width;
+						u32 height;
+						g_switchOperationMode = appletGetOperationMode();
+						SwitchOutputSize(g_switchOperationMode, &width, &height);
+						rc = nwindowSetDimensions(&g_switchWindow, width, height);
+					}
+				}
+				if (R_FAILED(rc)) {
+					viCloseLayer(&g_switchLayer);
+				}
+			}
+			if (R_FAILED(rc)) {
+				viCloseDisplay(&g_switchDisplay);
+			}
+		}
+		if (R_FAILED(rc)) {
+			viExit();
+		}
+	}
+	if (R_FAILED(rc)) {
+		diagAbortWithResult(MAKERESULT(Module_Libnx, LibnxError_BadGfxInit));
+	}
+}
+
+extern "C" void __nx_win_exit() {
+	nwindowClose(&g_switchWindow);
+	viCloseLayer(&g_switchLayer);
+	viCloseDisplay(&g_switchDisplay);
+	viExit();
+}
 #endif
 
 GlobalUIState lastUIState = UISTATE_MENU;
@@ -94,13 +172,80 @@ static double g_lastCursorMoveTime = 0.0;
 
 static bool g_QuitRequested = false;
 static bool g_RestartRequested = false;
+#if PPSSPP_PLATFORM(SWITCH)
+static std::string g_restartParams;
+static std::string g_switchExecutablePath;
+static constexpr const char *SWITCH_RESTART_HANDOFF = "/switch/ppsspp-nx/.restart";
+
+static bool SwitchIsAppletMode() {
+	uint64_t isApplication = 1;
+	if (R_SUCCEEDED(svcGetInfo(&isApplication, InfoType_IsApplication, CUR_PROCESS_HANDLE, 0))) {
+		return isApplication == 0;
+	}
+	AppletType type = appletGetAppletType();
+	return type != AppletType_Application && type != AppletType_SystemApplication;
+}
+
+static bool SwitchWriteRestartHandoff(std::string_view params) {
+	FILE *file = fopen(SWITCH_RESTART_HANDOFF, "wb");
+	if (!file) {
+		return false;
+	}
+	bool success = fwrite(params.data(), 1, params.size(), file) == params.size();
+	success = fclose(file) == 0 && success;
+	if (!success) {
+		remove(SWITCH_RESTART_HANDOFF);
+	}
+	return success;
+}
+
+static std::string SwitchTakeRestartHandoff() {
+	FILE *file = fopen(SWITCH_RESTART_HANDOFF, "rb");
+	if (!file) {
+		return {};
+	}
+	char buffer[512]{};
+	size_t size = fread(buffer, 1, sizeof(buffer) - 1, file);
+	fclose(file);
+	remove(SWITCH_RESTART_HANDOFF);
+	return std::string(buffer, size);
+}
+
+static std::string SwitchNormalizeNroPath(std::string path) {
+	if (path.rfind("sdmc:/", 0) == 0) {
+		return path;
+	}
+	if (!path.empty() && path[0] == '/') {
+		return "sdmc:" + path;
+	}
+	if (path.rfind("switch/", 0) == 0) {
+		return "sdmc:/" + path;
+	}
+	return {};
+}
+
+static void CheckSwitchOperationMode() {
+	AppletOperationMode operationMode = appletGetOperationMode();
+	if (operationMode != g_switchOperationMode) {
+		g_switchOperationMode = operationMode;
+		g_restartParams.clear();
+		g_RestartRequested = true;
+	}
+}
+#endif
 
 static int g_DesktopWidth = 0;
 static int g_DesktopHeight = 0;
 static float g_DesktopDPI = 1.0f;
 static float g_ForcedDPI = 0.0f; // if this is 0.0f, use g_DesktopDPI
 static float g_RefreshRate = 60.f;
+#if PPSSPP_PLATFORM(SWITCH)
+static int g_sampleRate = 48000;
+static int g_nxlinkSocket = -1;
+static bool g_socketInitialized = false;
+#else
 static int g_sampleRate = 44100;
+#endif
 
 static SDL_AudioSpec g_retFmt;
 static int g_audioFramesPerBuffer = 0;
@@ -506,6 +651,11 @@ static int getDisplayNumber(void) {
 }
 
 static void sdl_mixaudio_callback(void *userdata, SDL_AudioStream *stream, int additional_amount, int total_amount) {
+	thread_local bool affinitySet = false;
+	if (!affinitySet) {
+		SetCurrentThreadAffinity(ThreadAffinityRole::AUDIO);
+		affinitySet = true;
+	}
 	(void)total_amount;
 	if (additional_amount <= 0) {
 		return;
@@ -516,7 +666,8 @@ static void sdl_mixaudio_callback(void *userdata, SDL_AudioStream *stream, int a
 		return;
 	}
 
-	std::vector<int16_t> mixBuf(frames * 2);
+	thread_local std::vector<int16_t> mixBuf;
+	mixBuf.resize(frames * 2);
 	NativeMix(mixBuf.data(), frames, g_sampleRate, userdata);
 	SDL_PutAudioStreamData(stream, mixBuf.data(), (int)(mixBuf.size() * sizeof(int16_t)));
 }
@@ -530,6 +681,9 @@ static void InitSDLAudioDevice(const std::string &name = "") {
 	fmt.freq = g_sampleRate;
 	fmt.format = SDL_AUDIO_S16;
 	fmt.channels = 2;
+#if PPSSPP_PLATFORM(SWITCH)
+	SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "2048");
+#endif
 	g_audioFramesPerBuffer = std::max(g_Config.iSDLAudioBufferSize, 128);
 
 	std::string startDevice = name;
@@ -715,6 +869,9 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 	switch (type) {
 	case SystemRequestType::RESTART_APP:
 		g_RestartRequested = true;
+#if PPSSPP_PLATFORM(SWITCH)
+		g_restartParams = param1;
+#endif
 		// TODO: Also save param1 and then split it into an argv.
 		return true;
 	case SystemRequestType::EXIT_APP:
@@ -736,6 +893,7 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 		if (R_SUCCEEDED(rc)) {
 			char buf[LIBNX_SWKBD_LIMIT] = {'\0'};
 			swkbdConfigMakePresetDefault(&kbd);
+			swkbdConfigSetType(&kbd, SwkbdType_All);
 
 			swkbdConfigSetHeaderText(&kbd, param1.c_str());
 			swkbdConfigSetInitialText(&kbd, param2.c_str());
@@ -744,7 +902,11 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 
 			swkbdClose(&kbd);
 
-			g_requestManager.PostSystemSuccess(requestId, buf);
+			if (R_SUCCEEDED(rc)) {
+				g_requestManager.PostSystemSuccess(requestId, buf);
+			} else {
+				g_requestManager.PostSystemFailure(requestId);
+			}
 			return true;
 		}
 
@@ -791,7 +953,7 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 		DarwinFileSystemServices::presentDirectoryPanel(callback, /* allowFiles = */ false, /* allowDirectories = */ true);
 		return true;
 	}
-#else
+#elif !PPSSPP_PLATFORM(SWITCH)
 	case SystemRequestType::BROWSE_FOR_IMAGE:
 	{
 		// TODO: Add non-blocking support.
@@ -1019,6 +1181,41 @@ std::string System_GetProperty(SystemProperty prop) {
 		return "SDL:";
 #endif
 	case SYSPROP_LANGREGION: {
+#if PPSSPP_PLATFORM(SWITCH)
+		uint64_t languageCode = 0;
+		SetLanguage language = SetLanguage_ENUS;
+		if (R_SUCCEEDED(setInitialize())) {
+			Result rc = setGetSystemLanguage(&languageCode);
+			if (R_SUCCEEDED(rc)) {
+				rc = setMakeLanguage(languageCode, &language);
+			}
+			setExit();
+			if (R_FAILED(rc)) {
+				language = SetLanguage_ENUS;
+			}
+		}
+		switch (language) {
+		case SetLanguage_JA: return "ja_JP";
+		case SetLanguage_FR:
+		case SetLanguage_FRCA: return "fr_FR";
+		case SetLanguage_DE: return "de_DE";
+		case SetLanguage_IT: return "it_IT";
+		case SetLanguage_ES: return "es_ES";
+		case SetLanguage_ZHCN:
+		case SetLanguage_ZHHANS: return "zh_CN";
+		case SetLanguage_KO: return "ko_KR";
+		case SetLanguage_NL: return "nl_NL";
+		case SetLanguage_PT: return "pt_PT";
+		case SetLanguage_RU: return "ru_RU";
+		case SetLanguage_ZHTW:
+		case SetLanguage_ZHHANT: return "zh_TW";
+		case SetLanguage_ES419: return "es_LA";
+		case SetLanguage_PTBR: return "pt_BR";
+		case SetLanguage_ENUS:
+		case SetLanguage_ENGB:
+		default: return "en_US";
+		}
+#else
 		// Get user-preferred locale from OS
 		setlocale(LC_ALL, "");
 		std::string locale(setlocale(LC_ALL, NULL));
@@ -1041,6 +1238,7 @@ std::string System_GetProperty(SystemProperty prop) {
 			}
 		}
 		return "en_US";
+#endif
 	}
 	case SYSPROP_CLIPBOARD_TEXT:
 		return SDL_HasClipboardText() ? SDL_GetClipboardText() : "";
@@ -1187,7 +1385,11 @@ bool System_GetPropertyBool(SystemProperty prop) {
 		return true;
 #if PPSSPP_PLATFORM(SWITCH)
 	case SYSPROP_HAS_TEXT_INPUT_DIALOG:
-		return __nx_applet_type == AppletType_Application || __nx_applet_type != AppletType_SystemApplication;
+		return __nx_applet_type == AppletType_Application || __nx_applet_type == AppletType_SystemApplication;
+	case SYSPROP_KEYBOARD_IS_SOFT:
+		return true;
+	case SYSPROP_APPLET_MODE:
+		return SwitchIsAppletMode();
 #endif
 	case SYSPROP_HAS_KEYBOARD:
 		return true;
@@ -1210,6 +1412,8 @@ case SYSPROP_HAS_FOLDER_BROWSER:
 case SYSPROP_HAS_FILE_BROWSER:
 #if PPSSPP_PLATFORM(MAC)
 		return true;
+#elif PPSSPP_PLATFORM(SWITCH)
+		return false;
 #else
 		return pfd::settings::available();
 #endif
@@ -1274,6 +1478,7 @@ struct InputStateTracker {
 
 	int mouseDown;  // bitflags
 	bool mouseCaptured;
+	TouchMapper touchMap;
 };
 
 SDL_Cursor *g_builtinCursors[SDL_SYSTEM_CURSOR_COUNT];
@@ -1468,10 +1673,14 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 #if !PPSSPP_PLATFORM(MAC)
 	case SDL_EVENT_FINGER_MOTION:
 		{
+			int touchId = inputTracker->touchMap.TouchId(event.tfinger.fingerID);
+			if (touchId < 0) {
+				break;
+			}
 			int w, h;
 			SDL_GetWindowSize(window, &w, &h);
 			TouchInput input{};
-			input.id = event.tfinger.fingerID;
+			input.id = touchId;
 			input.x = event.tfinger.x * w * g_DesktopDPI * g_display.dpi_scale_x;
 			input.y = event.tfinger.y * h * g_DesktopDPI * g_display.dpi_scale_y;
 			input.flags = TouchInputFlags::MOVE;
@@ -1481,40 +1690,55 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 		}
 	case SDL_EVENT_FINGER_DOWN:
 		{
+			int touchId = inputTracker->touchMap.TouchId(event.tfinger.fingerID);
+			if (touchId < 0) {
+				touchId = inputTracker->touchMap.AddNewTouch(event.tfinger.fingerID);
+			}
+			if (touchId < 0) {
+				break;
+			}
 			int w, h;
 			SDL_GetWindowSize(window, &w, &h);
 			TouchInput input{};
-			input.id = event.tfinger.fingerID;
+			input.id = touchId;
 			input.x = event.tfinger.x * w * g_DesktopDPI * g_display.dpi_scale_x;
 			input.y = event.tfinger.y * h * g_DesktopDPI * g_display.dpi_scale_y;
 			input.flags = TouchInputFlags::DOWN;
 			input.timestamp = event.tfinger.timestamp;
 			NativeTouch(input);
 
+#if !PPSSPP_PLATFORM(SWITCH)
 			KeyInput key{};
 			key.deviceId = DEVICE_ID_MOUSE;
 			key.keyCode = NKCODE_EXT_MOUSEBUTTON_1;
 			key.flags = KeyInputFlags::DOWN;
 			NativeKey(key);
+#endif
 			break;
 		}
 	case SDL_EVENT_FINGER_UP:
 		{
+			int touchId = inputTracker->touchMap.RemoveTouch(event.tfinger.fingerID);
+			if (touchId < 0) {
+				break;
+			}
 			int w, h;
 			SDL_GetWindowSize(window, &w, &h);
 			TouchInput input{};
-			input.id = event.tfinger.fingerID;
+			input.id = touchId;
 			input.x = event.tfinger.x * w * g_DesktopDPI * g_display.dpi_scale_x;
 			input.y = event.tfinger.y * h * g_DesktopDPI * g_display.dpi_scale_y;
 			input.flags = TouchInputFlags::UP;
 			input.timestamp = event.tfinger.timestamp;
 			NativeTouch(input);
 
+#if !PPSSPP_PLATFORM(SWITCH)
 			KeyInput key;
 			key.deviceId = DEVICE_ID_MOUSE;
 			key.keyCode = NKCODE_EXT_MOUSEBUTTON_1;
 			key.flags = KeyInputFlags::UP;
 			NativeKey(key);
+#endif
 			break;
 		}
 #endif
@@ -1713,6 +1937,9 @@ static void ProcessSDLEvent(SDL_Window *window, const SDL_Event &event, InputSta
 }
 
 void UpdateTextFocus(SDL_Window *window) {
+#if PPSSPP_PLATFORM(SWITCH)
+	g_textFocusChanged = false;
+#else
 	if (g_textFocusChanged) {
 		DEBUG_LOG(Log::System, "Updating text focus: %d", g_textFocus);
 		if (g_textFocus) {
@@ -1722,6 +1949,7 @@ void UpdateTextFocus(SDL_Window *window) {
 		}
 		g_textFocusChanged = false;
 	}
+#endif
 }
 
 void UpdateSDLCursor() {
@@ -1753,6 +1981,9 @@ void UpdateSDLCursor() {
 int main(int argc, char *argv[]) {
 	TimeInit();
 
+#if PPSSPP_PLATFORM(SWITCH)
+	std::string restartHandoff = SwitchTakeRestartHandoff();
+#endif
 	CommandLineOptions cmdLineOptions;
 	CommandLineParseResult parseResult = cmdLineOptions.Parse(argc, (const char **)argv);
 	switch (parseResult) {
@@ -1765,11 +1996,39 @@ int main(int argc, char *argv[]) {
 		break;
 	}
 
+#if PPSSPP_PLATFORM(SWITCH)
+	if (!restartHandoff.empty()) {
+		const char *restartArgv[] = { argc > 0 && argv[0] ? argv[0] : "PPSSPP", restartHandoff.c_str() };
+		parseResult = cmdLineOptions.Parse((int)ARRAY_SIZE(restartArgv), restartArgv);
+		if (parseResult != CommandLineParseResult::Continue) {
+			return parseResult == CommandLineParseResult::Exit ? 0 : 1;
+		}
+	}
+	SetCurrentThreadToProcessAffinity();
+	if (argc > 0 && argv[0]) {
+		g_switchExecutablePath = SwitchNormalizeNroPath(argv[0]);
+	}
+	if (g_switchExecutablePath.empty()) {
+		g_switchExecutablePath = "sdmc:/switch/ppsspp-nx/PPSSPP.nro";
+	}
+	SwitchUpdate_SetExecutablePath(g_switchExecutablePath);
+	std::string updateRecoveryError;
+	if (!SwitchUpdate_RecoverInstallation(&updateRecoveryError)) {
+		fprintf(stderr, "Update recovery failed: %s\n", updateRecoveryError.c_str());
+	}
+#endif
+
 	g_logManager.EnableOutput(LogOutput::Stdio);
 
 #ifdef HAVE_LIBNX
-	socketInitializeDefault();
-	nxlinkStdio();
+	if (R_FAILED(romfsInit())) {
+		fprintf(stderr, "Unable to mount RomFS.\n");
+		return 1;
+	}
+	if (R_SUCCEEDED(socketInitializeDefault())) {
+		g_socketInitialized = true;
+		g_nxlinkSocket = nxlinkStdio();
+	}
 #else // HAVE_LIBNX
 	// Ignore sigpipe.
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
@@ -1932,7 +2191,7 @@ int main(int argc, char *argv[]) {
 	// Mac / Linux
 	char path[2048] = {};
 #if PPSSPP_PLATFORM(SWITCH)
-	strcpy(path, "/switch/ppsspp/");
+	strcpy(path, "/switch/ppsspp-nx/");
 #else
 	const char *the_path = getenv("HOME");
 	if (!the_path) {
@@ -1960,6 +2219,15 @@ int main(int argc, char *argv[]) {
 	// After NativeInit, code should no longer look at cmdLineOptions, they should have been translated
 	// into g_Config settings. This is because NativeInit may modify g_Config settings based on the command line options.
 	NativeInit(argc, (const char **)argv, cmdLineOptions, path, external_dir, nullptr);
+
+#if PPSSPP_PLATFORM(SWITCH)
+	File::CreateFullPath(Path("/switch/ppsspp-nx/lsfg"));
+	SwitchLSFG_Configure(g_Config.bSwitchFrameGeneration && g_Config.iGPUBackend == (int)GPUBackend::VULKAN, 0.25f, true);
+	SwitchLibrary::Initialize();
+	File::CreateFullPath(Path("/switch/ppsspp-nx/cache/mesa"));
+	setenv("MESA_SHADER_CACHE_DIR", "/switch/ppsspp-nx/cache/mesa", 1);
+	setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 1);
+#endif
 
 	// Use the setting from the config when initing the window.
 	if (g_Config.bFullScreen) {
@@ -1998,6 +2266,9 @@ int main(int argc, char *argv[]) {
 	case GPUBackend::OPENGL:
 		fallbackGPUBackend = (int)GPUBackend::VULKAN;
 		break;
+	case GPUBackend::ZINK:
+		fallbackGPUBackend = (int)GPUBackend::VULKAN;
+		break;
 	default:
 		fprintf(stderr, "Unknown GPU backend %d, switching to Vulkan.\n", g_Config.iGPUBackend);
 		g_Config.iGPUBackend = (int)GPUBackend::VULKAN;
@@ -2009,7 +2280,11 @@ int main(int argc, char *argv[]) {
 	WindowDesc windowDesc;
 	auto initializeBackend = [&](GPUBackend backend, GraphicsContext **graphicsContext, std::string *errorMessage) -> bool {
 		GraphicsContext *ctx = nullptr;
-		if (backend == GPUBackend::OPENGL) {
+		windowDesc = {};
+		if (backend == GPUBackend::OPENGL || backend == GPUBackend::ZINK) {
+#if PPSSPP_PLATFORM(SWITCH)
+			setenv("GALLIUM_DRIVER", backend == GPUBackend::ZINK ? "zink" : "nouveau", 1);
+#endif
 			SDL_GLContext glContext = nullptr;
 			window = CreateSDLGLWindowAndContext(x, y, w, h, mode, cmdLineOptions.force_gl_version, &glContext, errorMessage);
 
@@ -2021,8 +2296,24 @@ int main(int argc, char *argv[]) {
 		} else {
 			// Use a local copy of mode: this flag combination is Vulkan-specific, and if we fall back to
 			// OpenGL below, we don't want SDL_WINDOW_VULKAN to stick around and get OR'd in there too.
-			Uint32 vulkanMode = mode | SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN;
+			Uint32 vulkanMode = mode | SDL_WINDOW_HIDDEN;
+#if PPSSPP_PLATFORM(SWITCH)
+			SDL_PropertiesID windowProperties = SDL_CreateProperties();
+			if (windowProperties) {
+				SDL_SetStringProperty(windowProperties, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "Initializing graphics...");
+				SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_X_NUMBER, x);
+				SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_Y_NUMBER, y);
+				SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, w);
+				SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, h);
+				SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, vulkanMode);
+				SDL_SetBooleanProperty(windowProperties, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, true);
+				window = SDL_CreateWindowWithProperties(windowProperties);
+				SDL_DestroyProperties(windowProperties);
+			}
+#else
+			vulkanMode |= SDL_WINDOW_VULKAN;
 			window = SDL_CreateWindow("Initializing graphics...", w, h, (SDL_WindowFlags)vulkanMode);
+#endif
 			if (!window) {
 				if (errorMessage) {
 					*errorMessage = StringFromFormat("Error creating SDL window: %s", SDL_GetError());
@@ -2043,6 +2334,11 @@ int main(int argc, char *argv[]) {
 
 		if (!ctx->InitAPI(nullptr, &g_Config.sVulkanDevice, errorMessage)) {
 			fprintf(stderr, "Graphics initialization failed: %s\n", errorMessage->c_str());
+			delete ctx;
+			if (window) {
+				SDL_DestroyWindow(window);
+				window = nullptr;
+			}
 			return false;
 		}
 
@@ -2052,13 +2348,27 @@ int main(int argc, char *argv[]) {
 			VulkanContext *vkctx = (VulkanContext *)vkgfxctx->GetAPIContext();
 			vkctx->SetCbGetDrawSize([window]() {
 				int w=1,h=1;
+#if PPSSPP_PLATFORM(SWITCH)
+				u32 width = 1, height = 1;
+				if (R_SUCCEEDED(nwindowGetDimensions(nwindowGetDefault(), &width, &height))) {
+					w = (int)width;
+					h = (int)height;
+				}
+#else
 				SDL_GetWindowSizeInPixels(window, &w, &h);
+#endif
 				return VkExtent2D {(uint32_t)w, (uint32_t)h};
 			});
 		}
 
 		if (!ctx->InitSurface(windowDesc.winsys, windowDesc.data1, windowDesc.data2, errorMessage)) {
 			fprintf(stderr, "Surface creation failed: %s\n", errorMessage->c_str());
+			ctx->ShutdownAPI();
+			delete ctx;
+			if (window) {
+				SDL_DestroyWindow(window);
+				window = nullptr;
+			}
 			return false;
 		}
 
@@ -2176,6 +2486,7 @@ int main(int argc, char *argv[]) {
 	SDL_Semaphore *battery_poll_thread_sema = SDL_CreateSemaphore(0); // c++20 and onwards has semaphore
 
 	std::thread battery_poll_thread([&battery_poll_thread_sema, &stop_battery_poll_thread] {
+		SetCurrentThreadAffinity(ThreadAffinityRole::BACKGROUND);
 		while (!stop_battery_poll_thread) {
 			SDL_WaitSemaphore(battery_poll_thread_sema);
 			SDL_GetPowerInfo(nullptr, &g_batteryPercent);
@@ -2210,10 +2521,14 @@ int main(int argc, char *argv[]) {
 				return keepRunning;
 			});
 		});
+		SetCurrentThreadAffinity(ThreadAffinityRole::EVENT);
 
 		// The SDL main thread only becomes a plain message pump. This allows for lower latency
 		// input events, and so on. The spawned main thread runs emulation and rendering.
 		while (true) {
+#if PPSSPP_PLATFORM(SWITCH)
+			CheckSwitchOperationMode();
+#endif
 			SDL_Event event;
 			if (SDL_WaitEventTimeout(&event, 100)) {
 				do {
@@ -2246,11 +2561,15 @@ int main(int argc, char *argv[]) {
 		emuThread.join();
 	} else {
 		// OpenGL mode uses this path.
+		SetCurrentThreadAffinity(ThreadAffinityRole::RENDER);
 		std::thread emuThread = EmuThread_Start(graphicsContext, new NativeApplication(), [&](GraphicsContext *graphicsContext){
 			NativeFrame(graphicsContext);
 			return true;
 		});
 		while (true) {
+#if PPSSPP_PLATFORM(SWITCH)
+			CheckSwitchOperationMode();
+#endif
 			// OpenGL mode uses this.
 			{
 				SDL_Event event;
@@ -2304,8 +2623,14 @@ int main(int argc, char *argv[]) {
 	graphicsContext->ShutdownSurface();
 	graphicsContext->ShutdownAPI();
 	delete graphicsContext;
+	SDL_DestroyWindow(window);
+	window = nullptr;
 
 	NativeShutdown();
+
+#if PPSSPP_PLATFORM(SWITCH)
+	SwitchLibrary::Shutdown();
+#endif
 
 
 	for (int i = 0; i < SDL_SYSTEM_CURSOR_COUNT; ++i) {
@@ -2324,7 +2649,34 @@ int main(int argc, char *argv[]) {
 	glslang::FinalizeProcess();
 	fprintf(stderr, "Leaving main\n");
 #ifdef HAVE_LIBNX
-	socketExit();
+	if (g_nxlinkSocket >= 0) {
+		close(g_nxlinkSocket);
+		g_nxlinkSocket = -1;
+	}
+	if (g_socketInitialized) {
+		socketExit();
+		g_socketInitialized = false;
+	}
+	romfsExit();
+#endif
+
+#if PPSSPP_PLATFORM(SWITCH)
+	if (g_RestartRequested) {
+		bool handoffReady = g_restartParams.empty() || SwitchWriteRestartHandoff(g_restartParams);
+		if (handoffReady && (__nx_applet_type == AppletType_Application || __nx_applet_type == AppletType_SystemApplication)) {
+			appletRestartProgram(nullptr, 0);
+			remove(SWITCH_RESTART_HANDOFF);
+		}
+		std::string restartArgs = g_switchExecutablePath;
+		if (!g_restartParams.empty()) {
+			restartArgs += " ";
+			restartArgs += g_restartParams;
+		}
+		Result rc = envSetNextLoad(g_switchExecutablePath.c_str(), restartArgs.c_str());
+		if (R_SUCCEEDED(rc)) {
+			return 0;
+		}
+	}
 #endif
 
 	// If a restart was requested (and supported on this platform), respawn the executable.

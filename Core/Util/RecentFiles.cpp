@@ -37,6 +37,7 @@ void RecentFilesManager::EnsureThread() {
 	thread_ = std::thread([this] {
 		// NOTE: Can't create the thread in the constructor, because at that point,
 		// JNI attachment doesn't yet work.
+		SetCurrentThreadAffinity(ThreadAffinityRole::IO);
 		SetCurrentThreadName("RecentISOThreadFunc");
 		AndroidJNIThreadContext jniContext;  // destructor detaches
 		ThreadFunc();

@@ -17,6 +17,7 @@
 
 #include "ppsspp_config.h"
 
+#include <algorithm>
 #include <sstream>
 
 #if PPSSPP_PLATFORM(IOS) || PPSSPP_PLATFORM(MAC)
@@ -297,6 +298,16 @@ void CPUInfo::Detect()
 	SYSTEM_INFO sysInfo;
 	GetSystemInfo(&sysInfo);
 	num_cores = sysInfo.dwNumberOfProcessors;
+#elif PPSSPP_PLATFORM(SWITCH)
+	strcpy(brand_string, "NVIDIA Tegra X1");
+	isVFP3 = true;
+	isVFP4 = true;
+	uint64_t coreMask = 0;
+	if (R_SUCCEEDED(svcGetInfo(&coreMask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && coreMask) {
+		num_cores = std::min(__builtin_popcountll(coreMask), 3);
+	} else {
+		num_cores = 3;
+	}
 #else // !PPSSPP_PLATFORM(IOS) && !PPSSPP_PLATFORM(MAC) && !PPSSPP_PLATFORM(WINDOWS)
 	strcpy(brand_string, "Unknown");
 	num_cores = 1;
@@ -318,6 +329,10 @@ void CPUInfo::Detect()
 	bIDIVt = isVFP4;
 	bFP = false;
 	bASIMD = false;
+#if PPSSPP_PLATFORM(SWITCH)
+	bFP = true;
+	bASIMD = true;
+#endif
 #else // PPSSPP_PLATFORM(LINUX)
 	truncate_cpy(cpu_string, GetCPUString());
 	truncate_cpy(brand_string, GetCPUBrandString());

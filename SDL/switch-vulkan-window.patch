@@ -1,0 +1,76 @@
+diff --git a/src/video/switch/SDL_switchtouch.c b/src/video/switch/SDL_switchtouch.c
+index b4c6716..0d7aa7e 100644
+--- a/src/video/switch/SDL_switchtouch.c
++++ b/src/video/switch/SDL_switchtouch.c
+@@ -67,7 +67,7 @@ void SWITCH_PollTouch(Uint64 timestamp)
+ 
+                 for (j = 0; j < touchStateOld.count; j++) {
+                     if (touchStateOld.touches[j].finger_id == touchState.touches[i].finger_id) {
+-                        found = false;
++                        found = true;
+                         break;
+                     }
+                 }
+@@ -75,7 +75,7 @@ void SWITCH_PollTouch(Uint64 timestamp)
+                 if (!found) {
+                     SDL_SendTouch(timestamp, id,
+                                   (SDL_FingerID)touchState.touches[i].finger_id + 1,
+-                                  window, false,
++                                  window, SDL_EVENT_FINGER_DOWN,
+                                   (float)touchState.touches[i].x / rel_w,
+                                   (float)touchState.touches[i].y / rel_h, 1);
+                 }
+@@ -88,7 +88,7 @@ void SWITCH_PollTouch(Uint64 timestamp)
+ 
+             for (j = 0; j < touchState.count; j++) {
+                 if (touchState.touches[j].finger_id == touchStateOld.touches[i].finger_id) {
+-                    found = false;
++                    found = true;
+                     /* Finger moved */
+                     if (touchState.touches[j].x != touchStateOld.touches[i].x || touchState.touches[j].y != touchStateOld.touches[i].y) {
+                         SDL_SendTouchMotion(timestamp, id,
+@@ -106,7 +106,7 @@ void SWITCH_PollTouch(Uint64 timestamp)
+                 SDL_SendTouch(timestamp, id,
+                               (SDL_FingerID)touchStateOld.touches[i].finger_id + 1,
+                               window,
+-                              false,
++                              SDL_EVENT_FINGER_UP,
+                               (float)touchStateOld.touches[i].x / rel_w,
+                               (float)touchStateOld.touches[i].y / rel_h, 1);
+             }
+diff --git a/src/video/switch/SDL_switchvideo.c b/src/video/switch/SDL_switchvideo.c
+index 8742877..f20da67 100644
+--- a/src/video/switch/SDL_switchvideo.c
++++ b/src/video/switch/SDL_switchvideo.c
+@@ -242,10 +242,6 @@ static bool SWITCH_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_
+         return SDL_SetError("Switch only supports one window");
+     }
+ 
+-    if (!_this->egl_data) {
+-        return SDL_SetError("EGL not initialized");
+-    }
+-
+     window_data = (SDL_WindowData *)SDL_calloc(1, sizeof(SDL_WindowData));
+     if (window_data == NULL) {
+         return SDL_OutOfMemory();
+@@ -258,9 +254,17 @@ static bool SWITCH_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_
+         return SDL_SetError("Could not set NWindow dimensions: 0x%x", rc);
+     }
+ 
+-    window_data->egl_surface = SDL_EGL_CreateSurface(_this, window, nWindow);
+-    if (window_data->egl_surface == EGL_NO_SURFACE) {
+-        return SDL_SetError("Could not create GLES window surface");
++    window_data->egl_surface = EGL_NO_SURFACE;
++    if (!window->external_graphics_context) {
++        if (!_this->egl_data) {
++            SDL_free(window_data);
++            return SDL_SetError("EGL not initialized");
++        }
++        window_data->egl_surface = SDL_EGL_CreateSurface(_this, window, nWindow);
++        if (window_data->egl_surface == EGL_NO_SURFACE) {
++            SDL_free(window_data);
++            return SDL_SetError("Could not create GLES window surface");
++        }
+     }
+ 
+     /* Setup driver data for this window */

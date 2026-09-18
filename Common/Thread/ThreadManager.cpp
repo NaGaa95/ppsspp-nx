@@ -1,8 +1,11 @@
+#include "ppsspp_config.h"
+
 #include <cstdio>
 #include <algorithm>
 #include <thread>
 #include <deque>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <vector>
 #include <atomic>
@@ -25,6 +28,13 @@ static constexpr size_t TASK_PRIORITY_COUNT = (size_t)TaskPriority::COUNT;
 
 ThreadManager g_threadManager;
 
+#if PPSSPP_PLATFORM(SWITCH)
+struct DedicatedThreadContext {
+	std::thread thread;
+	std::atomic<bool> done{false};
+};
+#endif
+
 struct GlobalThreadContext {
 	std::mutex mutex;
 	std::deque<Task *> compute_queue[TASK_PRIORITY_COUNT];
@@ -32,6 +42,11 @@ struct GlobalThreadContext {
 	std::deque<Task *> io_queue[TASK_PRIORITY_COUNT];
 	std::atomic<int> io_queue_size;
 	std::vector<TaskThreadContext *> threads_;
+
+#if PPSSPP_PLATFORM(SWITCH)
+	std::mutex dedicated_mutex;
+	std::vector<std::unique_ptr<DedicatedThreadContext>> dedicated_threads;
+#endif
 
 	std::atomic<int> roundRobin;
 };
@@ -48,6 +63,10 @@ struct TaskThreadContext {
 	char name[16];
 };
 
+#if PPSSPP_PLATFORM(SWITCH)
+static void JoinDedicatedThreads(GlobalThreadContext *global);
+#endif
+
 ThreadManager::ThreadManager() : global_(new GlobalThreadContext()) {
 	global_->compute_queue_size = 0;
 	global_->io_queue_size = 0;
@@ -62,8 +81,51 @@ ThreadManager::~ThreadManager() {
 	if (IsInitialized()) {
 		Teardown();
 	}
+#if PPSSPP_PLATFORM(SWITCH)
+	JoinDedicatedThreads(global_);
+#endif
 	delete global_;
 }
+
+#if PPSSPP_PLATFORM(SWITCH)
+static void ReapDedicatedThreads(GlobalThreadContext *global) {
+	std::vector<std::unique_ptr<DedicatedThreadContext>> completed;
+	{
+		std::lock_guard<std::mutex> lock(global->dedicated_mutex);
+		for (auto it = global->dedicated_threads.begin(); it != global->dedicated_threads.end();) {
+			if ((*it)->done.load(std::memory_order_acquire)) {
+				completed.push_back(std::move(*it));
+				it = global->dedicated_threads.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+	for (auto &thread : completed) {
+		if (thread->thread.joinable()) {
+			thread->thread.join();
+		}
+	}
+}
+
+static void JoinDedicatedThreads(GlobalThreadContext *global) {
+	for (;;) {
+		std::vector<std::unique_ptr<DedicatedThreadContext>> threads;
+		{
+			std::lock_guard<std::mutex> lock(global->dedicated_mutex);
+			if (global->dedicated_threads.empty()) {
+				break;
+			}
+			threads.swap(global->dedicated_threads);
+		}
+		for (auto &thread : threads) {
+			if (thread->thread.joinable()) {
+				thread->thread.join();
+			}
+		}
+	}
+}
+#endif
 
 void ThreadManager::Teardown() {
 	for (TaskThreadContext *&threadCtx : global_->threads_) {
@@ -102,6 +164,9 @@ void ThreadManager::Teardown() {
 		delete threadCtx;
 	}
 	global_->threads_.clear();
+#if PPSSPP_PLATFORM(SWITCH)
+	JoinDedicatedThreads(global_);
+#endif
 }
 
 void ThreadManager::TeardownTask(Task *task) {
@@ -117,6 +182,7 @@ void ThreadManager::TeardownTask(Task *task) {
 }
 
 static void WorkerThreadFunc(GlobalThreadContext *global, TaskThreadContext *thread) {
+	SetCurrentThreadAffinity(thread->type == TaskType::CPU_COMPUTE ? ThreadAffinityRole::COMPUTE : ThreadAffinityRole::IO);
 	if (thread->type == TaskType::CPU_COMPUTE) {
 		snprintf(thread->name, sizeof(thread->name), "PoolW %d", thread->index);
 	} else {
@@ -207,7 +273,11 @@ void ThreadManager::Init(int numRealCores, int numLogicalCoresPerCpu) {
 		Teardown();
 	}
 	
+#if PPSSPP_PLATFORM(SWITCH)
+	numComputeThreads_ = 1;
+#else
 	numComputeThreads_ = numRealCores * numLogicalCoresPerCpu;
+#endif
 	// Double it for the IO blocking threads.
 	int numThreads = numComputeThreads_ + std::max(MIN_IO_BLOCKING_THREADS, numComputeThreads_);
 	numThreads_ = numThreads;
@@ -226,12 +296,27 @@ void ThreadManager::Init(int numRealCores, int numLogicalCoresPerCpu) {
 
 void ThreadManager::EnqueueTask(Task *task) {
 	if (task->Type() == TaskType::DEDICATED_THREAD) {
+#if PPSSPP_PLATFORM(SWITCH)
+		ReapDedicatedThreads(global_);
+		std::unique_ptr<DedicatedThreadContext> dedicated(new DedicatedThreadContext());
+		DedicatedThreadContext *context = dedicated.get();
+		context->thread = std::thread([context](Task *task) {
+			SetCurrentThreadAffinity(ThreadAffinityRole::SHADER_COMPILER);
+			SetCurrentThreadName("DedicatedThreadTask");
+			task->Run();
+			task->Release();
+			context->done.store(true, std::memory_order_release);
+		}, task);
+		std::lock_guard<std::mutex> lock(global_->dedicated_mutex);
+		global_->dedicated_threads.push_back(std::move(dedicated));
+#else
 		std::thread th([=](Task *task) {
 			SetCurrentThreadName("DedicatedThreadTask");
 			task->Run();
 			task->Release();
 		}, task);
 		th.detach();
+#endif
 		return;
 	}
 

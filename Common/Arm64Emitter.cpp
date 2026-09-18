@@ -23,6 +23,10 @@
 #include <libkern/OSCacheControl.h>
 #endif
 
+#if PPSSPP_PLATFORM(SWITCH)
+#include <switch.h>
+#endif
+
 namespace Arm64Gen
 {
 
@@ -336,6 +340,12 @@ void ARM64XEmitter::FlushIcacheSection(const u8 *start, const u8 *end)
 	sys_cache_control(kCacheFunctionPrepareForExecution, (void *)start, end - start);
 #elif PPSSPP_PLATFORM(WINDOWS)
 	FlushInstructionCache(GetCurrentProcess(), start, end - start);
+#elif PPSSPP_PLATFORM(SWITCH)
+	size_t size = end - start;
+	intptr_t aliasOffset = (intptr_t)m_writable - (intptr_t)m_code;
+	void *writableStart = (void *)((intptr_t)start + aliasOffset);
+	armDCacheFlush(writableStart, size);
+	armICacheInvalidate((void *)start, size);
 #elif PPSSPP_ARCH(ARM64)
 	// Code from Dolphin, contributed by the Mono project.
 

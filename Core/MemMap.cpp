@@ -199,17 +199,25 @@ static bool Memory_TryBase(MemMapSetupFlags flags) {
 	return true;
 bail:
 	// Argh! ERROR! Free what we grabbed so far so we can try again.
+	position = 0;
+	last_position = 0;
 	for (int j = 0; j <= i; j++) {
-		if (views[i].size == 0)
+		const MemoryView &view = views[j];
+		if (view.size == 0)
 			continue;
-		if (SkipView(flags, views[i].flags))
+		if (SkipView(flags, view.flags))
 			continue;
-		if (views[j].out_ptr && *views[j].out_ptr) {
-			if (!CanIgnoreView(views[j])) {
-				g_arena.ReleaseView(0, *views[j].out_ptr, views[j].size);
-			}
-			*views[j].out_ptr = nullptr;
+		if (view.flags & MV_MIRROR_PREVIOUS) {
+			position = last_position;
 		}
+		if (view.out_ptr && *view.out_ptr) {
+			if (!CanIgnoreView(view)) {
+				g_arena.ReleaseView(position, *view.out_ptr, view.size);
+			}
+			*view.out_ptr = nullptr;
+		}
+		last_position = position;
+		position += g_arena.roundup(view.size);
 	}
 	return false;
 }
@@ -336,7 +344,14 @@ bool Init(MemMapSetupFlags flags) {
 	}
 
 	if (!MemoryMap_Setup(flags)) {
+#if PPSSPP_PLATFORM(SWITCH)
+		MemoryMap_Shutdown();
+		if (!MemoryMap_Setup(flags)) {
+			return false;
+		}
+#else
 		return false;
+#endif
 	}
 
 	INFO_LOG(Log::MemMap, "Memory system initialized. Base at %p (RAM at @ %p, uncached @ %p)",

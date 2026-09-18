@@ -525,6 +525,14 @@ std::string_view AnalogCalibrationScreen::GetTitle() const {
 	return co->T("Calibrate analog stick");
 }
 
+static float DefaultAnalogDeadzone() {
+#if PPSSPP_PLATFORM(SWITCH)
+	return 0.10f;
+#else
+	return 0.15f;
+#endif
+}
+
 void AnalogCalibrationScreen::CreateSettingsViews(UI::ViewGroup *scrollContents) {
 	using namespace UI;
 	auto co = GetI18NCategory(I18NCat::CONTROLS);
@@ -532,7 +540,7 @@ void AnalogCalibrationScreen::CreateSettingsViews(UI::ViewGroup *scrollContents)
 	scrollContents->Add(new ItemHeader(co->T("Analog Settings")));
 
 	// TODO: Would be nicer if these didn't pop up...
-	scrollContents->Add(new PopupSliderChoiceFloat(&g_Config.fAnalogDeadzone, 0.0f, 0.5f, 0.15f, co->T("Deadzone radius"), 0.01f, screenManager(), "/ 1.0"));
+	scrollContents->Add(new PopupSliderChoiceFloat(&g_Config.fAnalogDeadzone, 0.0f, 0.5f, DefaultAnalogDeadzone(), co->T("Deadzone radius"), 0.01f, screenManager(), "/ 1.0"));
 	scrollContents->Add(new PopupSliderChoiceFloat(&g_Config.fAnalogInverseDeadzone, 0.0f, 1.0f, 0.0f, co->T("Low end radius"), 0.01f, screenManager(), "/ 1.0"));
 	scrollContents->Add(new PopupSliderChoiceFloat(&g_Config.fAnalogSensitivity, 0.0f, 2.0f, 1.1f, co->T("Sensitivity (scale)", "Sensitivity"), 0.01f, screenManager(), "x"));
 	// Legacy circular toggle. Disabled when deadzone shape is set to Circle, since that already provides circular behavior.
@@ -573,7 +581,7 @@ void AnalogCalibrationScreen::CreateContentViews(UI::ViewGroup *parent) {
 }
 
 void AnalogCalibrationScreen::OnResetToDefaults(UI::EventParams &e) {
-	g_Config.fAnalogDeadzone = 0.15f;
+	g_Config.fAnalogDeadzone = DefaultAnalogDeadzone();
 	g_Config.fAnalogInverseDeadzone = 0.0f;
 	g_Config.fAnalogSensitivity = 1.1f;
 	g_Config.bAnalogIsCircular = false;

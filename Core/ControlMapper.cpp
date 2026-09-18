@@ -21,6 +21,27 @@ const float AXIS_BIND_THRESHOLD_MOUSE = 0.01f;
 
 ControlMapper g_controlMapper;
 
+#if PPSSPP_PLATFORM(SWITCH)
+static bool SwitchRightStickFaceMapping(uint32_t button, InputMapping *mapping) {
+	switch (button) {
+	case CTRL_TRIANGLE:
+		*mapping = InputMapping(DEVICE_ID_SWITCH_RIGHT_STICK, NKCODE_DPAD_UP);
+		return true;
+	case CTRL_CROSS:
+		*mapping = InputMapping(DEVICE_ID_SWITCH_RIGHT_STICK, NKCODE_DPAD_DOWN);
+		return true;
+	case CTRL_SQUARE:
+		*mapping = InputMapping(DEVICE_ID_SWITCH_RIGHT_STICK, NKCODE_DPAD_LEFT);
+		return true;
+	case CTRL_CIRCLE:
+		*mapping = InputMapping(DEVICE_ID_SWITCH_RIGHT_STICK, NKCODE_DPAD_RIGHT);
+		return true;
+	default:
+		return false;
+	}
+}
+#endif
+
 // We reduce the threshold of some axes when another axis on the same stick is active.
 // This makes it easier to hit diagonals if you bind an analog stick to four face buttons or D-Pad.
 static InputAxis GetCoAxis(InputAxis axis) {
@@ -28,6 +49,10 @@ static InputAxis GetCoAxis(InputAxis axis) {
 	case JOYSTICK_AXIS_X: return JOYSTICK_AXIS_Y;
 	case JOYSTICK_AXIS_Y: return JOYSTICK_AXIS_X;
 
+#if PPSSPP_PLATFORM(SWITCH)
+	case JOYSTICK_AXIS_Z: return JOYSTICK_AXIS_RZ;
+	case JOYSTICK_AXIS_RZ: return JOYSTICK_AXIS_Z;
+#else
 		// This looks weird, but it's simply how XInput axes are mapped.
 	case JOYSTICK_AXIS_Z: return JOYSTICK_AXIS_RX;
 	case JOYSTICK_AXIS_RX: return JOYSTICK_AXIS_Z;
@@ -35,6 +60,7 @@ static InputAxis GetCoAxis(InputAxis axis) {
 		// Not sure if these two are used.
 	case JOYSTICK_AXIS_RY: return JOYSTICK_AXIS_RZ;
 	case JOYSTICK_AXIS_RZ: return JOYSTICK_AXIS_RY;
+#endif
 
 	default:
 		return JOYSTICK_AXIS_MAX; // invalid
@@ -423,7 +449,19 @@ bool ControlMapper::UpdatePSPState(const InputMapping &changedMapping, double no
 		}
 
 		SwapMappingIfEnabled(&mappingBit);
-		if (!KeyMap::InputMappingsFromPspButtonNoLock(mappingBit, &inputMappings, false))
+		inputMappings.clear();
+		bool hasMappings = KeyMap::InputMappingsFromPspButtonNoLock(mappingBit, &inputMappings, false);
+#if PPSSPP_PLATFORM(SWITCH)
+		InputMapping rightStickMapping;
+		auto changedInput = curInput_.find(changedMapping);
+		const bool releasingRightStick = changedInput != curInput_.end() && changedInput->second.value == 0.0f;
+		if (SwitchRightStickFaceMapping(mappingBit, &rightStickMapping) &&
+			(g_Config.bRightStickFaceButtons || (rightStickMapping == changedMapping && releasingRightStick))) {
+			inputMappings.push_back(MultiInputMapping(rightStickMapping));
+			hasMappings = true;
+		}
+#endif
+		if (!hasMappings)
 			continue;
 
 		// If a mapping could consist of a combo, we could trivially check it here.

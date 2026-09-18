@@ -104,8 +104,7 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Android")
 	set(ANDROID ON)
 endif()
 
-# We only support Vulkan on Unix, macOS (by MoltenVK), Android and Windows.
-if(ANDROID OR WIN32 OR (UNIX AND NOT ARM_NO_VULKAN))
+if(ANDROID OR WIN32 OR (UNIX AND NOT ARM_NO_VULKAN) OR USE_LIBNX)
 	set(VULKAN ON)
 endif()
 
@@ -123,7 +122,11 @@ endif()
 include(CheckCXXSourceCompiles)
 include(GNUInstallDirs)
 
-add_compile_definitions(ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/ppsspp/assets/")
+if(USE_LIBNX)
+	add_compile_definitions(ASSETS_DIR="romfs:/")
+else()
+	add_compile_definitions(ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/ppsspp/assets/")
+endif()
 
 if(OPENXR AND NOT ARMV7_DEVICE)
 	add_compile_definitions(OPENXR)
@@ -190,9 +193,15 @@ option(SIMULATOR "Set to ON when targeting an x86 simulator of an ARM platform" 
 option(LIBRETRO "Set to ON to generate the libretro target" OFF)
 # :: Options
 option(USE_LIBNX "Set to ON to build for Switch(libnx)" OFF)
+option(SWITCH_ENABLE_LTO "Enable link-time optimization for Switch release builds" ON)
+set(SWITCH_LTO_JOBS "16" CACHE STRING "Parallel jobs used by the Switch LTO linker")
+set(DEFAULT_USE_MINIUPNPC ON)
+if(USE_LIBNX)
+	set(DEFAULT_USE_MINIUPNPC OFF)
+endif()
 option(USE_FFMPEG "Build with FFMPEG support" ON)
 option(USE_DISCORD "Build with Discord support" ON)
-option(USE_MINIUPNPC "Build with miniUPnPc support" ON)
+option(USE_MINIUPNPC "Build with miniUPnPc support" ${DEFAULT_USE_MINIUPNPC})
 option(USE_SYSTEM_SNAPPY "Dynamically link against system snappy" ${USE_SYSTEM_SNAPPY})
 option(USE_SYSTEM_FFMPEG "Dynamically link against system FFMPEG" ${USE_SYSTEM_FFMPEG})
 option(BUILD_BUNDLED_FFMPEG "Build bundled ffmpeg module" ${BUILD_BUNDLED_FFMPEG})
@@ -210,6 +219,99 @@ option(USE_CCACHE "Use ccache if detected" ON)
 option(USE_NO_MMAP "Disable mmap usage" OFF)
 option(USE_IAP "IAP enabled" OFF)
 option(GOLD "Gold build" OFF)
+
+if(USE_LIBNX)
+	set(CMAKE_DL_LIBS "")
+	set(CMAKE_DISABLE_PRECOMPILE_HEADERS ON)
+	set(USING_GLES2 OFF CACHE BOOL "Set to ON if target device uses OpenGL ES 2.0" FORCE)
+	set(USING_X11_VULKAN OFF)
+	add_compile_definitions(GLEW_EGL GLEW_NO_GLU GLEW_STATIC HAVE_LIBNX IMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS)
+	add_compile_options(
+		"$<$<CONFIG:Release>:-O3>"
+		"$<$<CONFIG:Release>:-g0>"
+		"-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+		"-fmacro-prefix-map=${CMAKE_SOURCE_DIR}=."
+		"-ffile-prefix-map=${CMAKE_BINARY_DIR}=build"
+		"-fmacro-prefix-map=${CMAKE_BINARY_DIR}=build")
+	add_link_options("-Wl,--build-id=none")
+	if(SWITCH_ENABLE_LTO)
+		include(CheckIPOSupported)
+		check_ipo_supported(RESULT SWITCH_IPO_SUPPORTED OUTPUT SWITCH_IPO_ERROR LANGUAGES C CXX)
+		if(NOT SWITCH_IPO_SUPPORTED)
+			message(FATAL_ERROR "Switch LTO is unavailable: ${SWITCH_IPO_ERROR}")
+		endif()
+		if(NOT SWITCH_LTO_JOBS MATCHES "^[1-9][0-9]*$")
+			message(FATAL_ERROR "SWITCH_LTO_JOBS must be a positive integer")
+		endif()
+		set(CMAKE_C_COMPILE_OPTIONS_IPO "-flto=${SWITCH_LTO_JOBS}" "-fno-fat-lto-objects")
+		set(CMAKE_CXX_COMPILE_OPTIONS_IPO "-flto=${SWITCH_LTO_JOBS}" "-fno-fat-lto-objects")
+		set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+	endif()
+
+	include(FetchContent)
+	set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+	set(ENABLE_EXAMPLES OFF CACHE BOOL "" FORCE)
+	set(ENABLE_LIBKRB5 OFF CACHE BOOL "" FORCE)
+	set(ENABLE_GSSAPI OFF CACHE BOOL "" FORCE)
+	FetchContent_Declare(libsmb2
+		GIT_REPOSITORY https://github.com/ITotalJustice/libsmb2.git
+		GIT_TAG 867beea093f2863dfddea01945204f724afd6c45)
+	FetchContent_MakeAvailable(libsmb2)
+	target_compile_definitions(smb2 PRIVATE AES128_ECB_encrypt=smb2_AES128_ECB_encrypt)
+	target_compile_options(smb2 PRIVATE -UNEED_WRITEV)
+
+	set(USBHSFS_GPL OFF CACHE BOOL "" FORCE)
+	set(USBHSFS_NTFS ON CACHE BOOL "" FORCE)
+	set(USBHSFS_EXT4 OFF CACHE BOOL "" FORCE)
+	set(USBHSFS_SXOS_DISABLE ON CACHE BOOL "" FORCE)
+	set(USBHSFS_EXAMPLES OFF CACHE BOOL "" FORCE)
+	set(PPSSPP_LIBUSBHSFS_REVISION 625269b7725a6e2a3f2724e8d45b602c1b20ead5)
+	FetchContent_Declare(libusbhsfs
+		GIT_REPOSITORY https://github.com/ITotalJustice/libusbhsfs.git
+		GIT_TAG ${PPSSPP_LIBUSBHSFS_REVISION})
+	FetchContent_MakeAvailable(libusbhsfs)
+
+	find_package(Git REQUIRED)
+	set(PPSSPP_LIBUSBHSFS_PATCH_DIR "${CMAKE_SOURCE_DIR}/dist/switch/libusbhsfs")
+	foreach(PPSSPP_LIBUSBHSFS_PATCH
+		"${PPSSPP_LIBUSBHSFS_PATCH_DIR}/0001-add-uasp-transport-hooks.patch"
+		"${PPSSPP_LIBUSBHSFS_PATCH_DIR}/0002-fallback-to-bot-interface.patch"
+		"${PPSSPP_LIBUSBHSFS_PATCH_DIR}/0003-cleanup-after-uasp-reset.patch")
+		execute_process(
+			COMMAND "${GIT_EXECUTABLE}" -c "safe.directory=${libusbhsfs_SOURCE_DIR}"
+				apply --ignore-space-change --check "${PPSSPP_LIBUSBHSFS_PATCH}"
+			WORKING_DIRECTORY "${libusbhsfs_SOURCE_DIR}"
+			RESULT_VARIABLE PPSSPP_LIBUSBHSFS_PATCH_CHECK
+			OUTPUT_QUIET ERROR_QUIET)
+		if(PPSSPP_LIBUSBHSFS_PATCH_CHECK EQUAL 0)
+			execute_process(
+				COMMAND "${GIT_EXECUTABLE}" -c "safe.directory=${libusbhsfs_SOURCE_DIR}"
+					apply --ignore-space-change "${PPSSPP_LIBUSBHSFS_PATCH}"
+				WORKING_DIRECTORY "${libusbhsfs_SOURCE_DIR}"
+				RESULT_VARIABLE PPSSPP_LIBUSBHSFS_PATCH_RESULT)
+			if(NOT PPSSPP_LIBUSBHSFS_PATCH_RESULT EQUAL 0)
+				message(FATAL_ERROR "Failed to apply ${PPSSPP_LIBUSBHSFS_PATCH}")
+			endif()
+		else()
+			execute_process(
+				COMMAND "${GIT_EXECUTABLE}" -c "safe.directory=${libusbhsfs_SOURCE_DIR}"
+					apply --ignore-space-change --reverse --check "${PPSSPP_LIBUSBHSFS_PATCH}"
+				WORKING_DIRECTORY "${libusbhsfs_SOURCE_DIR}"
+				RESULT_VARIABLE PPSSPP_LIBUSBHSFS_PATCH_REVERSE_CHECK
+				OUTPUT_QUIET ERROR_QUIET)
+			if(NOT PPSSPP_LIBUSBHSFS_PATCH_REVERSE_CHECK EQUAL 0)
+				message(FATAL_ERROR "The pinned libusbhsfs source does not match ${PPSSPP_LIBUSBHSFS_PATCH}")
+			endif()
+		endif()
+	endforeach()
+	target_sources(libusbhsfs PRIVATE
+		"${PPSSPP_LIBUSBHSFS_PATCH_DIR}/usbhsfs_uasp.c"
+		"${PPSSPP_LIBUSBHSFS_PATCH_DIR}/usbhsfs_uasp.h")
+	target_include_directories(libusbhsfs PRIVATE
+		"${PPSSPP_LIBUSBHSFS_PATCH_DIR}"
+		"${libusbhsfs_SOURCE_DIR}/source")
+	target_compile_definitions(libusbhsfs PRIVATE get_fattime=usbhsfs_get_fattime)
+endif()
 
 if(USE_CCACHE)
 	include(ccache)
@@ -273,7 +375,23 @@ endif()
 
 # naett wraps a native HTTPS implementation per platform: WinHTTP on Windows, the Java
 # APIs on Android, NSURLSession on macOS, and libcurl elsewhere.
-if(WIN32 OR ANDROID OR (APPLE AND NOT IOS))
+if(USE_LIBNX)
+	set(PPSSPP_SWITCH_RELEASE_VERSION "1.0.0" CACHE STRING "PPSSPP Switch release version")
+	add_compile_definitions(PPSSPP_SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION}")
+	find_path(SWITCH_CURL_INCLUDE_DIR curl/curl.h REQUIRED)
+	find_library(SWITCH_CURL_LIBRARY NAMES curl REQUIRED)
+	find_library(SWITCH_MBEDTLS_LIBRARY NAMES mbedtls REQUIRED)
+	find_library(SWITCH_MBEDX509_LIBRARY NAMES mbedx509 REQUIRED)
+	find_library(SWITCH_MBEDCRYPTO_LIBRARY NAMES mbedcrypto REQUIRED)
+	add_library(SwitchCurl INTERFACE)
+	target_include_directories(SwitchCurl INTERFACE "${SWITCH_CURL_INCLUDE_DIR}")
+	target_compile_definitions(SwitchCurl INTERFACE CURL_STATICLIB)
+	target_link_libraries(SwitchCurl INTERFACE
+		"${SWITCH_CURL_LIBRARY}"
+		"${SWITCH_MBEDTLS_LIBRARY}"
+		"${SWITCH_MBEDX509_LIBRARY}"
+		"${SWITCH_MBEDCRYPTO_LIBRARY}")
+elseif(WIN32 OR ANDROID OR (APPLE AND NOT IOS))
 	# Nothing to do, these need no external library.
 elseif(UNIX AND NOT APPLE AND NOT LIBRETRO)
 	# We only need the curl headers at build time - libcurl itself is loaded with dlopen
@@ -307,7 +425,11 @@ include_directories(ext/glslang)
 # Anyway, glew will be going away anyway.
 include_directories(ext/glew)
 
-if(OPENXR AND NOT ARMV7_DEVICE)
+if(USE_LIBNX)
+	find_package(OpenGL CONFIG REQUIRED)
+	find_package(Vulkan CONFIG REQUIRED)
+	set(OPENGL_LIBRARIES OpenGL::GL)
+elseif(OPENXR AND NOT ARMV7_DEVICE)
 	set(OPENGL_LIBRARIES GLESv3 EGL)
 elseif(NOT OPENGL_LIBRARIES AND USING_GLES2)
 	set(OPENGL_LIBRARIES GLESv2 EGL)
@@ -340,25 +462,35 @@ if(NOT LIBRETRO AND NOT IOS AND NOT LOONGARCH64_DEVICE AND NOT ANDROID)
 			message(FATAL_ERROR "SDL3 not found. Install SDL3 development packages for your distribution and retry.")
 		endif()
 	endif()
-	set(SDL_LIB_TARGET SDL3::SDL3)
-	find_package(SDL3_ttf QUIET)
-	if(NOT SDL3_ttf_FOUND)
-		if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (EXISTS "/usr/bin/apt" OR EXISTS "/usr/bin/apt-get" OR EXISTS "/etc/debian_version"))
-			message(FATAL_ERROR "SDL3_ttf not found. Install dependencies with: sudo apt install libsdl3-ttf-dev")
-		else()
-			message(FATAL_ERROR "SDL3_ttf not found. Install SDL3_ttf development packages for your distribution and retry.")
-		endif()
-	endif()
-	set(SDL_TTF_LIB_TARGET SDL3_ttf::SDL3_ttf)
-	message(STATUS "Using SDL3 and SDL3_ttf")
-	add_compile_definitions(USE_SDL3_TTF)
-	find_package(Fontconfig QUIET)
-	if(Fontconfig_FOUND)
-		set(FONTCONFIG_LIB_TARGET Fontconfig::Fontconfig)
-		add_compile_definitions(USE_SDL3_TTF_FONTCONFIG)
-		message(STATUS "Using Fontconfig for SDL3_ttf fallback fonts")
+	if(USE_LIBNX)
+		set(SDL_LIB_TARGET SDL3::SDL3-static)
+		get_target_property(SWITCH_SDL3_LINK_LIBRARIES SDL3::SDL3-static INTERFACE_LINK_LIBRARIES)
+		list(REMOVE_ITEM SWITCH_SDL3_LINK_LIBRARIES
+			EGL glapi drm_nouveau
+			"$<LINK_ONLY:EGL>" "$<LINK_ONLY:glapi>" "$<LINK_ONLY:drm_nouveau>")
+		set_property(TARGET SDL3::SDL3-static PROPERTY INTERFACE_LINK_LIBRARIES "${SWITCH_SDL3_LINK_LIBRARIES}")
+		message(STATUS "Using SDL3 with atlas fonts")
 	else()
-		message(WARNING "Fontconfig not found - SDL3_ttf fallback fonts for missing glyphs will be limited")
+		set(SDL_LIB_TARGET SDL3::SDL3)
+		find_package(SDL3_ttf QUIET)
+		if(NOT SDL3_ttf_FOUND)
+			if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND (EXISTS "/usr/bin/apt" OR EXISTS "/usr/bin/apt-get" OR EXISTS "/etc/debian_version"))
+				message(FATAL_ERROR "SDL3_ttf not found. Install dependencies with: sudo apt install libsdl3-ttf-dev")
+			else()
+				message(FATAL_ERROR "SDL3_ttf not found. Install SDL3_ttf development packages for your distribution and retry.")
+			endif()
+		endif()
+		set(SDL_TTF_LIB_TARGET SDL3_ttf::SDL3_ttf)
+		message(STATUS "Using SDL3 and SDL3_ttf")
+		add_compile_definitions(USE_SDL3_TTF)
+		find_package(Fontconfig QUIET)
+		if(Fontconfig_FOUND)
+			set(FONTCONFIG_LIB_TARGET Fontconfig::Fontconfig)
+			add_compile_definitions(USE_SDL3_TTF_FONTCONFIG)
+			message(STATUS "Using Fontconfig for SDL3_ttf fallback fonts")
+		else()
+			message(WARNING "Fontconfig not found - SDL3_ttf fallback fonts for missing glyphs will be limited")
+		endif()
 	endif()
 endif()
 
@@ -576,13 +708,32 @@ endmacro()
 
 add_subdirectory(ext)
 
+if(USE_LIBNX)
+	file(GLOB_RECURSE SWITCH_LSFG_SOURCES CONFIGURE_DEPENDS
+		"${CMAKE_CURRENT_SOURCE_DIR}/ext/lsfg-vk/lsfg-vk-common/src/*.cpp"
+		"${CMAKE_CURRENT_SOURCE_DIR}/ext/lsfg-vk/lsfg-vk-backend/src/*.cpp")
+	add_library(SwitchLsfgBackend STATIC
+		Common/GPU/Vulkan/lsfg/lsfg_bridge.cpp
+		${SWITCH_LSFG_SOURCES})
+	set_target_properties(SwitchLsfgBackend PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+	target_include_directories(SwitchLsfgBackend PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/Common/GPU/Vulkan/lsfg"
+		"${CMAKE_CURRENT_SOURCE_DIR}/ext/lsfg-vk/lsfg-vk-common/include"
+		"${CMAKE_CURRENT_SOURCE_DIR}/ext/lsfg-vk/lsfg-vk-backend/include"
+		"${CMAKE_CURRENT_SOURCE_DIR}/ext/lsfg-vk/lsfg-vk-backend/src")
+	target_compile_definitions(SwitchLsfgBackend PRIVATE
+		VK_USE_PLATFORM_VI_NN
+		VK_NO_PROTOTYPES
+		PPSSPP_LSFG_VULKAN_DISPATCH)
+endif()
+
 include_directories(ext/OpenXR-SDK/include)
 
 # For ext/sol includes, that are usually included as sol/*.hpp
 include_directories(ext)
 
 include_directories(Common)
-if(USING_GLES2 OR (USING_EGL AND NOT USING_FBDEV))
+if((USING_GLES2 OR (USING_EGL AND NOT USING_FBDEV)) AND NOT USE_LIBNX)
 	find_package(X11)
 endif()
 
@@ -1019,6 +1170,20 @@ else()
 		SDL/SDLUtil.cpp
 		SDL/SDLGLGraphicsContext.cpp
 	)
+	if(USE_LIBNX)
+		list(APPEND targetExtra
+			Common/File/SwitchStorage.h
+			Common/File/SwitchStorage.cpp
+			Common/GPU/Vulkan/SwitchLSFG.h
+			Common/GPU/Vulkan/SwitchLSFG.cpp
+			UI/SwitchLibrary.h
+			UI/SwitchLibrary.cpp
+			UI/SwitchLibraryScreen.h
+			UI/SwitchLibraryScreen.cpp
+			UI/SwitchUpdate.h
+			UI/SwitchUpdate.cpp)
+		list(APPEND targetExtraLibs SwitchLsfgBackend SwitchCurl smb2 libusbhsfs)
+	endif()
 	if(SDL_TTF_LIB_TARGET)
 		list(APPEND targetExtraLibs ${SDL_TTF_LIB_TARGET})
 	endif()
@@ -1056,6 +1221,9 @@ else()
 			Common/Render/Text/draw_text_sdl.h
 		)
 		list(APPEND targetExtraLibs ${SDL_LIB_TARGET})
+		if(USE_LIBNX)
+			list(APPEND targetExtraLibs Vulkan::Vulkan)
+		endif()
 	endif()
 
 	if(USING_EGL AND NOT APPLE)
@@ -1539,6 +1707,29 @@ if(NOT ANDROID)
 	file(INSTALL ${NativeAssets} DESTINATION assets)
 	file(INSTALL ${UIImages} DESTINATION assets/ui_images)
 	file(INSTALL assets/flash0 DESTINATION assets)
+endif()
+
+if(USE_LIBNX)
+	file(GLOB_RECURSE SWITCH_ROMFS_FILES CONFIGURE_DEPENDS
+		RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+		"${CMAKE_CURRENT_SOURCE_DIR}/assets/*"
+	)
+	dkp_add_asset_target(PPSSPP_romfs "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+	dkp_track_assets(PPSSPP_romfs FILES ${SWITCH_ROMFS_FILES})
+
+	nx_generate_nacp(
+		OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/PPSSPP.nacp"
+		NAME "PPSSPP"
+		AUTHOR "naga"
+		VERSION "${PPSSPP_SWITCH_RELEASE_VERSION}"
+	)
+	nx_create_nro(PPSSPP_NRO
+		TARGET ${TargetBin}
+		OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/PPSSPP.nro"
+		ICON "${CMAKE_CURRENT_SOURCE_DIR}/icons/PPSSPP-icon.jpg"
+		NACP "${CMAKE_CURRENT_BINARY_DIR}/PPSSPP.nacp"
+		ROMFS PPSSPP_romfs
+	)
 endif()
 # packaging and code signing
 if(IOS AND NOT LIBRETRO)

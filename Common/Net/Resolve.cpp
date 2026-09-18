@@ -15,12 +15,16 @@
 #include "Common/Net/Resolve.h"
 
 #ifndef HTTPS_NOT_AVAILABLE
+#if PPSSPP_PLATFORM(SWITCH)
+#include <curl/curl.h>
+#else
 #include "ext/naett-lib/naett.h"
 // Note: PPSSPP_PLATFORM(LINUX) is also set on Android, which needs no loader.
 #if PPSSPP_PLATFORM(LINUX) && !PPSSPP_PLATFORM(ANDROID)
 // On Linux, naett goes through libcurl, which we load at runtime - so HTTPS support is
 // only known once we've tried.
 #include "ext/naett-lib/src/naett_curl.h"
+#endif
 #endif
 #endif
 
@@ -32,6 +36,9 @@ extern JavaVM *gJvm;
 namespace net {
 
 static bool g_wsaInitialized;
+#if PPSSPP_PLATFORM(SWITCH) && !defined(HTTPS_NOT_AVAILABLE)
+static bool g_curlInitialized;
+#endif
 
 void Init() {
 #ifdef _WIN32
@@ -46,7 +53,11 @@ void Init() {
 	// naett ignores repeat calls the same way WSAStartup does, so there's nothing to track here
 	// either. HTTPSAvailable is cheap to ask twice - on Linux it's a cached dlopen result.
 #ifndef HTTPS_NOT_AVAILABLE
-#if PPSSPP_PLATFORM(ANDROID)
+#if PPSSPP_PLATFORM(SWITCH)
+	if (!g_curlInitialized) {
+		g_curlInitialized = curl_global_init(CURL_GLOBAL_ALL) == CURLE_OK;
+	}
+#elif PPSSPP_PLATFORM(ANDROID)
 	_assert_(gJvm != nullptr);
 	naettInit(gJvm);
 #else
@@ -60,6 +71,8 @@ void Init() {
 bool HTTPSAvailable() {
 #ifdef HTTPS_NOT_AVAILABLE
 	return false;
+#elif PPSSPP_PLATFORM(SWITCH)
+	return g_curlInitialized;
 #elif PPSSPP_PLATFORM(LINUX) && !PPSSPP_PLATFORM(ANDROID)
 	return naettCurlLoad() != 0;
 #else
@@ -622,7 +635,6 @@ static bool parse_dns_response(unsigned char *buffer, size_t response_len, uint3
 	return false;
 }
 
-// This was written by ChatGPT, although not much of that remains, after all the cleanup and fixing...
 
 // Specialized cache for the direct DNS lookups
 struct DNSCacheEntry {

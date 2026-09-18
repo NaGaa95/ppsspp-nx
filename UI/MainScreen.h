@@ -73,6 +73,7 @@ protected:
 	void OnGameHighlight(UI::EventParams &e);
 	// Event handlers
 	void OnLoadFile(UI::EventParams &e);
+	void OnLibrary(UI::EventParams &e);
 	void OnGameSettings(UI::EventParams &e);
 	void OnCredits(UI::EventParams &e);
 	void OnPPSSPPOrg(UI::EventParams &e);

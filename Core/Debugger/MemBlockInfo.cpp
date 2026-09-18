@@ -712,6 +712,7 @@ size_t FormatMemWriteTagAtNoFlush(char *buf, size_t sz, const char *prefix, size
 }
 
 static void FlushMemInfoThread() {
+	SetCurrentThreadAffinity(ThreadAffinityRole::BACKGROUND);
 	SetCurrentThreadName("FlushMemInfo");
 
 	while (flushThreadRunning.load()) {

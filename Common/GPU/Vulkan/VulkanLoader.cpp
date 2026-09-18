@@ -30,6 +30,10 @@
 #include "Common/VR/PPSSPPVR.h"
 #include "Common/File/FileUtil.h"
 
+#if PPSSPP_PLATFORM(SWITCH)
+extern "C" PFN_vkVoidFunction SwitchVulkanGetInstanceProcAddr(VkInstance instance, const char *name) asm("vkGetInstanceProcAddr");
+#endif
+
 #if !PPSSPP_PLATFORM(WINDOWS) && !PPSSPP_PLATFORM(SWITCH)
 #include <dlfcn.h>
 #endif
@@ -194,6 +198,9 @@ PFN_vkCreateAndroidSurfaceKHR vkCreateAndroidSurfaceKHR;
 #elif defined(_WIN32)
 PFN_vkCreateWin32SurfaceKHR vkCreateWin32SurfaceKHR;
 #endif
+#if defined(VK_USE_PLATFORM_VI_NN)
+PFN_vkCreateViSurfaceNN vkCreateViSurfaceNN;
+#endif
 #if defined(VK_USE_PLATFORM_METAL_EXT)
 PFN_vkCreateMetalSurfaceEXT vkCreateMetalSurfaceEXT;
 #endif
@@ -253,7 +260,7 @@ using namespace PPSSPP_VK;
 #elif PPSSPP_PLATFORM(SWITCH)
 typedef void *VulkanLibraryHandle;
 static VulkanLibraryHandle vulkanLibrary;
-#define dlsym(x, y) nullptr
+#define dlsym(x, y) SwitchVulkanGetInstanceProcAddr(VK_NULL_HANDLE, y)
 #elif PPSSPP_PLATFORM(WINDOWS)
 typedef HINSTANCE VulkanLibraryHandle;
 static VulkanLibraryHandle vulkanLibrary;
@@ -357,8 +364,7 @@ static const char * const so_names[] = {
 #if !PPSSPP_PLATFORM(IOS_APP_STORE)
 static VulkanLibraryHandle VulkanLoadLibrary(std::string *errorString) {
 #if PPSSPP_PLATFORM(SWITCH)
-	// Always unavailable, for now.
-	return nullptr;
+	return reinterpret_cast<VulkanLibraryHandle>(SwitchVulkanGetInstanceProcAddr);
 #elif PPSSPP_PLATFORM(UWP)
 	return nullptr;
 #elif PPSSPP_PLATFORM(WINDOWS)
@@ -443,6 +449,10 @@ bool VulkanMayBeAvailable() {
 	// MoltenVK does no longer seem to support iOS <= 12, despite what the docs say.
 	g_vulkanMayBeAvailable = System_GetPropertyInt(SYSPROP_SYSTEMVERSION) >= 13;
 	return g_vulkanMayBeAvailable;
+#elif PPSSPP_PLATFORM(SWITCH)
+	g_vulkanAvailabilityChecked = true;
+	g_vulkanMayBeAvailable = true;
+	return true;
 #else
 	// Unsupported in VR at the moment
 	if (IsVREnabled()) {
@@ -680,7 +690,11 @@ bool VulkanLoad(std::string *errorStr) {
 	LOAD_GLOBAL_FUNC(vkEnumerateInstanceExtensionProperties);
 	LOAD_GLOBAL_FUNC(vkEnumerateInstanceLayerProperties);
 
-	if (vkCreateInstance && vkGetInstanceProcAddr && vkGetDeviceProcAddr && vkEnumerateInstanceExtensionProperties && vkEnumerateInstanceLayerProperties) {
+	bool baseFunctionsLoaded = vkCreateInstance && vkGetInstanceProcAddr && vkEnumerateInstanceExtensionProperties && vkEnumerateInstanceLayerProperties;
+#if !PPSSPP_PLATFORM(SWITCH)
+	baseFunctionsLoaded = baseFunctionsLoaded && vkGetDeviceProcAddr;
+#endif
+	if (baseFunctionsLoaded) {
 		INFO_LOG(Log::G3D, "VulkanLoad: Base functions loaded.");
 		// NOTE: It's ok if vkEnumerateInstanceVersion is missing.
 		return true;
@@ -723,6 +737,9 @@ void VulkanLoadInstanceFunctions(VkInstance instance, const VulkanExtensions &en
 #if !PPSSPP_PLATFORM(IOS_APP_STORE)
 	INFO_LOG(Log::G3D, "Loading Vulkan instance functions. Instance API version: %08x (%d.%d.%d)", vulkanInstanceApiVersion, VK_API_VERSION_MAJOR(vulkanInstanceApiVersion), VK_API_VERSION_MINOR(vulkanInstanceApiVersion), VK_API_VERSION_PATCH(vulkanInstanceApiVersion));
 	// OK, let's use the above functions to get the rest.
+#if PPSSPP_PLATFORM(SWITCH)
+	LOAD_INSTANCE_FUNC(instance, vkGetDeviceProcAddr);
+#endif
 	LOAD_INSTANCE_FUNC(instance, vkDestroyInstance);
 	LOAD_INSTANCE_FUNC(instance, vkEnumeratePhysicalDevices);
 	LOAD_INSTANCE_FUNC(instance, vkGetPhysicalDeviceFeatures);
@@ -753,6 +770,8 @@ void VulkanLoadInstanceFunctions(VkInstance instance, const VulkanExtensions &en
 	LOAD_INSTANCE_FUNC(instance, vkCreateWin32SurfaceKHR);
 #elif defined(__ANDROID__)
 	LOAD_INSTANCE_FUNC(instance, vkCreateAndroidSurfaceKHR);
+#elif defined(VK_USE_PLATFORM_VI_NN)
+	LOAD_INSTANCE_FUNC(instance, vkCreateViSurfaceNN);
 #elif defined(VK_USE_PLATFORM_METAL_EXT)
 	LOAD_INSTANCE_FUNC(instance, vkCreateMetalSurfaceEXT);
 #endif

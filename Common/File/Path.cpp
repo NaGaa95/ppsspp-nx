@@ -396,6 +396,10 @@ Path Path::GetRootVolume() const {
 		return Path(path_.substr(0, len));
 	}
 #endif
+	const size_t colonPos = path_.find(':');
+	if (colonPos != std::string::npos && colonPos + 1 < path_.size() && path_[colonPos + 1] == '/') {
+		return Path(path_.substr(0, colonPos + 2));
+	}
 	return Path("/");
 }
 
@@ -408,6 +412,8 @@ bool Path::IsAbsolute() const {
 	if (path_.empty())
 		return true;
 	else if (path_.front() == '/')
+		return true;
+	else if (path_.find(":/") != std::string::npos)
 		return true;
 #if PPSSPP_PLATFORM(WINDOWS)
 	else if (path_.size() > 3 && path_[1] == ':')
@@ -442,13 +448,14 @@ bool Path::ComputePathTo(const Path &other, std::string &path) const {
 			return false;
 		}
 		return a.ComputePathTo(b, path);
-	} else if (path_ == "/") {
-		path = other.path_.substr(1);
-		return true;
 	} else {
-		path = other.path_.substr(path_.size() + 1);
-		return true;
+		size_t start = path_.size();
+		if (start > 0 && path_.back() != '/') {
+			++start;
+		}
+		path = other.path_.substr(start);
 	}
+	return true;
 }
 
 static bool FixFilenameCase(const std::string &path, std::string &filename) {

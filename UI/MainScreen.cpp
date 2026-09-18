@@ -54,6 +54,9 @@
 #include "UI/InstallPkgScreen.h"
 #include "UI/Background.h"
 #include "UI/GameBrowser.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "UI/SwitchLibraryScreen.h"
+#endif
 #include "Core/Config.h"
 #include "Core/Loaders.h"
 #include "Common/Data/Text/I18n.h"
@@ -240,12 +243,20 @@ public:
 		}
 
 		dc.Draw()->DrawImage(GetIconID(), bounds_.x, bounds_.y, 1.0f);
+		const float logoX = bounds_.x + iconImg->w + 8;
+		const float logoY = bounds_.y + 4;
 
 		if (bounds_.w < iconImg->w + logoImg->w + 36) {
+			if (System_GetPropertyBool(SYSPROP_APPLET_MODE)) {
+				dc.Flush();
+				dc.SetFontStyle(*GetTextStyle(dc, TextSize::Tiny));
+				dc.DrawText("Applet mode", logoX, logoY, 0xFF3030FF);
+				dc.SetFontStyle(dc.GetTheme().uiFont);
+			}
 			return;
 		}
 
-		dc.Draw()->DrawImage(ImageID("I_LOGO"), bounds_.x + iconImg->w + 8, bounds_.y + 4, 1.0f);
+		dc.Draw()->DrawImage(ImageID("I_LOGO"), logoX, logoY, 1.0f);
 
 		std::string versionString = PPSSPP_GIT_VERSION;
 		// Strip the 'v' from the displayed version, and shorten the commit hash.
@@ -266,9 +277,12 @@ public:
 		const FontStyle *style = GetTextStyle(dc, tiny ? TextSize::Tiny : TextSize::Small);
 		dc.SetFontStyle(*style);
 		dc.DrawText(versionString,
-			bounds_.x + iconImg->w + 8,
+			logoX,
 			bounds_.y + logoImg->h + (tiny ? 8 : 6),
 			dc.GetTheme().infoStyle.fgColor);
+		if (System_GetPropertyBool(SYSPROP_APPLET_MODE)) {
+			dc.DrawText("Applet mode", logoX, logoY, 0xFF3030FF);
+		}
 		dc.SetFontStyle(dc.GetTheme().uiFont);
 	}
 
@@ -304,17 +318,23 @@ void MainScreen::CreateMainButtons(UI::ViewGroup *parent, bool portrait) {
 	if (portrait) {
 		parent->Add(new Spacer(1.0f, new LinearLayoutParams(1.0f)));
 	}
+#if PPSSPP_PLATFORM(SWITCH)
+	if (!portrait)
+		parent->Add(new Spacer(48.0f));
+	parent->Add(new Choice(mm->T("Library")))->OnClick.Handle(this, &MainScreen::OnLibrary);
+#else
 	if (System_GetPropertyBool(SYSPROP_HAS_FILE_BROWSER)) {
 		parent->Add(portrait ? new Choice(ImageID("I_FOLDER_OPEN"), portrait ? new LinearLayoutParams() : nullptr) : new Choice(mm->T("Load", "Load...")))->OnClick.Handle(this, &MainScreen::OnLoadFile);
 	}
+#endif
 	parent->Add(portrait ? new Choice(ImageID("I_GEAR"), portrait ? new LinearLayoutParams() : nullptr) : new Choice(mm->T("Game Settings", "Settings")))->OnClick.Handle(this, &MainScreen::OnGameSettings);
 	parent->Add(portrait ? new Choice(ImageID("I_INFO"), portrait ? new LinearLayoutParams() : nullptr) : new Choice(mm->T("About PPSSPP")))->OnClick.Handle(this, &MainScreen::OnCredits);
 
-	if (!portrait) {
+	if (!portrait && !PPSSPP_PLATFORM(SWITCH)) {
 		parent->Add(new Choice(mm->T("www.ppsspp.org")))->OnClick.Handle(this, &MainScreen::OnPPSSPPOrg);
 	}
 
-	if (!System_GetPropertyBool(SYSPROP_APP_GOLD) && (System_GetPropertyInt(SYSPROP_DEVICE_TYPE) != DEVICE_TYPE_VR)) {
+	if (!PPSSPP_PLATFORM(SWITCH) && !System_GetPropertyBool(SYSPROP_APP_GOLD) && (System_GetPropertyInt(SYSPROP_DEVICE_TYPE) != DEVICE_TYPE_VR)) {
 		Choice *gold = parent->Add(portrait ? new Choice(ImageID("I_ICON_GOLD"), portrait ? new LinearLayoutParams() : nullptr) : new Choice(mm->T("Buy PPSSPP Gold")));
 		gold->OnClick.Add([this](UI::EventParams &) {
 			LaunchBuyGold(this->screenManager());
@@ -383,8 +403,13 @@ void MainScreen::CreateViews() {
 
 	Button *focusButton = nullptr;
 	if (hasStorageAccess) {
+#if PPSSPP_PLATFORM(SWITCH)
+		CreateBrowserTab(Path("!LIBRARY"), "Games", "", "", BrowseFlags::NONE, &g_Config.bGridView2, &g_Config.fGameListScrollPosition);
+		CreateBrowserTab(GetSysDirectory(DIRECTORY_GAME), "Homebrew & Demos", "", "", BrowseFlags::HOMEBREW_STORE, &g_Config.bGridView3, &g_Config.fHomebrewScrollPosition);
+#else
 		CreateBrowserTab(Path(g_Config.currentDirectory), "Games", "How to get games", getGamesUri, BrowseFlags::STANDARD, &g_Config.bGridView2, &g_Config.fGameListScrollPosition);
 		CreateBrowserTab(GetSysDirectory(DIRECTORY_GAME), "Homebrew & Demos", "How to get homebrew & demos", getHomebrewUri, BrowseFlags::HOMEBREW_STORE, &g_Config.bGridView3, &g_Config.fHomebrewScrollPosition);
+#endif
 
 		if (g_Config.bRemoteTab && !g_Config.sLastRemoteISOServer.empty()) {
 			Path remotePath(FormatRemoteISOUrl(g_Config.sLastRemoteISOServer.c_str(), g_Config.iLastRemoteISOPort, RemoteSubdir().c_str()));
@@ -470,7 +495,7 @@ void MainScreen::CreateViews() {
 		rightColumnItems->SetSpacing(0.0f);
 		ViewGroup *logo = new LogoView(false, new LinearLayoutParams(FILL_PARENT, 80.0f));
 
-		if (System_GetPropertyInt(SYSPROP_DEVICE_TYPE) == DEVICE_TYPE_DESKTOP) {
+		if (System_GetPropertyInt(SYSPROP_DEVICE_TYPE) == DEVICE_TYPE_DESKTOP && !PPSSPP_PLATFORM(SWITCH)) {
 			auto gr = GetI18NCategory(I18NCat::GRAPHICS);
 			Button *fullscreenButton = logo->Add(new Button("", ImageID(), new AnchorLayoutParams(48, 48, NONE, 0, 0, NONE, Centering::None)));
 			fullscreenButton->SetIgnoreText(true);
@@ -625,6 +650,12 @@ void MainScreen::OnLoadFile(UI::EventParams &e) {
 			System_PostUIMessage(UIMessage::REQUEST_GAME_BOOT, value);
 		});
 	}
+}
+
+void MainScreen::OnLibrary(UI::EventParams &e) {
+#if PPSSPP_PLATFORM(SWITCH)
+	screenManager()->push(new SwitchLibraryScreen());
+#endif
 }
 
 void MainScreen::DrawBackground(UIContext &dc) {

@@ -501,6 +501,7 @@ static bool ProcessQueuedRequests() {
 }
 
 static int upnpService(unsigned int timeout) {
+	SetCurrentThreadAffinity(ThreadAffinityRole::IO);
 	SetCurrentThreadName("UPnPService");
 	INFO_LOG(Log::Net, "UPnPService: Begin of UPnPService Thread");
 

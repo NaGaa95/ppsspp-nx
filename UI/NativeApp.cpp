@@ -645,7 +645,7 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 #elif PPSSPP_PLATFORM(MAC)
 	g_Config.memStickDirectory = DarwinFileSystemServices::appropriateMemoryStickDirectoryToUse();
 #elif PPSSPP_PLATFORM(SWITCH)
-	g_Config.memStickDirectory = g_Config.internalDataDirectory / "config/ppsspp";
+	g_Config.memStickDirectory = g_Config.internalDataDirectory;
 #elif PPSSPP_PLATFORM(WINDOWS)
 	// ...
 #else

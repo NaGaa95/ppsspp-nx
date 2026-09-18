@@ -80,6 +80,7 @@ bool VulkanGraphicsContext::InitAPI(void *wnd, std::string *deviceName, std::str
 	}
 
 	init_glslang();
+	glslangInitialized_ = true;
 
 	g_LogOptions.breakOnError = true;
 	g_LogOptions.breakOnWarning = true;
@@ -89,6 +90,7 @@ bool VulkanGraphicsContext::InitAPI(void *wnd, std::string *deviceName, std::str
 	if (!VulkanLoad(&errorStr)) {
 		*errorMessage = "Failed to load Vulkan driver library: ";
 		(*errorMessage) += errorStr;
+		ShutdownAPI();
 		return false;
 	}
 
@@ -98,22 +100,25 @@ bool VulkanGraphicsContext::InitAPI(void *wnd, std::string *deviceName, std::str
 	InitVulkanCreateInfoFromConfig(&info);
 	if (VK_SUCCESS != vulkan_->CreateInstance(info)) {
 		*errorMessage = vulkan_->InitError();
-		delete vulkan_;
-		vulkan_ = nullptr;
+		ShutdownAPI();
 		return false;
 	}
 	int deviceNum = vulkan_->GetPhysicalDeviceByName(*deviceName);
 	if (deviceNum < 0) {
 		deviceNum = vulkan_->GetBestPhysicalDevice();
-		if (!deviceName->empty()) {
+		if (deviceNum >= 0 && !deviceName->empty()) {
 			*deviceName = vulkan_->GetPhysicalDeviceProperties(deviceNum).properties.deviceName;
 		}
+	}
+	if (deviceNum < 0) {
+		*errorMessage = "No usable Vulkan device found";
+		ShutdownAPI();
+		return false;
 	}
 
 	if (vulkan_->CreateDevice(deviceNum) != VK_SUCCESS) {
 		*errorMessage = vulkan_->InitError();
-		delete vulkan_;
-		vulkan_ = nullptr;
+		ShutdownAPI();
 		return false;
 	}
 	return true;
@@ -129,6 +134,7 @@ bool VulkanGraphicsContext::InitSurface(WindowSystem winsys, void *data1, void *
 		if (errorMessage->empty()) {
 			*errorMessage = StringFromFormat("Failed to initialize Vulkan surface: %s", VulkanResultToString(res));
 		}
+		vulkan_->DestroySurface();
 		return false;
 	}
 
@@ -138,6 +144,11 @@ bool VulkanGraphicsContext::InitSurface(WindowSystem winsys, void *data1, void *
 	}
 
 	draw_ = Draw::T3DCreateVulkanContext(vulkan_, useMultiThreading);
+	if (!draw_) {
+		*errorMessage = "Failed to create Vulkan drawing context";
+		vulkan_->DestroySurface();
+		return false;
+	}
 
 	VkPresentModeKHR presentMode = ConfigPresentModeToVulkan(draw_);
 
@@ -149,46 +160,74 @@ bool VulkanGraphicsContext::InitSurface(WindowSystem winsys, void *data1, void *
 
 	if (!vulkan_->InitSwapchain(presentMode)) {
 		*errorMessage = vulkan_->InitError();
+		ShutdownSurface();
 		return false;
 	}
 
 	SetGPUBackend(GPUBackend::VULKAN, vulkan_->GetPhysicalDeviceProperties().properties.deviceName);
 	bool success = draw_->CreatePresets();
-	_assert_msg_(success, "Failed to compile preset shaders");
+	if (!success) {
+		*errorMessage = "Failed to compile Vulkan preset shaders";
+		ShutdownSurface();
+		return false;
+	}
 	draw_->HandleEvent(Draw::Event::GOT_BACKBUFFER, vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight());
 
 	renderManager_ = (VulkanRenderManager *)draw_->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
+	if (!renderManager_) {
+		*errorMessage = "Failed to create Vulkan render manager";
+		ShutdownSurface();
+		return false;
+	}
 	renderManager_->SetInflightFrames(g_Config.iInflightFrames);
 	if (!renderManager_->HasBackbuffers()) {
-		// WTF?
-		_dbg_assert_(false);
+		*errorMessage = "Failed to create Vulkan backbuffers";
+		ShutdownSurface();
 		return false;
 	}
 	return true;
 }
 
 void VulkanGraphicsContext::ShutdownSurface() {
-	if (draw_) {
+	bool hadDraw = draw_ != nullptr;
+	if (draw_ && vulkan_->IsSwapchainInited()) {
 		draw_->HandleEvent(Draw::Event::LOST_BACKBUFFER, vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight());
 	}
 
 	delete draw_;
 	draw_ = nullptr;
+	renderManager_ = nullptr;
 
-	vulkan_->WaitUntilQueueIdle();
-	vulkan_->DestroySwapchain();
-	vulkan_->DestroySurface();
+	if (vulkan_) {
+		if (hadDraw) {
+			vulkan_->WaitUntilQueueIdle();
+		}
+		vulkan_->DestroySwapchain();
+		vulkan_->DestroySurface();
+	}
 }
 
 void VulkanGraphicsContext::ShutdownAPI() {
-	vulkan_->DestroyDevice();
-	vulkan_->DestroyInstance();
-
-	delete vulkan_;
-	vulkan_ = nullptr;
+	if (draw_) {
+		ShutdownSurface();
+	}
+	if (vulkan_) {
+		vulkan_->DestroySwapchain();
+		vulkan_->DestroySurface();
+		if (vulkan_->GetDevice()) {
+			vulkan_->DestroyDevice();
+		}
+		if (vulkan_->GetInstance()) {
+			vulkan_->DestroyInstance();
+		}
+		delete vulkan_;
+		vulkan_ = nullptr;
+	}
 	renderManager_ = nullptr;
-
-	finalize_glslang();
+	if (glslangInitialized_) {
+		finalize_glslang();
+		glslangInitialized_ = false;
+	}
 }
 
 void VulkanGraphicsContext::Resize() {
@@ -201,7 +240,10 @@ void VulkanGraphicsContext::Resize() {
 		: VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT);
 #endif
 
-	vulkan_->InitSwapchain(presentMode);
+	if (!vulkan_->InitSwapchain(presentMode)) {
+		ERROR_LOG(Log::G3D, "Failed to recreate Vulkan swapchain: %s", vulkan_->InitError().c_str());
+		return;
+	}
 	draw_->HandleEvent(Draw::Event::GOT_BACKBUFFER, vulkan_->GetBackbufferWidth(), vulkan_->GetBackbufferHeight());
 }
 

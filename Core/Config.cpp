@@ -80,6 +80,8 @@ std::string GPUBackendToString(GPUBackend backend) {
 		return "DIRECT3D11";
 	case GPUBackend::VULKAN:
 		return "VULKAN";
+	case GPUBackend::ZINK:
+		return "ZINK";
 	}
 	// Intentionally not a default so we get a warning.
 	return "INVALID";
@@ -92,6 +94,8 @@ GPUBackend GPUBackendFromString(std::string_view backend) {
 		return GPUBackend::DIRECT3D11;
 	if (equalsNoCase(backend, "VULKAN") || backend == "3")
 		return GPUBackend::VULKAN;
+	if (equalsNoCase(backend, "ZINK") || backend == "4")
+		return GPUBackend::ZINK;
 	return GPUBackend::OPENGL;
 }
 
@@ -223,6 +227,30 @@ static int DefaultScreenRotation() {
 #endif
 }
 
+static bool DefaultUISound() {
+#if PPSSPP_PLATFORM(SWITCH)
+	return true;
+#else
+	return false;
+#endif
+}
+
+static float DefaultAnalogDeadzone() {
+#if PPSSPP_PLATFORM(SWITCH)
+	return 0.10f;
+#else
+	return 0.15f;
+#endif
+}
+
+static bool DefaultRightStickFaceButtons() {
+#if PPSSPP_PLATFORM(SWITCH)
+	return true;
+#else
+	return false;
+#endif
+}
+
 #define SETTING(a, x) &a, &a.x
 #define SETTING_IDX(a, x, i) &a, &a.x[i]
 
@@ -242,7 +270,7 @@ static const ConfigSetting generalSettings[] = {
 	ConfigSetting("Language", SETTING(g_Config, sLanguageIni), &DefaultLangRegion, CfgFlag::DEFAULT),
 	ConfigSetting("ForceLagSync2", SETTING(g_Config, bForceLagSync), false, CfgFlag::PER_GAME),
 	ConfigSetting("DiscordRichPresence", SETTING(g_Config, bDiscordRichPresence), false, CfgFlag::DEFAULT),
-	ConfigSetting("UISound", SETTING(g_Config, bUISound), false, CfgFlag::DEFAULT),
+	ConfigSetting("UISound", SETTING(g_Config, bUISound), &DefaultUISound, CfgFlag::DEFAULT),
 
 	ConfigSetting("DisableHTTPS", SETTING(g_Config, bDisableHTTPS), false, CfgFlag::DONT_SAVE),
 	ConfigSetting("AutoLoadSaveState", SETTING(g_Config, iAutoLoadSaveState), 0, CfgFlag::PER_GAME),
@@ -451,6 +479,8 @@ static int DefaultGPUBackend() {
 
 #if PPSSPP_PLATFORM(UWP)
 	return (int)GPUBackend::DIRECT3D11;
+#elif PPSSPP_PLATFORM(SWITCH)
+	return (int)GPUBackend::VULKAN;
 #elif PPSSPP_PLATFORM(WINDOWS)
 	// On Win10, there's a good chance Vulkan will work by default.
 	if (IsWin10OrHigher()) {
@@ -537,6 +567,11 @@ int Config::NextValidBackend() {
 			return (int)GPUBackend::OPENGL;
 		}
 #endif
+#if PPSSPP_PLATFORM(SWITCH)
+		if (!failed.count(GPUBackend::ZINK)) {
+			return (int)GPUBackend::ZINK;
+		}
+#endif
 		// They've all failed.  Let them try the default - or on Android, OpenGL.
 		if (sFailedGPUBackends.find(",ALL") == std::string::npos) {
 			sFailedGPUBackends += ",ALL";
@@ -568,13 +603,13 @@ bool Config::IsBackendEnabled(GPUBackend backend) {
 	if (backend != GPUBackend::DIRECT3D11)
 		return false;
 #elif PPSSPP_PLATFORM(SWITCH)
-	if (backend != GPUBackend::OPENGL)
+	if (backend != GPUBackend::OPENGL && backend != GPUBackend::VULKAN && backend != GPUBackend::ZINK)
 		return false;
 #elif PPSSPP_PLATFORM(WINDOWS)
 	if (backend == GPUBackend::DIRECT3D11 && !IsVistaOrHigher())
 		return false;
 #else
-	if (backend == GPUBackend::DIRECT3D11)
+	if (backend == GPUBackend::DIRECT3D11 || backend == GPUBackend::ZINK)
 		return false;
 #endif
 
@@ -684,6 +719,9 @@ static const ConfigSetting graphicsSettings[] = {
 #endif
 	ConfigSetting("DisabledGraphicsBackends", SETTING(g_Config, sDisabledGPUBackends), "", CfgFlag::DEFAULT),
 	ConfigSetting("VulkanDevice", SETTING(g_Config, sVulkanDevice), "", CfgFlag::DEFAULT),
+#if PPSSPP_PLATFORM(SWITCH)
+	ConfigSetting("SwitchFrameGeneration", SETTING(g_Config, bSwitchFrameGeneration), false, CfgFlag::DEFAULT),
+#endif
 #ifdef _WIN32
 	ConfigSetting("D3D11Device", SETTING(g_Config, sD3D11Device), "", CfgFlag::DEFAULT),
 #endif
@@ -999,7 +1037,7 @@ static const ConfigSetting controlSettings[] = {
 	ConfigSetting("TouchSnapToGrid", SETTING(g_Config, bTouchSnapToGrid), false, CfgFlag::PER_GAME),
 	ConfigSetting("TouchSnapGridSize", SETTING(g_Config, iTouchSnapGridSize), 64, CfgFlag::PER_GAME),
 
-	ConfigSetting("AnalogDeadzone", SETTING(g_Config, fAnalogDeadzone), 0.15f, CfgFlag::PER_GAME),
+	ConfigSetting("AnalogDeadzone", SETTING(g_Config, fAnalogDeadzone), &DefaultAnalogDeadzone, CfgFlag::PER_GAME),
 	ConfigSetting("AnalogInverseDeadzone", SETTING(g_Config, fAnalogInverseDeadzone), 0.0f, CfgFlag::PER_GAME),
 	ConfigSetting("AnalogSensitivity", SETTING(g_Config, fAnalogSensitivity), 1.1f, CfgFlag::PER_GAME),
 	ConfigSetting("AnalogIsCircular", SETTING(g_Config, bAnalogIsCircular), false, CfgFlag::PER_GAME),
@@ -1013,6 +1051,7 @@ static const ConfigSetting controlSettings[] = {
 	ConfigSetting("AnalogLimiterDeadzone", SETTING(g_Config, fAnalogLimiterDeadzone), 0.6f, CfgFlag::DEFAULT),
 	ConfigSetting("AnalogTriggerThreshold", SETTING(g_Config, fAnalogTriggerThreshold), 0.75f, CfgFlag::DEFAULT),
 	ConfigSetting("AnalogStickThreshold", SETTING(g_Config, fAnalogStickThreshold), 0.75f, CfgFlag::DEFAULT),
+	ConfigSetting("RightStickFaceButtons", SETTING(g_Config, bRightStickFaceButtons), &DefaultRightStickFaceButtons, CfgFlag::PER_GAME),
 
 	ConfigSetting("AllowMappingCombos", SETTING(g_Config, bAllowMappingCombos), false, CfgFlag::DEFAULT),
 	ConfigSetting("StrictComboOrder", SETTING(g_Config, bStrictComboOrder), false, CfgFlag::DEFAULT),
@@ -1568,7 +1607,7 @@ void Config::PostLoadCleanup() {
 
 	if (iGPUBackend == 1) {  // d3d9, no longer supported. Fall back to D3D11.
 		iGPUBackend = (int)GPUBackend::DIRECT3D11;
-	} else if (iGPUBackend < 0 || iGPUBackend > 3) {
+	} else if (iGPUBackend < 0 || iGPUBackend > 4) {
 		iGPUBackend = (int)DefaultGPUBackend();
 	}
 

@@ -25,6 +25,7 @@
 #include "Common/Math/SIMDHeaders.h"
 #include "Common/Math/CrossSIMD.h"
 #include "Common/Math/lin/matrix4x4.h"
+#include "Common/Thread/ParallelLoop.h"
 #include "Common/TimeUtil.h"
 #include "Core/System.h"
 #include "Core/Config.h"
@@ -1288,7 +1289,24 @@ void DrawEngineCommon::FlushQueuedDepth() {
 				continue;
 			}
 			u16 *depthPtr = (uint16_t *)Memory::GetPointerWriteUnchecked(draw.depthAddr);
+#if PPSSPP_PLATFORM(SWITCH)
+			const int scissorWidth = draw.scissor.x2 - draw.scissor.x1 + 1;
+			int tileCount = std::min(g_threadManager.GetNumLooperThreads(), 4);
+			tileCount = std::min(tileCount, std::max(1, scissorWidth / 64));
+			if (!collectStats && draw.prim == GE_PRIM_TRIANGLES && outVertCount >= 12 && tileCount > 1) {
+				WaitableCounter *counter = RunParallel(&g_threadManager, [=, &draw](int tile, int numTiles) {
+					const DepthScissor workerScissor = draw.scissor.Tile(tile, numTiles);
+					DepthRasterScreenVerts(depthPtr, draw.depthStride, tx, ty, tz, outVertCount, draw, workerScissor, lowQ, false);
+				}, tileCount, TaskPriority::HIGH);
+				if (counter) {
+					counter->WaitAndRelease();
+				}
+			} else {
+				DepthRasterScreenVerts(depthPtr, draw.depthStride, tx, ty, tz, outVertCount, draw, tileScissor, lowQ);
+			}
+#else
 			DepthRasterScreenVerts(depthPtr, draw.depthStride, tx, ty, tz, outVertCount, draw, tileScissor, lowQ);
+#endif
 		}
 	}
 

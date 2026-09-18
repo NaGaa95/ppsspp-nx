@@ -311,6 +311,18 @@ std::string StringFromFormat(const char* format, ...) {
 		temp.resize(required);
 	}
 	va_end(args);
+#elif PPSSPP_PLATFORM(SWITCH)
+	va_start(args, format);
+	va_list argsCopy;
+	va_copy(argsCopy, args);
+	int required = vsnprintf(nullptr, 0, format, argsCopy);
+	va_end(argsCopy);
+	if (required >= 0) {
+		temp.resize((size_t)required + 1);
+		vsnprintf(temp.data(), temp.size(), format, args);
+		temp.resize((size_t)required);
+	}
+	va_end(args);
 #else
 	char *buf = nullptr;
 
