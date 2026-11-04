@@ -16,6 +16,7 @@
 #if PPSSPP_PLATFORM(SWITCH)
 
 #include <stdio.h>
+#include <array>
 #include <malloc.h> // memalign
 #include <errno.h>
 #include <switch.h>
@@ -25,12 +26,28 @@
 static uintptr_t memoryBase = 0;
 static uintptr_t memoryCodeBase = 0;
 static uintptr_t memorySrcBase = 0;
-static VirtmemReservation *memoryReservation = nullptr;
 static VirtmemReservation *memoryCodeReservation = nullptr;
 static bool memoryCodeMapped = false;
 static size_t memoryBackingSize = 0;
 
-static constexpr size_t PSP_ADDRESS_SPACE_SIZE = 0x10000000;
+// The 64-bit Switch build maps the PSP's kernel/uncached mirrors without masking.
+static constexpr size_t PSP_ADDRESS_SPACE_SIZE = 0x100000000ULL;
+
+struct ArenaWindow {
+	uintptr_t base = 0;
+	VirtmemReservation *reservation = nullptr;
+};
+struct ArenaView {
+	uintptr_t address = 0;
+	size_t offset = 0, size = 0;
+};
+static std::array<ArenaWindow, 4> memoryWindows;
+static std::array<ArenaView, 128> memoryViews;
+
+static bool InWindow(uintptr_t address, size_t size, const ArenaWindow &window) {
+	return window.base && address >= window.base && address - window.base < PSP_ADDRESS_SPACE_SIZE &&
+		size <= PSP_ADDRESS_SPACE_SIZE - (address - window.base);
+}
 
 static void *ReserveVirtmem(size_t size, bool code, VirtmemReservation **reservation) {
 	virtmemLock();
@@ -59,6 +76,11 @@ bool MemArena::GrabMemSpace(size_t size) {
 }
 
 void MemArena::ReleaseSpace() {
+	for (const auto &view : memoryViews) {
+		if (view.address) {
+			return;
+		}
+	}
 	if (memoryCodeMapped) {
 		Result rc = svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), (u64)memoryCodeBase, (u64)memorySrcBase, memoryBackingSize);
 		if (R_FAILED(rc)) {
@@ -72,14 +94,16 @@ void MemArena::ReleaseSpace() {
 	memorySrcBase = 0;
 	memoryBackingSize = 0;
 	virtmemLock();
-	if (memoryReservation) {
-		virtmemRemoveReservation(memoryReservation);
+	for (auto &window : memoryWindows) {
+		if (window.reservation) {
+			virtmemRemoveReservation(window.reservation);
+		}
+		window = {};
 	}
 	if (memoryCodeReservation) {
 		virtmemRemoveReservation(memoryCodeReservation);
 	}
 	virtmemUnlock();
-	memoryReservation = nullptr;
 	memoryCodeReservation = nullptr;
 	memoryBase = 0;
 	memoryCodeBase = 0;
@@ -89,57 +113,120 @@ void *MemArena::CreateView(s64 offset, size_t size, void *base) {
 	if (!memoryCodeMapped || offset < 0 || (size_t)offset > memoryBackingSize || size > memoryBackingSize - (size_t)offset) {
 		return nullptr;
 	}
+	bool reserved = false;
+	for (const auto &window : memoryWindows) {
+		reserved |= InWindow((uintptr_t)base, size, window);
+	}
+	ArenaView *slot = nullptr;
+	for (auto &view : memoryViews) {
+		if (view.address == (uintptr_t)base) {
+			return nullptr;
+		}
+		if (!view.address) {
+			slot = &view;
+		}
+	}
+	if (!reserved || !slot) {
+		return nullptr;
+	}
 	Result rc = svcMapProcessMemory(base, envGetOwnProcessHandle(), (u64)(memoryCodeBase + offset), size);
 	if (R_FAILED(rc)) {
 		printf("Fatal error creating the view... base: %p offset: %p size: %p src: %p err: %d\n",
 			   (void *)base, (void *)offset, (void *)size, (void *)(memoryCodeBase + offset), rc);
 		return nullptr;
 	}
+	*slot = {(uintptr_t)base, (size_t)offset, size};
 
 	return base;
 }
 
 void MemArena::ReleaseView(s64 offset, void *view, size_t size) {
-	Result rc = svcUnmapProcessMemory(view, envGetOwnProcessHandle(), (u64)(memoryCodeBase + offset), size);
-	if (R_FAILED(rc)) {
-		printf("Failed to unmap view...\n");
+	// Secondary address spaces do not retain backing offsets at the call site.
+	(void)offset;
+	for (auto &mapped : memoryViews) {
+		if (mapped.address != (uintptr_t)view) {
+			continue;
+		}
+		if (mapped.size != size) {
+			return;
+		}
+		Result rc = svcUnmapProcessMemory(view, envGetOwnProcessHandle(), (u64)(memoryCodeBase + mapped.offset), size);
+		if (R_FAILED(rc)) {
+			return;
+		}
+		mapped = {};
+		return;
+	}
+}
+
+void MemArena::ReleaseViewSpace(u8 *base) {
+	if (!base) {
+		return;
+	}
+	for (auto &window : memoryWindows) {
+		if (window.base != (uintptr_t)base) {
+			continue;
+		}
+		for (const auto &view : memoryViews) {
+			if (view.address && InWindow(view.address, view.size, window)) {
+				return;
+			}
+		}
+		virtmemLock();
+		virtmemRemoveReservation(window.reservation);
+		virtmemUnlock();
+		if (memoryBase == window.base) {
+			memoryBase = 0;
+		}
+		window = {};
+		return;
 	}
 }
 
 u8 *MemArena::Find4GBBase() {
-	if (memoryCodeMapped) {
-		return (u8 *)memoryBase;
-	}
 	if (!memorySrcBase || !memoryBackingSize) {
 		return nullptr;
 	}
 
+	ArenaWindow *window = nullptr;
+	for (auto &candidate : memoryWindows) {
+		if (!candidate.reservation) {
+			window = &candidate;
+			break;
+		}
+	}
+	if (window) {
+		window->base = (uintptr_t)ReserveVirtmem(PSP_ADDRESS_SPACE_SIZE, false, &window->reservation);
+	}
+	if (!window || !window->reservation) {
+		if (!memoryCodeMapped) {
+			ReleaseSpace();
+		}
+		return nullptr;
+	}
 	if (!memoryBase) {
-		memoryBase = (uintptr_t)ReserveVirtmem(PSP_ADDRESS_SPACE_SIZE, false, &memoryReservation);
+		memoryBase = window->base;
 	}
-
-	if (!memoryCodeBase) {
+	if (!memoryCodeMapped) {
 		memoryCodeBase = (uintptr_t)ReserveVirtmem(memoryBackingSize, true, &memoryCodeReservation);
+		if (!memoryCodeBase) {
+			ReleaseSpace();
+			return nullptr;
+		}
+		Result rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(), (u64)memoryCodeBase, (u64)memorySrcBase, memoryBackingSize);
+		if (R_FAILED(rc)) {
+			ReleaseSpace();
+			return nullptr;
+		}
+		memoryCodeMapped = true;
+		rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(), memoryCodeBase, memoryBackingSize, Perm_Rx);
+		if (R_FAILED(rc)) {
+			ReleaseSpace();
+			return nullptr;
+		}
 	}
 
-	if (!memorySrcBase || !memoryBase || !memoryCodeBase) {
-		ReleaseSpace();
-		return nullptr;
-	}
-
-	Result rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(), (u64)memoryCodeBase, (u64)memorySrcBase, memoryBackingSize);
-	if (R_FAILED(rc)) {
-		ReleaseSpace();
-		return nullptr;
-	}
-	memoryCodeMapped = true;
-	rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(), memoryCodeBase, memoryBackingSize, Perm_Rx);
-	if (R_FAILED(rc)) {
-		ReleaseSpace();
-		return nullptr;
-	}
-
-	return (u8 *)memoryBase;
+	return (u8 *)window->base;
 }
 
 #endif // PPSSPP_PLATFORM(SWITCH)

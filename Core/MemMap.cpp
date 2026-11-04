@@ -315,14 +315,20 @@ bool MemoryMap_Setup(MemMapSetupFlags flags) {
 #else
 
 	// Figure out how much memory we need to allocate in total.
+	// Mirrors reuse the previous range; match the offsets in Memory_TryBase.
 	size_t total_mem = 0;
+	size_t position = 0, last_position = 0;
 	for (int i = 0; i < ARRAY_SIZE(views); i++) {
 		if (views[i].size == 0)
 			continue;
 		if (SkipView(flags, views[i].flags))
 			continue;
-		if (!CanIgnoreView(views[i]))
-			total_mem += g_arena.roundup(views[i].size);
+		if (views[i].flags & MV_MIRROR_PREVIOUS) {
+			position = last_position;
+		}
+		last_position = position;
+		position += g_arena.roundup(views[i].size);
+		total_mem = std::max(total_mem, position);
 	}
 
 	// Grab some pagefile backed memory out of the void ...
@@ -759,7 +765,7 @@ void DestroyMESpace() {
 		g_arena.ReleaseView(0, ptr, size);
 	}
 	g_meViews.clear();
-#if defined(__APPLE__)
+#if defined(__APPLE__) || PPSSPP_PLATFORM(SWITCH)
 	if (g_meSpace.base) {
 		MemArena::ReleaseViewSpace(g_meSpace.base);
 	}

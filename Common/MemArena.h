@@ -51,6 +51,8 @@ public:
 	// alignMask: the address bits that must be zero.
 	static u8 *ReserveViewSpace(size_t size, size_t alignMask);
 	static void ReleaseViewSpace(u8 *base);
+#elif PPSSPP_PLATFORM(SWITCH)
+	static void ReleaseViewSpace(u8 *base);
 #endif
 
 private:
