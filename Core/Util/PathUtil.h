@@ -27,6 +27,7 @@ enum PSPDirectories {
 	DIRECTORY_EXDATA,
 	DIRECTORY_CUSTOM_SHADERS,
 	DIRECTORY_CUSTOM_THEMES,
+	DIRECTORY_CUSTOM_OVERLAYS,
 	COUNT,
 };
 
@@ -40,10 +41,19 @@ bool HasParentDirComponent(std::string_view path);
 // strings that would otherwise become host filesystem path components.
 bool HasPathTraversal(std::string_view path);
 
+// Returns true if an untrusted string (a disc ID, a texture pack's game ID) can be used as a single
+// directory or file name. Stricter than HasPathTraversal: also rejects empty names, control
+// characters, ':' (drive letters, NTFS streams) and the trailing dots and spaces Win32 strips,
+// which would turn "..." into "..".
+bool IsSafePathComponent(std::string_view name);
+
 Path FindConfigFile(const Path &searchPath, std::string_view baseFilename, bool *exists);
 Path GetSysDirectory(PSPDirectories directoryType);
 bool CreateSysDirectories();
 Path GetGameConfigFilePath(const Path &searchPath, std::string_view gameId, bool *exists);
 bool TryUpdateSavedPath(Path *path);
 Path GetFailedBackendsDir();
+// The default memory stick of the Mac and Linux builds, shared by the app and headless. The Mac app may use
+// another one, if the user picked it.
+Path GetDefaultDesktopMemStickDirectory();
 std::string GetFriendlyPath(Path path, const Path &rootMatch = Path(), std::string_view rootDisplay = "ms:/");

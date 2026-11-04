@@ -44,6 +44,7 @@ enum {
 
 extern BlockAllocator userMemory;
 extern BlockAllocator kernelMemory;
+extern BlockAllocator volatileMemory;
 
 void __KernelMemoryInit();
 void __KernelMemoryDoState(PointerWrap &p);
@@ -221,6 +222,7 @@ int sceKernelGetCompiledSdkVersion();
 SceUID sceKernelCreateTlspl(const char *name, u32 partitionid, u32 attr, u32 size, u32 count, u32 optionsPtr);
 int sceKernelDeleteTlspl(SceUID uid);
 int sceKernelGetTlsAddr(SceUID uid);
+int _sceKernelAllocateTlspl(SceUID uid, u32 addrPtr, u32 timeoutPtr);
 int sceKernelFreeTlspl(SceUID uid);
 int sceKernelReferTlsplStatus(SceUID uid, u32 infoPtr);
 

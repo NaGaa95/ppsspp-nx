@@ -138,6 +138,14 @@ The runner uses `--screenshot=<ref>` (compare), `--screenshot-save=<file>`
 `--screenshot-diff=<file>` (always write a visual comparison when comparing).
 See `headless/README.md` for details.
 
+`--depth-save=<file>` writes the current depth buffer next to the screenshot: a
+u32 width and height, then a u16 per pixel, or a float if the path ends in
+`.f32`. The software renderer gives the GE's own values. The hardware renderers
+keep depth at higher precision without the GE's rounding, so their u16 is
+`floor(d * 65536)` and usually within one of the software renderer's; the
+`.f32` version keeps the fraction, which shows whether two draws of the same
+surface meet a depth test like `>=`.
+
 ## Command line options
 
 ```
@@ -150,6 +158,9 @@ usage: frametests.py [OPTIONS] [CONFIG.json]
 | `--filter=SUBSTR`  | Only run dumps whose relative path contains SUBSTR (case-insensitive). |
 | `--strict`         | Treat missing reference images as failures (a configuration error).    |
 | `--out-mode=all\|failures` | `all` keeps everything in the output dir; `failures` keeps only artifacts of non-passing tests (smaller CI artifacts). Default: `all`. |
+| `--variants=NAME=ARGS,...` | Run these variants instead of the config's. |
+| `--adb[=SERIAL]`   | Run on an Android device instead; see "Running on Android" below. |
+| `--ios[=DEVICE]`   | Run on an iPhone or iPad instead; see "Running on iOS" below. |
 
 The headless binary is located, in order of preference:
 
@@ -158,6 +169,65 @@ The headless binary is located, in order of preference:
 3. Well-known paths relative to the current directory (e.g.
    `Windows/x64/Debug/PPSSPPHeadless.exe`, `build/PPSSPPHeadless`), newest
    by modification time.
+
+## Running on Android
+
+`--adb` runs every dump on an Android device over adb, with the `ppsspp_headless` executable from the
+legacy NDK build, and compares each screenshot with the host's Vulkan render of the same dump (through
+`Tools/image_compare.py`, so rasterizer noise doesn't count). The references in the config aren't used:
+the question is whether the device's drivers draw what a desktop GPU does.
+
+```bash
+cd android && NDK=/path/to/ndk ./ab.sh APP_ABI=arm64-v8a HEADLESS=1 SKIPAPP=1 -j8 && cd ..
+python3 frametests.py frametests/frametests.json --adb
+```
+
+The first run pushes the binary, `assets/` and the dumps to `/data/local/tmp/ppsspp-frametests`; later runs
+only push what changed. The variants default to `vulkan=--graphics=vulkan --dump-compat,gl=--graphics=gles
+--dump-compat`, and `--host-args` (default `--graphics=vulkan --dump-compat`) sets how the host renders its
+side. `--dump-compat` applies the game's `compat.ini` settings, which headless otherwise skips for dumps;
+without them some games look wrong on every backend (Coded Arms needs `AccurateSplines`). A failing test's diff image shows host, device and the
+differences side by side. Runs go to the device one at a time.
+
+## Running on iOS
+
+`--ios` does the same on an iPhone or iPad, comparing against the host's Vulkan render the same way.
+An iOS device only runs apps, so PPSSPPHeadless is built as one there (`org.ppsspp.headless`,
+`ios/HeadlessMain.mm`): it starts UIKit, runs the usual headless `main` on a thread with the arguments
+`devicectl` launched it with, and exits. The screen stays black meanwhile, since it renders offscreen.
+It needs a development-signed build, which is what lets `devicectl` copy files in and out of it.
+
+```bash
+cmake -S . -B build-ios-headless -GXcode -DCMAKE_TOOLCHAIN_FILE=cmake/Toolchains/ios.cmake \
+    -DIOS_APP_STORE=ON -DDEVELOPMENT_TEAM_ID=<team> -DHEADLESS=ON
+xcodebuild -project build-ios-headless/PPSSPP.xcodeproj -scheme PPSSPPHeadless -configuration Release \
+    -destination 'generic/platform=iOS' -allowProvisioningUpdates build
+python3 frametests.py frametests/frametests.json --ios
+```
+
+Keep the device unlocked while it runs. frametests.py installs the app, copies the dumps the device doesn't
+have yet into its `Documents/dumps`, and renders each variant's dumps in launches of up to 100 (each
+`devicectl` call costs a second or two, so one launch per dump would be slow). A dump that crashes the app
+ends its launch; the rest go into the next one. The variants default to `vulkan=--graphics=vulkan
+--dump-compat`, as iOS has no OpenGL. There's no JIT without a debugger attached, so the device runs the
+IR interpreter and decodes vertices without the vertex JIT.
+
+To run the app by hand:
+
+```bash
+xcrun devicectl device copy to --device <udid> --domain-type appDataContainer \
+    --domain-identifier org.ppsspp.headless --source dump.ppdmp --destination Documents/dump.ppdmp
+xcrun devicectl device process launch --device <udid> --terminate-existing --console org.ppsspp.headless \
+    --graphics=vulkan --screenshot-dir=shots dump.ppdmp
+```
+
+Relative paths are relative to `Documents`, and `--console` shows its output. `--ios-clear=DIR`
+(handled by the app, not headless) deletes a folder under `Documents` first. `devicectl` has no way to
+delete files, and **never pass it `--remove-existing-content`**: that empties all of `Documents`, not
+just the destination folder.
+
+The `build-ios` folder works too if it's configured with `-DHEADLESS=ON`, as long as Xcode doesn't
+have that project open: `xcodebuild` then hangs before building anything, even `xcodebuild -list`.
 
 ## CI integration
 
@@ -217,3 +287,74 @@ new flag combinations, as long as the headless binary supports them.
 The CI test set (dumps and references) is maintained separately from the
 runner; the `frametests/` submodule is just one of several possible test sets
 - custom machines can use their own (possibly much larger) ones.
+
+## Comparing renderers
+
+Two backends never match pixel for pixel: edges land a pixel apart, filtering and interpolation round
+differently, 16-bit framebuffers expand their colors differently. To find what really differs between,
+say, Vulkan and the software renderer (or a PSP capture), render the same dumps with each and compare the
+directories with `Tools/image_compare.py`:
+
+```bash
+python3 Tools/image_compare.py out_vulkan/ out_soft/ --sort --heatmaps heat/
+```
+
+It counts a difference only where a pixel is outside the range of the other image's 3x3 neighborhood
+(widened by a tolerance) and enough of its neighbors are too, so shifted edges and speckle drop out, and
+separately counts 8x8 blocks whose averages differ, for broad shifts. The heatmaps show both images and the
+counted pixels. On the GitHub dump set, Vulkan and OpenGL come out equivalent for 795 of 957 dumps, and
+what's left is mostly real (frames one of them renders black, missing effects).
+
+## Replaying a dump on a real PSP
+
+The references above are PPSSPP's own renders, so they catch regressions, not
+wrong output. To see what the hardware draws, replay the dump on a PSP:
+`pspautotests/utils/ppdmp-playback` is a PSP program that runs a `.ppdmp` natively
+(all dump versions PPSSPP writes), and its `run.py` drives it over PSPLink from
+the host:
+
+```bash
+cd pspautotests
+python3 utils/ppdmp-playback/run.py --out /tmp/shots \
+	--headless ../build/PPSSPPHeadless "../frametests/dumps/Depth/21391 Coded arms ULUS10019_0001.zip"
+```
+
+It saves what the PSP displays as `NAME-psp.png`, and with `--headless` renders
+the same dump in PPSSPPHeadless (`--graphics=software` by default), saves
+`NAME-ppsspp.png` and prints the MSE between the two. Each frame stays on the
+PSP's screen for 1.5 seconds (`--hold`). It needs the PSPSDK (it rebuilds the PRX) and a PSP in
+PSPLink with `usbhostfs_pc` serving the pspautotests root, the same setup as
+[pspautotests-hardware.md](pspautotests-hardware.md); like every hardware run,
+one at a time. See its README for replaying a subset of the primitives.
+
+A zip holding several dumps plays its last `.ppdmp`, in PPSSPP and in the replayer, so extract that one
+when you need the file itself.
+
+If a replay hangs, `run.py` resets the PSP and prints the last lines the replayer wrote. `--progress=N`
+prints a line every N dump commands and `--trace-from=N` every command from N on, and `--cmds=N` replays
+only the first N dump commands, which bisects a hang in a few runs. The replayer's Makefile has no header
+dependencies: after changing `replay.h`, delete the `.o` files, or a stale object corrupts the `Replay`
+object.
+
+To find the draw where the two diverge, stop both at the same primitive:
+`run.py --end=N` on the PSP and `--replay-end=N` on PPSSPPHeadless. A draw into
+an offscreen buffer can be compared directly: `run.py --display=ADDR,STRIDE,FMT`
+shows and screenshots that buffer instead of the display (e.g.
+`--display=04000000,512,3` for an 8888 target at the start of VRAM), and
+PPSSPPHeadless takes `--screenshot-render-target` to save the current render
+target.
+
+PPSSPP's software renderer now matches the PSP bit for bit on nearly every dump
+here, so a difference is worth chasing. Hardware backends still differ slightly
+(filtering, edge rules), so compare their MSEs between versions instead.
+
+To record a dump from a running game without the UI, use the WebSocket debugger's
+`gpu.record.dump` through `Tools/wsdbg`. Its reply comes later, so wait for it:
+
+```bash
+printf ':sleep 6\ngpu.record.dump\n:wait gpu.record.dump 60\n:quit\n' | \
+	Tools/wsdbg/target/release/wsdbg --sync --compact --quiet --launch \
+	build/PPSSPPHeadless game.iso --state=STATE.ppst --graphics=software --debugger-run=0 > out.txt
+```
+
+The reply's `uri` is a base64 `data:` URI holding the `.ppdmp`.

@@ -32,7 +32,7 @@
     #endif
 #endif
 
-#if defined(__arm__) || defined(_M_ARM)
+#if defined(__arm__)
     #define PPSSPP_ARCH_ARM 1
     #define PPSSPP_ARCH_32BIT 1
 
@@ -47,11 +47,6 @@
     #endif
 
     #if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        #define PPSSPP_ARCH_ARM_NEON 1
-    #endif
-
-    #if defined(_M_ARM)
-        #define PPSSPP_ARCH_ARMV7 1
         #define PPSSPP_ARCH_ARM_NEON 1
     #endif
 #endif
@@ -94,9 +89,6 @@
 #if defined(_WIN32)
     // Covers both 32 and 64bit Windows
     #define PPSSPP_PLATFORM_WINDOWS 1
-	#ifdef _M_ARM
-        #define PPSSPP_ARCH_ARM_HARDFP 1
-	#endif
 	// UWP trickery
     #if defined(WINAPI_FAMILY) && defined(WINAPI_FAMILY_PARTITION)
         #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_APP) && WINAPI_FAMILY != WINAPI_FAMILY_DESKTOP_APP
@@ -105,6 +97,14 @@
     #endif
 #elif defined(__APPLE__)
     #include <TargetConditionals.h>
+    // tvOS is iOS with some APIs removed, so it also gets PPSSPP_PLATFORM_IOS.
+    // Check PPSSPP_PLATFORM(TVOS) for the differences.
+    #if TARGET_OS_TV
+        #define PPSSPP_PLATFORM_TVOS 1
+        #if TARGET_OS_SIMULATOR
+            #define PPSSPP_PLATFORM_TVOS_SIMULATOR 1
+        #endif
+    #endif
     #if TARGET_IPHONE_SIMULATOR
         #define PPSSPP_PLATFORM_IOS 1
         #define PPSSPP_PLATFORM_IOS_SIMULATOR 1
@@ -126,14 +126,14 @@
     #define PPSSPP_PLATFORM_OPENBSD 1
 #endif
 
-// Windows ARM/ARM64, and Windows UWP (all), are the only platform that don't do GL at all (until Apple finally removes it)
+// Windows ARM/ARM64, Windows UWP (all) and the iOS app don't do GL at all. The iOS libretro core still does.
 #if PPSSPP_PLATFORM(WINDOWS)
 #if PPSSPP_ARCH(ARM64) || PPSSPP_ARCH(ARM) || PPSSPP_PLATFORM(UWP)
 // No GL
 #else
 #define PPSSPP_API_ANY_GL 1
 #endif
-#elif PPSSPP_PLATFORM(IOS_APP_STORE)
+#elif PPSSPP_PLATFORM(IOS) && !defined(__LIBRETRO__)
 // No GL
 #else
 // All other platforms support GL.
@@ -142,4 +142,9 @@
 
 #if PPSSPP_PLATFORM(WINDOWS)
 #define PPSSPP_API_D3D11 1
+#endif
+
+// Not in the libretro cores, which get their graphics context from the frontend.
+#if (PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(IOS)) && !defined(__LIBRETRO__)
+#define PPSSPP_API_METAL 1
 #endif

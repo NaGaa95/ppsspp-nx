@@ -22,7 +22,7 @@
 #include "Common/Serialize/SerializeFuncs.h"
 #include "Core/MemMapHelpers.h"
 #include "Core/HLE/sceAtrac.h"
-#include "Core/Config.h"
+#include "Core/HLE/scePower.h"
 #include "Core/Reporting.h"
 #include "Core/Util/AudioFormat.h"
 #include "Core/System.h"
@@ -172,6 +172,13 @@ void VagDecoder::DoState(PointerWrap &p) {
 		}
 	}
 	Do(p, curSample);
+	// States from before 2018 saved idle voices uninitialized, so this can be garbage. The voice
+	// is ended instead, as GetSamples would index samples with it.
+	const bool badSample = curSample < 0 || curSample > (int)ARRAY_SIZE(samples);
+	if (badSample) {
+		WARN_LOG(Log::SaveState, "Bad VAG sample position %d, ending the voice", curSample);
+		curSample = (int)ARRAY_SIZE(samples);
+	}
 
 	Do(p, data_);
 	Do(p, read_);
@@ -185,6 +192,17 @@ void VagDecoder::DoState(PointerWrap &p) {
 	Do(p, loopEnabled_);
 	Do(p, loopAtNextBlock_);
 	Do(p, end_);
+	// GetSamples checks the read position against the blocks once, but loops back by block number
+	// without checking again.
+	const bool badBlocks = numBlocks_ < 0 || curBlock_ > numBlocks_ || loopStartBlock_ >= numBlocks_ ||
+		!Memory::IsValidRange(data_, (u32)numBlocks_ * 16);
+	if (p.mode == p.MODE_READ && badBlocks && !end_) {
+		WARN_LOG(Log::SaveState, "Bad VAG blocks (%d of %d, loop %d), ending the voice", curBlock_, numBlocks_, loopStartBlock_);
+		end_ = true;
+	}
+	if (badSample) {
+		end_ = true;
+	}
 }
 
 // The context pointer is assumed to be valid.
@@ -450,20 +468,34 @@ void SasInstance::SetGrainSize(int newGrainSize) {
 	memset(sendBufferProcessed, 0, sizeof(s16) * grainSize * 2);
 }
 
+// How long the Media Engine takes to mix one grain. Measured on a PSP (pspautotests
+// audio/timing/sastiming) at 222MHz: a fixed 110us plus 0.49us per sample of grain, plus per
+// playing voice and sample 0.445us + 0.0675us per unit of pitch ratio for VAG (a faster voice
+// decodes more ADPCM), 0.405us + 0.0675us for PCM and 0.41us for noise, plus 0.64us per sample
+// when a reverb type is set (the type doesn't matter; wet with no reverb type is free). Linear to
+// within 1% from 64 to 2048 samples and 0 to 32 voices - 32 VAG voices at 512 samples take 8.7ms.
 int SasInstance::EstimateMixUs() {
-	int voicesPlayingCount = 0;
-
+	float us = 110.0f + 0.49f * grainSize;
 	for (int v = 0; v < PSP_SAS_VOICES_MAX; v++) {
-		SasVoice &voice = voices[v];
-		if (!voice.playing || voice.paused)
+		const SasVoice &voice = voices[v];
+		if (!voice.playing || voice.paused) {
 			continue;
-		voicesPlayingCount++;
+		}
+		const float pitchRatio = voice.pitch / (float)PSP_SAS_PITCH_BASE;
+		float perSample;
+		switch (voice.type) {
+		case VOICETYPE_PCM: perSample = 0.405f + 0.0675f * pitchRatio; break;
+		case VOICETYPE_NOISE:
+		case VOICETYPE_TRIWAVE:
+		case VOICETYPE_PULSEWAVE: perSample = 0.41f; break;
+		default: perSample = 0.445f + 0.0675f * pitchRatio; break;
+		}
+		us += perSample * grainSize;
 	}
-
-	// Each voice costs extra time, and each byte of grain costs extra time.
-	int cycles = 20 + voicesPlayingCount * 68 + (grainSize * 60) / 100;
-	// Cap to 1200 to fix FFT, see issue #9956.
-	return std::min(cycles, 1200);
+	if (waveformEffect.type >= 0 && waveformEffect.isWetOn) {
+		us += 0.64f * grainSize;
+	}
+	return PowerScaleFromDefaultClock((int)us);
 }
 
 void SasVoice::ReadSamples(s16 *output, int numSamples) {
@@ -639,7 +671,9 @@ void SasInstance::Mix(u32 outAddr, u32 inAddr, int leftVol, int rightVol, bool m
 	// Then mix the send buffer in with the rest.
 
 	// Alright, all voices mixed. Let's convert and clip, and at the same time, wipe mixBuffer for next time. Could also dither.
-	s16 *outp = (s16 *)Memory::GetPointerWriteRangeOrException(outAddr, 4 * grainSize);
+	// Raw mode writes four planes of grainSize samples, mixed mode two interleaved.
+	const u32 outBytes = (outputMode == PSP_SAS_OUTPUTMODE_MIXED ? 4 : 8) * grainSize;
+	s16 *outp = (s16 *)Memory::GetPointerWriteRangeOrException(outAddr, outBytes);
 	const s16 *inp = inAddr ? (const s16 *)Memory::GetPointerRangeOrException(inAddr, 4 * grainSize) : 0;
 	if (!outp) {
 		WARN_LOG_REPORT(Log::sceSas, "Bad SAS Mix output address: %08x, grain=%d", outAddr, grainSize);
@@ -759,6 +793,11 @@ void SasInstance::DoState(PointerWrap &p) {
 
 	Do(p, grainSize);
 	if (p.mode == p.MODE_READ) {
+		if (grainSize > PSP_SAS_MAX_GRAIN) {
+			ERROR_LOG(Log::SaveState, "Bad SAS grain size %d", grainSize);
+			p.SetError(p.ERROR_FAILURE);
+			return;
+		}
 		if (grainSize > 0) {
 			SetGrainSize(grainSize);
 		} else {
@@ -767,6 +806,11 @@ void SasInstance::DoState(PointerWrap &p) {
 	}
 
 	Do(p, maxVoices);
+	if (maxVoices <= 0 || maxVoices > PSP_SAS_VOICES_MAX) {
+		ERROR_LOG(Log::SaveState, "Bad SAS voice count %d", maxVoices);
+		p.SetError(p.ERROR_FAILURE);
+		return;
+	}
 	Do(p, sampleRate);
 	Do(p, outputMode);
 
@@ -788,6 +832,7 @@ void SasInstance::DoState(PointerWrap &p) {
 	Do(p, n);
 	if (n != PSP_SAS_VOICES_MAX) {
 		ERROR_LOG(Log::SaveState, "Wrong number of SAS voices");
+		p.SetError(p.ERROR_FAILURE);
 		return;
 	}
 	DoArray(p, voices, ARRAY_SIZE(voices));
@@ -855,6 +900,14 @@ void SasVoice::DoState(PointerWrap &p) {
 
 	Do(p, sampleFrac);
 	Do(p, pitch);
+	// Mixing leaves less than a sample in sampleFrac, and indexes its temp buffer by it and pitch.
+	// ReadSamples() needs the PCM positions inside the buffer.
+	if (sampleFrac >= PSP_SAS_PITCH_BASE || pitch < PSP_SAS_PITCH_MIN || pitch > PSP_SAS_PITCH_MAX ||
+		(type == VOICETYPE_PCM && (pcmSize <= 0 || pcmIndex < 0 || pcmIndex > pcmSize || pcmLoopPos < 0 || pcmLoopPos >= pcmSize))) {
+		ERROR_LOG(Log::SaveState, "Bad SAS voice state");
+		p.SetError(p.ERROR_FAILURE);
+		return;
+	}
 	Do(p, loop);
 	if (s < 2 && type == VOICETYPE_PCM) {
 		// We set loop incorrectly before, and always looped.

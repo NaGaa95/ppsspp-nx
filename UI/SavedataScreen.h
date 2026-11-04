@@ -95,13 +95,16 @@ public:
 	void dialogFinished(const Screen *dialog, DialogResult result) override;
 	void sendMessage(UIMessage message, const char *value) override;
 
+	ViewLayoutMode LayoutMode() const override {
+		return ViewLayoutMode::ApplyInsets;
+	}
+
 	const char *tag() const override { return "Savedata"; }
 
 protected:
 	void CreateTabs() override;
 	void CreateExtraButtons(UI::ViewGroup *verticalLayout, int margins) override;
 
-	bool ShowSearchControls() const override { return false; }
 	
 private:
 	void OnSavedataButtonClick(UI::EventParams &e);

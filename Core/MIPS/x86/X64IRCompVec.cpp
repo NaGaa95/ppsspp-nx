@@ -242,50 +242,50 @@ void X64JitBackend::CompIR_VecAssign(IRInst inst) {
 	}
 }
 
-void X64JitBackend::CompIR_VecClamp(IRInst inst) {
-	CONDITIONAL_DISABLE;
-
-	switch (inst.op) {
-	case IROp::Vec4ClampToZero:
-	case IROp::Vec2ClampToZero:
-		CompIR_Generic(inst);
-		break;
-
-	default:
-		INVALIDOP;
-		break;
-	}
-}
-
 void X64JitBackend::CompIR_VecHoriz(IRInst inst) {
 	CONDITIONAL_DISABLE;
 
 	switch (inst.op) {
-	case IROp::Vec4Dot:
+	case IROp::Vec4VfpuDot:
 	{
-		// TODO: Handle "aliasing" of sizes.  In theory it should be fine if not dirty...
-		if (Overlap(inst.dest, 1, inst.src1, 4) || Overlap(inst.dest, 1, inst.src2, 4))
-			DISABLE;
-
-		X64Reg tempReg = regs_.MapWithFPRTemp(inst);
-
-		if (inst.dest == inst.src1) {
-			MULPS(regs_.FX(inst.dest), regs_.F(inst.src2));
-		} else if (inst.dest == inst.src2) {
-			MULPS(regs_.FX(inst.dest), regs_.F(inst.src1));
-		} else if (cpu_info.bAVX) {
-			VMULPS(128, regs_.FX(inst.dest), regs_.FX(inst.src1), regs_.F(inst.src2));
-		} else if (cpu_info.bSSE4_1) {
-			MOVAPS(regs_.FX(inst.dest), regs_.F(inst.src1));
-			MULPS(regs_.FX(inst.dest), regs_.F(inst.src2));
+#if PPSSPP_ARCH(AMD64)
+		if (!vfpuDot_ || Overlap(inst.dest, 1, inst.src1, 4) || Overlap(inst.dest, 1, inst.src2, 4)) {
+			CompIR_Generic(inst);
+			break;
 		}
-
-		// This shuffle can be done in one op for SSE3/AVX, but it's not always faster.
-		MOVAPS(tempReg, regs_.F(inst.dest));
-		SHUFPS(tempReg, regs_.F(inst.dest), VFPU_SWIZZLE(1, 0, 3, 2));
-		ADDPS(regs_.FX(inst.dest), R(tempReg));
-		MOVHLPS(tempReg, regs_.FX(inst.dest));
-		ADDSS(regs_.FX(inst.dest), R(tempReg));
+		// The operands go to the shared routine in xmm0 and xmm1, and the result comes back in edi.
+		// Whatever guest state is in the registers it clobbers gets flushed first: these come last in
+		// the allocation order, so usually that's nothing. Then again after the operands are moved,
+		// in case they were mapped into one of them.
+		auto flushClobbered = [&]() {
+			regs_.FlushHostRegs({ RCX, RDX, RSI, RDI }, { XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM14, XMM15 });
+		};
+		flushClobbered();
+		regs_.SpillLockFPR(inst.src1, inst.src2);
+		const X64Reg x = regs_.MapVec4(inst.src1);
+		const X64Reg y = regs_.MapVec4(inst.src2);
+		if (x == XMM1 && y == XMM0) {
+			MOVAPS(XMM2, R(XMM0));
+			MOVAPS(XMM0, R(XMM1));
+			MOVAPS(XMM1, R(XMM2));
+		} else if (y == XMM0) {
+			MOVAPS(XMM1, R(y));
+			MOVAPS(XMM0, R(x));
+		} else {
+			if (x != XMM0)
+				MOVAPS(XMM0, R(x));
+			if (y != XMM1)
+				MOVAPS(XMM1, R(y));
+		}
+		regs_.ReleaseSpillLockFPR(inst.src1, inst.src2);
+		flushClobbered();
+		CALL(vfpuDot_);
+		regs_.MapFPR(inst.dest, MIPSMap::NOINIT);
+		MOVD_xmm(regs_.FX(inst.dest), R(EDI));
+#else
+		// 32-bit x86 has too few registers for the shared routine.
+		CompIR_Generic(inst);
+#endif
 		break;
 	}
 
@@ -298,17 +298,99 @@ void X64JitBackend::CompIR_VecHoriz(IRInst inst) {
 void X64JitBackend::CompIR_VecPack(IRInst inst) {
 	CONDITIONAL_DISABLE;
 
+	// Only SSE2 here. A destination overlapping the source goes the slow way, it's rare.
 	switch (inst.op) {
-	case IROp::Vec2Unpack16To31:
 	case IROp::Vec4Pack32To8:
-	case IROp::Vec2Pack31To16:
-	case IROp::Vec4Unpack8To32:
-	case IROp::Vec2Unpack16To32:
-	case IROp::Vec4DuplicateUpperBitsAndShift1:
 	case IROp::Vec4Pack31To8:
-	case IROp::Vec2Pack32To16:
-		CompIR_Generic(inst);
+	{
+		if (Overlap(inst.dest, 1, inst.src1, 4)) {
+			DISABLE;
+		}
+		// The top byte of each lane, packed into one lane. For 31, the byte below the sign, with
+		// negative lanes clamped to zero: the arithmetic shift makes them negative, and PACKUSWB
+		// saturates them to 0.
+		X64Reg tempReg = regs_.MapWithFPRTemp(inst);
+		MOVDQA(tempReg, regs_.F(inst.src1));
+		if (inst.op == IROp::Vec4Pack31To8)
+			PSRAD(tempReg, 23);
+		else
+			PSRLD(tempReg, 24);
+		PACKSSDW(tempReg, R(tempReg));
+		PACKUSWB(tempReg, R(tempReg));
+		MOVDQA(regs_.FX(inst.dest), R(tempReg));
 		break;
+	}
+
+	case IROp::Vec2Pack32To16:
+	case IROp::Vec2Pack31To16:
+	{
+		if (Overlap(inst.dest, 1, inst.src1, 2)) {
+			DISABLE;
+		}
+		// The top 16 bits of each lane (for 31, the 16 below the sign, with negative lanes clamped
+		// to zero), packed into one lane. The arithmetic shift keeps them in PACKSSDW's range, so
+		// the bits come through unchanged.
+		X64Reg tempReg = regs_.MapWithFPRTemp(inst);
+		MOVDQA(tempReg, regs_.F(inst.src1));
+		if (inst.op == IROp::Vec2Pack31To16) {
+			PSRAD(tempReg, 31);
+			PANDN(tempReg, regs_.F(inst.src1));
+			PSLLD(tempReg, 1);
+		}
+		PSRAD(tempReg, 16);
+		PACKSSDW(tempReg, R(tempReg));
+		MOVDQA(regs_.FX(inst.dest), R(tempReg));
+		break;
+	}
+
+	case IROp::Vec4Unpack8To32:
+	{
+		if (Overlap(inst.dest, 4, inst.src1, 1)) {
+			DISABLE;
+		}
+		// Each byte into the top of a lane: duplicate bytes, then words, then shift the rest out.
+		X64Reg tempReg = regs_.MapWithFPRTemp(inst);
+		MOVDQA(tempReg, regs_.F(inst.src1));
+		PUNPCKLBW(tempReg, R(tempReg));
+		PUNPCKLWD(tempReg, R(tempReg));
+		PSLLD(tempReg, 24);
+		MOVDQA(regs_.FX(inst.dest), R(tempReg));
+		break;
+	}
+
+	case IROp::Vec2Unpack16To32:
+	case IROp::Vec2Unpack16To31:
+	{
+		if (Overlap(inst.dest, 2, inst.src1, 1)) {
+			DISABLE;
+		}
+		// Each half into the top of a lane, shifted down one more for 31.
+		X64Reg tempReg = regs_.MapWithFPRTemp(inst);
+		MOVDQA(tempReg, regs_.F(inst.src1));
+		PUNPCKLWD(tempReg, R(tempReg));
+		PSLLD(tempReg, 16);
+		if (inst.op == IROp::Vec2Unpack16To31)
+			PSRLD(tempReg, 1);
+		MOVDQA(regs_.FX(inst.dest), R(tempReg));
+		break;
+	}
+
+	case IROp::Vec4DuplicateUpperBitsAndShift1:
+	{
+		if (inst.dest != inst.src1 && Overlap(inst.dest, 4, inst.src1, 4)) {
+			DISABLE;
+		}
+		// v |= v >> 8; v |= v >> 16; v >>= 1, which turns 0xFF000000 into 0x7FFFFFFF.
+		X64Reg tempReg = regs_.MapWithFPRTemp(inst);
+		MOVDQA(tempReg, regs_.F(inst.src1));
+		PSRLD(tempReg, 8);
+		POR(tempReg, regs_.F(inst.src1));
+		MOVDQA(regs_.FX(inst.dest), R(tempReg));
+		PSRLD(tempReg, 16);
+		POR(regs_.FX(inst.dest), R(tempReg));
+		PSRLD(regs_.FX(inst.dest), 1);
+		break;
+	}
 
 	default:
 		INVALIDOP;

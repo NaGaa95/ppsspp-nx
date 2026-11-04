@@ -37,6 +37,8 @@ const char * const hlsl_preamble_fs =
 "#define inversesqrt rsqrt\n"
 "#define floatBitsToUint asuint\n"
 "#define uintBitsToFloat asfloat\n"
+"#define floatBitsToInt asint\n"
+"#define intBitsToFloat asfloat\n"
 "\n";
 
 static const char * const hlsl_d3d11_preamble_fs =
@@ -71,6 +73,8 @@ static const char * const hlsl_preamble_vs =
 "#define inversesqrt rsqrt\n"
 "#define floatBitsToUint asuint\n"
 "#define uintBitsToFloat asfloat\n"
+"#define floatBitsToInt asint\n"
+"#define intBitsToFloat asfloat\n"
 "\n";
 
 static const char * const semanticNames[] = {
@@ -387,7 +391,9 @@ void ShaderWriter::DeclareTexture2D(const SamplerDef &def) {
 		break;
 	case GLSL_VULKAN:
 		// texBindingBase_ is used for the thin3d descriptor set layout, where they start at 1.
-		if (def.flags & SamplerFlags::ARRAY_ON_VULKAN) {
+		if (def.flags & SamplerFlags::MULTISAMPLE) {
+			F("layout(set = 0, binding = %d) uniform sampler2DMS%s %s;\n", def.binding + texBindingBase_, (def.flags & SamplerFlags::ARRAY_ON_VULKAN) ? "Array" : "", def.name);
+		} else if (def.flags & SamplerFlags::ARRAY_ON_VULKAN) {
 			F("layout(set = 0, binding = %d) uniform sampler2DArray %s;\n", def.binding + texBindingBase_, def.name);
 		} else {
 			F("layout(set = 0, binding = %d) uniform sampler2D %s;\n", def.binding + texBindingBase_, def.name);

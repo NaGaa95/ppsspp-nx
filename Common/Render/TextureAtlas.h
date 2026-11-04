@@ -96,6 +96,9 @@ struct AtlasFontHeader {
 };
 
 struct AtlasFont {
+	AtlasFont() = default;
+	AtlasFont(const AtlasFont &) = delete;
+	AtlasFont &operator=(const AtlasFont &) = delete;
 	~AtlasFont();
 
 	float padding;
@@ -126,6 +129,9 @@ struct AtlasHeader {
 };
 
 struct Atlas {
+	Atlas() = default;
+	Atlas(const Atlas &) = delete;
+	Atlas &operator=(const Atlas &) = delete;
 	~Atlas();
 	bool LoadMeta(const uint8_t *data, size_t data_size);
 	bool IsMetadataLoaded() const {
@@ -137,6 +143,8 @@ struct Atlas {
 	int num_fonts = 0;
 	AtlasImage *images = nullptr;
 	int num_images = 0;
+	// Texels per UI unit that generated images were rasterized at. Not stored in metadata.
+	float dpiScale = 1.0f;
 
 	// These are inefficient linear searches, try not to call every frame.
 	const AtlasFont *getFont(FontID id) const;

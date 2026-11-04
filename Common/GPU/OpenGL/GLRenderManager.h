@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -30,6 +31,8 @@ constexpr int MAX_GL_TEXTURE_SLOTS = 8;
 
 class GLRTexture {
 public:
+	GLRTexture(const GLRTexture &) = delete;
+	GLRTexture &operator=(const GLRTexture &) = delete;
 	GLRTexture(const Draw::DeviceCaps &caps, int width, int height, int depth, int numMips);
 	~GLRTexture();
 
@@ -53,6 +56,8 @@ public:
 
 class GLRFramebuffer {
 public:
+	GLRFramebuffer(const GLRFramebuffer &) = delete;
+	GLRFramebuffer &operator=(const GLRFramebuffer &) = delete;
 	GLRFramebuffer(const Draw::DeviceCaps &caps, int _width, int _height, bool z_stencil, const char *tag)
 		: color_texture(caps, _width, _height, 1, 1), z_stencil_texture(caps, _width, _height, 1, 1),
 		width(_width), height(_height), z_stencil_(z_stencil) {
@@ -73,6 +78,10 @@ public:
 	int height;
 	GLuint colorDepth = 0;
 	bool z_stencil_;
+#ifdef __LIBRETRO__
+	GLRFramebuffer *vrRight = nullptr;
+	unsigned vrGeneration = 0;
+#endif
 
 private:
 	std::string tag_;
@@ -83,6 +92,8 @@ private:
 
 class GLRShader {
 public:
+	GLRShader(const GLRShader &) = delete;
+	GLRShader &operator=(const GLRShader &) = delete;
 	explicit GLRShader(std::string_view _desc) : desc(_desc) {}
 	~GLRShader() {
 		if (shader) {
@@ -116,6 +127,9 @@ public:
 
 class GLRProgram {
 public:
+	GLRProgram() = default;
+	GLRProgram(const GLRProgram &) = delete;
+	GLRProgram &operator=(const GLRProgram &) = delete;
 	~GLRProgram() {
 		if (deleteCallback_) {
 			deleteCallback_(deleteParam_);
@@ -239,6 +253,11 @@ public:
 	void ThreadStart(Draw::DrawContext *draw);
 	void ThreadEnd();
 	bool ThreadFrame();  // False means it's time to exit.
+	// True if ThreadFrame() has queued work and will not block on an empty queue.
+	bool HasQueuedThreadWork() {
+		std::lock_guard<std::mutex> lock(pushMutex_);
+		return !renderThreadQueue_.empty();
+	}
 
 	void NotifyEmuThreadExit();
 
@@ -828,6 +847,10 @@ public:
 		queueRunner_.Resize(width, height);
 	}
 
+	void ForgetBoundFramebuffers() {
+		queueRunner_.ForgetBoundFramebuffers();
+	}
+
 	void UnregisterPushBuffer(GLPushBuffer *buffer) {
 		std::lock_guard<std::mutex> lock(pushBuffersMutex_);
 		int foundCount = 0;
@@ -921,7 +944,8 @@ private:
 	bool syncDone_ = false;
 
 	GLDeleter deleter_;
-	bool skipGLCalls_ = false;
+	// Set from either thread, read on the render thread.
+	std::atomic<bool> skipGLCalls_{false};
 
 	int curFrame_ = 0;
 

@@ -69,14 +69,22 @@ struct RasterizerState {
 	PixelFuncID pixelID;
 	SamplerID samplerID;
 	SingleFunc drawPixel;
+	// Four pixels in a row at once, where drawPixel is the C++ one.
+	SpanFunc drawSpan = nullptr;
 	Sampler::LinearFunc linear;
 	Sampler::NearestFunc nearest;
+	// Four pixels at once, where linear is the C++ fallback.
+	Sampler::LinearQuadFunc linearQuad = nullptr;
 	uint32_t texaddr[8]{};
 	uint16_t texbufw[8]{};
 	const u8 *texptr[8]{};
 	float textureLodSlope;
+	// TEXFLUSHes before this state (BinManager::SelfTextureSnapshot).
+	uint32_t texFlushGen = 0;
 	RasterizerStateFlags flags = RasterizerStateFlags::NONE;
 	RasterizerStateFlags lastFlags = RasterizerStateFlags::INVALID;
+	// The binner's tile generation in which threads may be drawing with it (BinManager::DistributeItems).
+	uint32_t liveGen = 0;
 
 	struct {
 		uint8_t maxTexLevel : 3;
@@ -90,6 +98,8 @@ struct RasterizerState {
 		bool magFilt : 1;
 		bool antialiasLines : 1;
 		bool textureProj : 1;
+		// Textures from the buffer it draws to (BinManager::SelfTextureSnapshot).
+		bool selfTexture : 1;
 	};
 
 #if defined(SOFTGPU_MEMORY_TAGGING_DETAILED) || defined(SOFTGPU_MEMORY_TAGGING_BASIC)
@@ -101,7 +111,7 @@ struct RasterizerState {
 	}
 };
 
-void ComputeRasterizerState(RasterizerState *state, BinManager *binner);
+void ComputeRasterizerState(RasterizerState *state);
 void CalculateRasterStateFlags(RasterizerState *state, const VertexData &v0);
 void CalculateRasterStateFlags(RasterizerState *state, const VertexData &v0, const VertexData &v1, bool forceFlat);
 void CalculateRasterStateFlags(RasterizerState *state, const VertexData &v0, const VertexData &v1, const VertexData &v2);

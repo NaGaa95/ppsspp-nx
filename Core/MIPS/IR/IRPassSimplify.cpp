@@ -6,6 +6,7 @@
 #include "Common/Data/Convert/SmallDataConvert.h"
 #include "Common/Log.h"
 #include "Core/Config.h"
+#include "Core/MemMap.h"
 #include "Core/MIPS/MIPSVFPUUtils.h"
 #include "Core/MIPS/IR/IRAnalysis.h"
 #include "Core/MIPS/IR/IRInterpreter.h"
@@ -23,10 +24,11 @@ u32 Evaluate(u32 a, u32 b, IROp op) {
 	case IROp::And: case IROp::AndConst: return a & b;
 	case IROp::Or: case IROp::OrConst: return a | b;
 	case IROp::Xor: case IROp::XorConst: return a ^ b;
-	case IROp::Shr: case IROp::ShrImm: return a >> b;
-	case IROp::Sar: case IROp::SarImm: return (s32)a >> b;
-	case IROp::Ror: case IROp::RorImm: return (a >> b) | (a << (32 - b));
-	case IROp::Shl: case IROp::ShlImm: return a << b;
+	// MIPS (and IRInterpret) only look at the low 5 bits of a variable shift amount.
+	case IROp::Shr: case IROp::ShrImm: return a >> (b & 31);
+	case IROp::Sar: case IROp::SarImm: return (s32)a >> (b & 31);
+	case IROp::Ror: case IROp::RorImm: return __rotr(a, b & 31);
+	case IROp::Shl: case IROp::ShlImm: return a << (b & 31);
 	case IROp::Slt: case IROp::SltConst: return ((s32)a < (s32)b);
 	case IROp::SltU: case IROp::SltUConst: return (a < b);
 	default:
@@ -253,6 +255,9 @@ bool RemoveLoadStoreLeftRight(const IRWriter &in, IRWriter &out, const IROptions
 			const IRInst &next = nextOp();
 			if (next.op != matchOp || next.dest != inst.dest || next.src1 != inst.src1)
 				return false;
+			// A load into its own base changes the address the second half reads from.
+			if (replaceOp == IROp::Load32 && inst.dest == inst.src1)
+				return false;
 			if (inst.constant + matchOff != next.constant)
 				return false;
 
@@ -455,8 +460,9 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 	IRImmRegCache gpr(&out);
 
 	bool logBlocks = false;
-	bool skipNextExitToConst = false;
-	for (int i = 0; i < (int)in.GetInstructions().size(); i++) {
+	// Set once a conditional exit is known to be taken, making the rest of the block dead.
+	bool unreachable = false;
+	for (int i = 0; i < (int)in.GetInstructions().size() && !unreachable; i++) {
 		IRInst inst = in.GetInstructions()[i];
 		bool symmetric = true;
 		switch (inst.op) {
@@ -623,6 +629,8 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 		case IROp::MovZ:
 		case IROp::MovNZ:
 			gpr.MapInInIn(inst.dest, inst.src1, inst.src2);
+			// The dest is read, then maybe written.
+			gpr.MapDirty(inst.dest);
 			goto doDefault;
 
 		case IROp::Min:
@@ -660,11 +668,16 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 		case IROp::Store32Left:
 		case IROp::Store32Right:
 		case IROp::Store32Conditional:
-			if (gpr.IsImm(inst.src1) && inst.src1 != inst.dest) {
+			if (gpr.IsImm(inst.src1)) {
 				gpr.MapIn(inst.dest);
+				// sc also writes its value reg, with the result.
+				if (inst.op == IROp::Store32Conditional)
+					gpr.MapDirty(inst.dest);
 				out.Write(inst.op, inst.dest, 0, 0, gpr.GetImm(inst.src1) + inst.constant);
 			} else {
 				gpr.MapInIn(inst.dest, inst.src1);
+				if (inst.op == IROp::Store32Conditional)
+					gpr.MapDirty(inst.dest);
 				goto doDefault;
 			}
 			break;
@@ -678,15 +691,38 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 			}
 			break;
 
+		case IROp::LoadKernel8:
+		case IROp::LoadKernel8Ext:
+		case IROp::LoadKernel16:
+		case IROp::LoadKernel16Ext:
+		case IROp::LoadKernel32:
+		case IROp::StoreKernel8:
+		case IROp::StoreKernel16:
+		case IROp::StoreKernel32:
+			// Barriers, so everything is written out, but they can't change the GPRs, so the values
+			// stay known. A constant address goes in the op, for ResolveKernelMemory.
+			if (gpr.IsImm(inst.src1)) {
+				const u32 addr = gpr.GetImm(inst.src1) + inst.constant;
+				gpr.FlushAll(true);
+				if ((GetIRMeta(inst.op)->flags & IRFLAG_SRC3) == 0)
+					gpr.MapDirty(inst.dest);
+				out.Write(inst.op, inst.dest, 0, 0, addr);
+				break;
+			}
+			gpr.FlushAll(true);
+			goto doDefault;
+
 		case IROp::Load8:
 		case IROp::Load8Ext:
 		case IROp::Load16:
 		case IROp::Load16Ext:
 		case IROp::Load32:
 		case IROp::Load32Linked:
-			if (gpr.IsImm(inst.src1) && inst.src1 != inst.dest) {
+			if (gpr.IsImm(inst.src1)) {
+				// Read the address first, as the dest may be the base (lui v0, hi; lw v0, lo(v0)).
+				u32 addr = gpr.GetImm(inst.src1) + inst.constant;
 				gpr.MapDirty(inst.dest);
-				out.Write(inst.op, inst.dest, 0, 0, gpr.GetImm(inst.src1) + inst.constant);
+				out.Write(inst.op, inst.dest, 0, 0, addr);
 			} else {
 				gpr.MapDirtyIn(inst.dest, inst.src1);
 				goto doDefault;
@@ -703,11 +739,15 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 			break;
 		case IROp::Load32Left:
 		case IROp::Load32Right:
+			// These merge into the dest, so it's read, then written.
 			if (gpr.IsImm(inst.src1)) {
+				u32 addr = gpr.GetImm(inst.src1) + inst.constant;
 				gpr.MapIn(inst.dest);
-				out.Write(inst.op, inst.dest, 0, 0, gpr.GetImm(inst.src1) + inst.constant);
+				gpr.MapDirty(inst.dest);
+				out.Write(inst.op, inst.dest, 0, 0, addr);
 			} else {
 				gpr.MapInIn(inst.dest, inst.src1);
+				gpr.MapDirty(inst.dest);
 				goto doDefault;
 			}
 			break;
@@ -764,6 +804,16 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 		case IROp::FRSqrt:
 		case IROp::FRecip:
 		case IROp::FAsin:
+		case IROp::FVSqrt:
+		case IROp::FExp2:
+		case IROp::FLog2:
+		case IROp::FHalfToFloat:
+		case IROp::FSinCos:
+		case IROp::FMin:
+		case IROp::FMax:
+		case IROp::FSign:
+		case IROp::FSat0_1:
+		case IROp::FSatMinus1_1:
 			out.Write(inst);
 			break;
 
@@ -817,20 +867,26 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 		case IROp::Vec4Sub:
 		case IROp::Vec4Mul:
 		case IROp::Vec4Div:
-		case IROp::Vec4Dot:
+		case IROp::Vec4VfpuDot:
+		case IROp::Vec4VfpuMultiDot:
 		case IROp::Vec4Scale:
 		case IROp::Vec4Shuffle:
 		case IROp::Vec4Blend:
 		case IROp::Vec4Neg:
 		case IROp::Vec4Abs:
+		case IROp::Vec4Min:
+		case IROp::Vec4Max:
+		case IROp::Vec4Slt:
+		case IROp::Vec4Sge:
+		case IROp::Vec4CvtScaledSW:
 		case IROp::Vec4Pack31To8:
 		case IROp::Vec4Pack32To8:
 		case IROp::Vec2Pack32To16:
 		case IROp::Vec4Unpack8To32:
 		case IROp::Vec2Unpack16To32:
+		case IROp::Vec2Unpack16To31:
+		case IROp::Vec2Pack31To16:
 		case IROp::Vec4DuplicateUpperBitsAndShift1:
-		case IROp::Vec2ClampToZero:
-		case IROp::Vec4ClampToZero:
 			out.Write(inst);
 			break;
 
@@ -874,11 +930,12 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 				if (passed) {
 					gpr.FlushAll();
 					out.Write(IROp::ExitToConst, 0, 0, 0, inst.constant);
-					skipNextExitToConst = true;
+					unreachable = true;
 				}
 				break;
 			}
-			gpr.FlushAll();
+			// Only exits when taken, so the values stay known after.
+			gpr.FlushAll(true);
 			goto doDefault;
 
 		case IROp::ExitToConstIfGtZ:
@@ -898,18 +955,15 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 				if (passed) {
 					gpr.FlushAll();
 					out.Write(IROp::ExitToConst, 0, 0, 0, inst.constant);
-					skipNextExitToConst = true;
+					unreachable = true;
 				}
 				break;
 			}
-			gpr.FlushAll();
+			// Only exits when taken, so the values stay known after.
+			gpr.FlushAll(true);
 			goto doDefault;
 
 		case IROp::ExitToConst:
-			if (skipNextExitToConst) {
-				skipNextExitToConst = false;
-				break;
-			}
 			gpr.FlushAll();
 			goto doDefault;
 
@@ -937,6 +991,9 @@ bool PropagateConstants(const IRWriter &in, IRWriter &out, const IROptions &opts
 		{
 			gpr.FlushAll();
 		doDefault:
+			// Whatever the op writes isn't known anymore (its inputs were written out above).
+			if (GetIRMeta(inst.op)->types[0] == 'G' && (GetIRMeta(inst.op)->flags & IRFLAG_SRC3) == 0)
+				gpr.MapDirty(inst.dest);
 			out.Write(inst);
 			break;
 		}
@@ -1002,6 +1059,21 @@ bool PurgeTemps(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 	int lastReadFrom[256];
 	memset(lastWrittenTo, -1, sizeof(lastWrittenTo));
 	memset(lastReadFrom, -1, sizeof(lastReadFrom));
+
+	auto writesToFPRCheck = [](const IRInstMeta &inst, const Check &check) {
+		for (int i = 0; i < check.fplen; ++i) {
+			if (IRWritesToFPR(inst, check.reg - 32 + i))
+				return true;
+		}
+		return false;
+	};
+
+	auto nukeCheckedInst = [&](Check &check) {
+		insts[check.index].op = IROp::Mov;
+		insts[check.index].dest = 0;
+		insts[check.index].src1 = 0;
+		check.reg = 0;
+	};
 
 	auto readsFromFPRCheck = [](IRInstMeta &inst, Check &check, bool *directly) {
 		if (check.reg < 32)
@@ -1096,6 +1168,8 @@ bool PurgeTemps(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 						srclen = 4;
 					else if (type == '2')
 						srclen = 2;
+					else if (type == 'M')
+						srclen = 16;
 					else if (type != 'F')
 						return;
 
@@ -1108,25 +1182,38 @@ bool PurgeTemps(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 				checkMismatch(inst.src1, inst.m.types[1]);
 				checkMismatch(inst.src2, inst.m.types[2]);
 				if ((inst.m.flags & (IRFLAG_SRC3 | IRFLAG_SRC3DST)) != 0)
-					checkMismatch(inst.src3, inst.m.types[3]);
+					checkMismatch(inst.src3, inst.m.types[0]);
 
 				bool cannotReplace = !readsDirectly || lenMismatch;
+				// Nor where a multi-lane result would cover the source it reads instead, which the
+				// backends don't expect (the copy was what kept them apart).
+				IRReg destRegs[4];
+				const int numDest = IRDestFPRs(inst, destRegs);
+				if (numDest > 1 && check.srcReg >= destRegs[0] + 32 && check.srcReg < destRegs[0] + 32 + numDest)
+					cannotReplace = true;
+				// Nor where it's read as src3 that's also the destination, which renaming would move.
+				if ((inst.m.flags & IRFLAG_SRC3DST) != 0 && inst.m.types[0] == 'F' && inst.src3 + 32 == check.reg)
+					cannotReplace = true;
 				if (!cannotReplace && check.srcReg >= 32 && lastWrittenTo[check.srcReg] < check.index) {
 					// This is probably not worth doing unless we can get rid of a temp.
 					if (!check.readByExit) {
-						if (insts[check.index].dest == inst.src1)
-							inst.src1 = check.srcReg - 32;
-						else if (insts[check.index].dest == inst.src2)
-							inst.src2 = check.srcReg - 32;
-						else
-							_assert_msg_(false, "Unexpected src3 read of FPR");
+						// Replace every F operand that reads it (it might be read twice).
+						const IRReg reg = (IRReg)(check.reg - 32);
+						const IRReg srcReg = (IRReg)(check.srcReg - 32);
+						if (inst.m.types[1] == 'F' && inst.src1 == reg)
+							inst.src1 = srcReg;
+						if (inst.m.types[2] == 'F' && inst.src2 == reg)
+							inst.src2 = srcReg;
+						if ((inst.m.flags & IRFLAG_SRC3) != 0 && inst.m.types[0] == 'F' && inst.src3 == reg)
+							inst.src3 = srcReg;
 
-						// Check if we've clobbered it entirely.
-						if (inst.dest == check.reg) {
+						// If this also writes the reg, the check ends here. A full overwrite leaves the
+						// original write dead, since every read in between now uses srcReg.
+						if (writesToFPRCheck(inst, check)) {
+							IRReg destFPRs[4];
+							if (IRDestFPRs(inst, destFPRs) == check.fplen && inst.dest + 32 == check.reg)
+								nukeCheckedInst(check);
 							check.reg = 0;
-							insts[check.index].op = IROp::Mov;
-							insts[check.index].dest = 0;
-							insts[check.index].src1 = 0;
 						}
 					} else {
 						// Let's not bother.
@@ -1172,17 +1259,14 @@ bool PurgeTemps(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 				insts[check.index].dest = 0;
 				insts[check.index].src1 = 0;
 				check.reg = 0;
-			} else if (IRWritesToFPR(inst, check.reg - 32) && check.fplen >= 1) {
+			} else if (check.fplen >= 1 && writesToFPRCheck(inst, check)) {
 				IRReg destFPRs[4];
 				int numFPRs = IRDestFPRs(inst, destFPRs);
 
 				if (numFPRs == check.fplen && inst.dest + 32 == check.reg) {
 					// This means we've clobbered it, and with full overlap.
 					// Sometimes this happens for non-temps, i.e. vmmov + vinit last row.
-					insts[check.index].op = IROp::Mov;
-					insts[check.index].dest = 0;
-					insts[check.index].src1 = 0;
-					check.reg = 0;
+					nukeCheckedInst(check);
 				} else {
 					// Since there's an overlap, we simply cannot optimize.
 					check.reg = 0;
@@ -1226,6 +1310,10 @@ bool PurgeTemps(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 				// These might sometimes be implicitly read/written by other instructions.
 				break;
 			}
+			if (inst.op == IROp::Store32Conditional || inst.op == IROp::Load32Linked) {
+				// These do more than write the reg (the store, and LLBIT), so they must stay.
+				break;
+			}
 			checks.push_back(Check(dest, i, true));
 			break;
 
@@ -1235,7 +1323,7 @@ bool PurgeTemps(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 			break;
 		}
 
-		IRReg regs[16];
+		IRReg regs[IR_MAX_FPR_READS];
 		int readGPRs = IRReadsFromGPRs(inst, regs);
 		if (readGPRs == -1) {
 			for (int j = 0; j < 256; ++j)
@@ -1308,7 +1396,10 @@ bool ReduceLoads(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 	for (int i = 0, n = (int)in.GetInstructions().size(); i < n; i++) {
 		IRInst inst = in.GetInstructions()[i];
 
-		if (inst.op == IROp::Load32 || inst.op == IROp::Load16 || inst.op == IROp::Load16Ext) {
+		// With the depth mirrors, a load's width decides whether it goes through the depth layout
+		// (Memory::DepthMirrored16), so 16-bit loads keep theirs, and no load becomes one.
+		const bool depthMirrors = Memory::DepthMirrorsActive();
+		if (inst.op == IROp::Load32 || ((inst.op == IROp::Load16 || inst.op == IROp::Load16Ext) && !depthMirrors)) {
 			int dest = IRDestGPR(GetIRMeta(inst));
 			for (int j = i + 1; j < n; j++) {
 				const IRInstMeta laterInst = GetIRMeta(in.GetInstructions()[j]);
@@ -1326,7 +1417,7 @@ bool ReduceLoads(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 							if (mask == 0xff) {
 								nextSkip = j;
 							}
-						} else if ((mask & 0xffff0000) == 0 && inst.op == IROp::Load32) {
+						} else if ((mask & 0xffff0000) == 0 && inst.op == IROp::Load32 && !depthMirrors) {
 							inst.op = IROp::Load16;
 							if (mask == 0xffff) {
 								nextSkip = j;
@@ -1839,9 +1930,11 @@ bool ApplyMemoryValidation(const IRWriter &in, IRWriter &out, const IROptions &o
 		}
 
 		const IRMeta *m = GetIRMeta(inst.op);
-		if (m->types[0] == 'G' && (m->flags & IRFLAG_SRC3) == 0 && inst.dest == MIPS_REG_SP) {
+		bool writesSP = m->types[0] == 'G' && (m->flags & IRFLAG_SRC3) == 0 && inst.dest == MIPS_REG_SP;
+		// A barrier (Interpret, CallReplacement) may write any GPR.
+		if (writesSP || (m->flags & IRFLAG_BARRIER) != 0) {
 			// We only care if it changes after we start combining.
-			spModified = spUpper != -1;
+			spModified = spModified || spUpper != -1;
 		}
 	}
 
@@ -1886,7 +1979,11 @@ bool ApplyMemoryValidation(const IRWriter &in, IRWriter &out, const IROptions &o
 		}
 
 		const IRMeta *m = GetIRMeta(inst.op);
-		if (m->types[0] == 'G' && (m->flags & IRFLAG_SRC3) == 0) {
+		if ((m->flags & IRFLAG_BARRIER) != 0) {
+			// Interpret runs an arbitrary instruction and CallReplacement a whole function, so
+			// either can write any GPR - no address we validated earlier can be trusted after one.
+			checks.clear();
+		} else if (m->types[0] == 'G' && (m->flags & IRFLAG_SRC3) == 0) {
 			uint64_t key = (uint64_t)inst.dest << 32;
 			// Wipe out all the already done checks since this was modified.
 			checks.erase(checks.lower_bound(key), checks.upper_bound(key | 0xFFFFFFFFULL));
@@ -1900,8 +1997,9 @@ bool ApplyMemoryValidation(const IRWriter &in, IRWriter &out, const IROptions &o
 
 bool ReduceVec4Flush(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 	CONDITIONAL_DISABLE;
-	// Only do this when using a SIMD backend.
-	if (!opts.preferVec4) {
+	// Only do this when using a SIMD backend. The interpreter has no flushes to avoid, and would
+	// only get more instructions to dispatch.
+	if (!opts.preferVec4 || opts.optimizeForInterpreter) {
 		DISABLE;
 	}
 
@@ -1929,6 +2027,14 @@ bool ReduceVec4Flush(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 			isVec4[r & ~3] = false;
 			for (int i = 0; i < 2; ++i)
 				isUsed[r + i] = true;
+			break;
+
+		case 'M':
+			_dbg_assert_((r & 3) == 0);
+			for (int i = 0; i < 16; ++i) {
+				isVec4[(r + i) & ~3] = true;
+				isUsed[r + i] = true;
+			}
 			break;
 
 		default:
@@ -2010,6 +2116,8 @@ bool ReduceVec4Flush(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 				if (m->types[0] == 'V' && inst.dest == r)
 					return true;
 				if (m->types[1] == 'V' && inst.src1 == r)
+					return true;
+				if (m->types[1] == 'M' && r >= inst.src1 && r < inst.src1 + 16)
 					return true;
 				if (m->types[2] == 'V' && inst.src2 == r)
 					return true;
@@ -2124,7 +2232,7 @@ bool ReduceVec4Flush(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 			}
 			break;
 
-		case IROp::Vec4Dot:
+		case IROp::Vec4VfpuDot:
 			if (overlapped(inst.dest, 1, inst.src1, 4, inst.src2, 4) && findAvailTempVec4()) {
 				out.Write(inst.op, temp, inst.src1, inst.src2, inst.constant);
 				if (usedLaterAsVec4(inst.dest & ~3)) {
@@ -2148,7 +2256,7 @@ bool ReduceVec4Flush(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 				out.Write(inst.op, inst.dest, inst.src1, temp, inst.constant);
 				skip = true;
 				inst.src2 = IRREG_INVALID;
-			} else if (isVec4[inst.src2 & 3] && usedLaterAsVec4(inst.src2 & ~3) && findAvailTempVec4()) {
+			} else if (isVec4[inst.src2 & ~3] && usedLaterAsVec4(inst.src2 & ~3) && findAvailTempVec4()) {
 				out.Write(IROp::FMov, temp, inst.src2);
 				out.Write(inst.op, inst.dest, inst.src1, temp, inst.constant);
 				skip = true;
@@ -2179,52 +2287,147 @@ bool ReduceVec4Flush(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 }
 
 // This optimizes away redundant loads-after-stores, which are surprisingly not that uncommon.
+// Replaces a load of what the block stored or loaded earlier with a register move, as long as
+// nothing in between may have changed the memory, the address reg, or the reg holding the value.
 bool OptimizeLoadsAfterStores(const IRWriter &in, IRWriter &out, const IROptions &opts) {
 	CONDITIONAL_DISABLE;
-	// This tells us to skip an AND op that has been optimized out.
-	// Maybe we could skip multiple, but that'd slow things down and is pretty uncommon.
-	int nextSkip = -1;
 
-	bool logBlocks = false;
-	for (int i = 0, n = (int)in.GetInstructions().size(); i < n; i++) {
-		IRInst inst = in.GetInstructions()[i];
+	// The value reg's kind: G = GPR, F = FPR, V = Vec4 of FPRs.
+	struct Known {
+		IRReg base;
+		u32 offset;
+		int size;
+		char kind;
+		IRReg value;
+	};
+	std::vector<Known> known;
 
-		// Just copy the last instruction.
-		if (i == n - 1) {
+	auto kindOf = [](IROp op) {
+		switch (op) {
+		case IROp::LoadFloat: case IROp::StoreFloat: return 'F';
+		case IROp::LoadVec4: case IROp::StoreVec4: return 'V';
+		default: return 'G';
+		}
+	};
+	// Only plain RAM, so a hardware register read after a write isn't skipped.
+	auto isRAM = [](IRReg base, u32 addr) {
+		addr &= 0x3FFFFFFF;
+		return base != MIPS_REG_ZERO || (addr >= 0x08000000 && addr < 0x0C000000);
+	};
+	auto forgetReg = [&](IRReg reg, bool fpr) {
+		known.erase(std::remove_if(known.begin(), known.end(), [&](const Known &k) {
+			if (!fpr && k.base == reg)
+				return true;
+			if (fpr && k.kind != 'G')
+				return reg >= k.value && reg < k.value + (k.kind == 'V' ? 4 : 1);
+			return !fpr && k.kind == 'G' && k.value == reg;
+		}), known.end());
+	};
+
+	for (const IRInst &inst : in.GetInstructions()) {
+		const IRMeta *m = GetIRMeta(inst.op);
+		IRMemoryOpInfo info = IROpMemoryAccessSize(inst.op);
+		const bool plainLoad = info.size != 0 && !info.isWrite && inst.op != IROp::Load32Left && inst.op != IROp::Load32Right && inst.op != IROp::Load32Linked;
+		const bool plainStore = inst.op == IROp::Store8 || inst.op == IROp::Store16 || inst.op == IROp::Store32 || inst.op == IROp::StoreFloat || inst.op == IROp::StoreVec4;
+
+		bool replaced = false;
+		if (plainLoad) {
+			for (const Known &k : known) {
+				if (k.base != inst.src1 || k.offset != inst.constant || k.size != info.size)
+					continue;
+				const char kind = kindOf(inst.op);
+				switch (inst.op) {
+				case IROp::Load8: out.Write(IROp::AndConst, inst.dest, k.value, 0, 0xFF); break;
+				case IROp::Load8Ext: out.Write(IROp::Ext8to32, inst.dest, k.value); break;
+				case IROp::Load16: out.Write(IROp::AndConst, inst.dest, k.value, 0, 0xFFFF); break;
+				case IROp::Load16Ext: out.Write(IROp::Ext16to32, inst.dest, k.value); break;
+				default:
+					if (kind == k.kind && inst.dest == k.value)
+						break;
+					if (kind == 'V')
+						out.Write(IROp::Vec4Mov, inst.dest, k.value);
+					else if (kind == 'G')
+						out.Write(k.kind == 'G' ? IROp::Mov : IROp::FMovToGPR, inst.dest, k.value);
+					else
+						out.Write(k.kind == 'G' ? IROp::FMovFromGPR : IROp::FMov, inst.dest, k.value);
+					break;
+				}
+				replaced = true;
+				break;
+			}
+		}
+		if (!replaced)
 			out.Write(inst);
-			break;
+
+		if ((m->flags & IRFLAG_BARRIER) != 0 || ((m->flags & IRFLAG_EXIT) != 0 && !(inst.op >= IROp::ExitToConstIfEq && inst.op <= IROp::ExitToConstIfLeZ))) {
+			known.clear();
+			continue;
+		}
+		if (info.size != 0 && info.isWrite) {
+			// Keep only what this store can't overlap: the same base, at a disjoint range.
+			known.erase(std::remove_if(known.begin(), known.end(), [&](const Known &k) {
+				if (k.base != inst.src1 || !plainStore)
+					return true;
+				// Signed, as the offsets are: -16 + 16 mustn't wrap to below -12.
+				const s64 known = (s32)k.offset, store = (s32)inst.constant;
+				return !(known + k.size <= store || store + info.size <= known);
+			}), known.end());
 		}
 
-		out.Write(inst);
+		// Anything this writes can't be the address or value of a known access anymore.
+		int destGPR = IRDestGPR(GetIRMeta(inst));
+		if (destGPR >= 0)
+			forgetReg(destGPR, false);
+		IRReg destFPRs[4];
+		int numFPRs = IRDestFPRs(GetIRMeta(inst), destFPRs);
+		for (int i = 0; i < numFPRs; ++i)
+			forgetReg(destFPRs[i], true);
 
-		IRInst next = in.GetInstructions()[i + 1];
-		switch (inst.op) {
-		case IROp::Store32:
-			if (next.op == IROp::Load32 &&
-				next.constant == inst.constant &&
-				next.dest == inst.dest &&
-				next.src1 == inst.src1) {
-				// The upcoming load is completely redundant.
-				// Skip it.
-				i++;
-			}
-			break;
-		case IROp::StoreVec4:
-			if (next.op == IROp::LoadVec4 &&
-				next.constant == inst.constant &&
-				next.dest == inst.dest &&
-				next.src1 == inst.src1) {
-				// The upcoming load is completely redundant. These are common in Wipeout.
-				// Skip it. NOTE: It looks like vector load/stores uses different register assignments, but there's a union between dest and src3.
-				i++;
-			}
-			break;
-		default:
-			break;
+		if (!isRAM(inst.src1, inst.constant))
+			continue;
+		if (plainStore) {
+			known.push_back({ inst.src1, inst.constant, info.size, kindOf(inst.op), inst.src3 });
+		} else if (plainLoad && info.size >= 4 && !(kindOf(inst.op) == 'G' && inst.dest == inst.src1)) {
+			known.push_back({ inst.src1, inst.constant, info.size, kindOf(inst.op), inst.dest });
 		}
 	}
+	return false;
+}
 
-	return logBlocks;
+// The plain op for a kernel load or store, and its size, or Nop.
+static IROp PlainMemoryOp(IROp op, int *size) {
+	switch (op) {
+	case IROp::LoadKernel8: *size = 1; return IROp::Load8;
+	case IROp::LoadKernel8Ext: *size = 1; return IROp::Load8Ext;
+	case IROp::LoadKernel16: *size = 2; return IROp::Load16;
+	case IROp::LoadKernel16Ext: *size = 2; return IROp::Load16Ext;
+	case IROp::LoadKernel32: *size = 4; return IROp::Load32;
+	case IROp::StoreKernel8: *size = 1; return IROp::Store8;
+	case IROp::StoreKernel16: *size = 2; return IROp::Store16;
+	case IROp::StoreKernel32: *size = 4; return IROp::Store32;
+	default: return IROp::Nop;
+	}
+}
+
+bool ResolveKernelMemory(const IRWriter &in, IRWriter &out, const IROptions &opts) {
+	CONDITIONAL_DISABLE;
+	for (IRInst inst : in.GetInstructions()) {
+		int size = 0;
+		const IROp plain = PlainMemoryOp(inst.op, &size);
+		if (plain != IROp::Nop && inst.src1 == MIPS_REG_ZERO) {
+			const u32 addr = inst.constant;
+			bool valid;
+			switch (size) {
+			case 1: valid = Memory::IsValidAddress(addr); break;
+			case 2: valid = Memory::IsValid2AlignedAddress(addr); break;
+			default: valid = Memory::IsValid4AlignedAddress(addr); break;
+			}
+			if (valid)
+				inst.op = plain;
+		}
+		out.Write(inst);
+	}
+	return false;
 }
 
 bool OptimizeForInterpreter(const IRWriter &in, IRWriter &out, const IROptions &opts) {
@@ -2292,6 +2495,19 @@ bool OptimizeForInterpreter(const IRWriter &in, IRWriter &out, const IROptions &
 					i++;  // Skip the next
 				}
 			}
+			out.Write(inst);
+			break;
+		case IROp::ExitToConstIfEq:
+		case IROp::ExitToConstIfNeq:
+		case IROp::ExitToConstIfGtZ:
+		case IROp::ExitToConstIfGeZ:
+		case IROp::ExitToConstIfLtZ:
+		case IROp::ExitToConstIfLeZ:
+			// With an ExitToConst right after, one op can pick either target. The ExitToConst stays
+			// as the second target's holder.
+			static_assert((int)IROp::OptExitToConstIfLeZElse - (int)IROp::OptExitToConstIfEqElse == (int)IROp::ExitToConstIfLeZ - (int)IROp::ExitToConstIfEq, "Else exits must match the exits' order");
+			if (!last && in.GetInstructions()[i + 1].op == IROp::ExitToConst)
+				inst.op = (IROp)((int)IROp::OptExitToConstIfEqElse + ((int)inst.op - (int)IROp::ExitToConstIfEq));
 			out.Write(inst);
 			break;
 		default:

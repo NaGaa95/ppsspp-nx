@@ -26,7 +26,8 @@ MpegDemux::MpegDemux(int size, int offset) : m_audioStream(size) {
 	m_buf = new u8[size];
 
 	m_len = size;
-	m_index = offset;
+	// The offset comes from the stream header.
+	m_index = std::clamp(offset, 0, size);
 	m_audioChannel = -1;
 	m_readSize = 0;
 }
@@ -40,10 +41,23 @@ void MpegDemux::DoState(PointerWrap &p) {
 	if (!s)
 		return;
 
-	Do(p, m_index);
-	Do(p, m_len);
-	Do(p, m_audioChannel);
-	Do(p, m_readSize);
+	int index = m_index;
+	int len = m_len;
+	int audioChannel = m_audioChannel;
+	int readSize = m_readSize;
+	Do(p, index);
+	Do(p, len);
+	Do(p, audioChannel);
+	Do(p, readSize);
+	if ((p.mode == p.MODE_READ || p.mode == p.MODE_VERIFY) &&
+		(len != m_len || index < 0 || index > len || readSize < 0 || readSize > len)) {
+		ERROR_LOG(Log::SaveState, "Savestate loading error: invalid MPEG demux state");
+		p.SetError(p.ERROR_FAILURE);
+		return;
+	}
+	m_index = index;
+	m_audioChannel = audioChannel;
+	m_readSize = readSize;
 	if (m_buf)
 		DoArray(p, m_buf, m_len);
 	DoClass(p, m_audioStream);
@@ -149,7 +163,9 @@ int MpegDemux::demuxStream(bool bdemux, int startCode, int length, int channel)
 		length = readPesHeader(pesHeader, length, startCode);
 		if (pesHeader.channel == channel || channel < 0) {
 			channel = pesHeader.channel;
-			m_audioStream.push(m_buf + m_index, length, pesHeader.pts);
+			// The header lengths come from the stream, so don't push past what's been read.
+			const int pushLength = std::clamp(length, 0, std::max(m_readSize - m_index, 0));
+			m_audioStream.push(m_buf + m_index, pushLength, pesHeader.pts);
 		}
 		skip(length);
 	} else {

@@ -11,7 +11,6 @@
 #include "Core/HLE/AtracCtx2.h"
 #include "Core/Util/AtracTrack.h"
 #include "Core/HW/Atrac3Standalone.h"
-#include "Core/Config.h"
 #include "Core/MemMap.h"
 #include "Common/File/FileUtil.h"
 
@@ -32,7 +31,7 @@
 struct AT3BitrateMeta {
 	u16 sampleSize;
 	u8 dataByte;
-	u8 jointStereo;  // I think?
+	u8 jointStereo;
 };
 
 static const AT3BitrateMeta g_at3BitrateMeta[5] = {
@@ -202,6 +201,10 @@ static int ComputeAtracStateAndInitSecondBuffer(SceAtracIdInfo *info, u32 readSi
 }
 
 int InitContextFromTrackInfo(SceAtracContext *ctx, const TrackInfo *wave, u32 bufferAddr, int readSize, int bufferSize) {
+	// The frame size comes from the file, and InitLengthAndLoop divides by it.
+	if (wave->blockAlign <= 0) {
+		return SCE_ERROR_ATRAC_BAD_CODEC_PARAMS;
+	}
 	(ctx->info).numChan = (char)wave->numChans;
 	const int extraSamples = (ctx->info).codec == 0x1001 ? 0x45 : 0x170;
 	(ctx->info).firstValidSample = extraSamples + wave->firstSampleOffset;
@@ -242,12 +245,13 @@ int InitContextFromTrackInfo(SceAtracContext *ctx, const TrackInfo *wave, u32 bu
 			(ctx->codec).fmt.at3.formatByte2 = wave->tailFlag;
 			return 0;
 		}
-		// At3. Set up the hardware codec (hopefully we can correctly support this in sceAudiocodec and thus sceAtrac LLE in the future)
-		// This is not actually necessary since we don't use the actual hardware codec.
+		// At3. Set up the hardware codec parameter as libatrac3plus.prx's SetData (0880645c) does:
+		// keyed by frame size and the joint-stereo flag (sampleSizeMaybe, for Atrac3), it stores the
+		// data byte, as a word. We don't decode through it, but it's what the game sees.
 		for (int counter = 4; counter >= 0; counter--) {
 			if ((g_at3BitrateMeta[counter].sampleSize == (ctx->info).sampleSize) &&
-				((int)g_at3BitrateMeta[counter].dataByte == wave->sampleSizeMaybe)) {
-				(ctx->codec).fmt.at3.formatByte1 = (char)g_at3BitrateMeta[counter].jointStereo;
+				((int)g_at3BitrateMeta[counter].jointStereo == wave->sampleSizeMaybe)) {
+				(ctx->codec).fmt.at3.formatByte1 = g_at3BitrateMeta[counter].dataByte;
 				(ctx->codec).fmt.at3.formatByte2 = 0;
 				(ctx->codec).fmt.at3.unk2a = 0;
 				(ctx->codec).fmt.at3.unk2b = 0;
@@ -336,7 +340,7 @@ void Atrac2::DumpBufferToFile() {
 }
 
 void Atrac2::DoState(PointerWrap &p) {
-	auto s = p.Section("Atrac2", 1, 3);
+	auto s = p.Section("Atrac2", 1, 4);
 	if (!s)
 		return;
 
@@ -360,9 +364,22 @@ void Atrac2::DoState(PointerWrap &p) {
 		Do(p, sas_.fileOffset);
 	}
 
+	// Both straight from the file: one is dereferenced, the other indexes the two SAS buffers.
+	if (p.mode == p.MODE_READ && (!context_.IsValid() || sas_.curBuffer < 0 || sas_.curBuffer > 1)) {
+		ERROR_LOG(Log::SaveState, "Atrac2: bad context %08x or SAS buffer %d in savestate", context_.ptr, sas_.curBuffer);
+		p.SetError(p.ERROR_FAILURE);
+		return;
+	}
+
 	const SceAtracIdInfo &info = context_->info;
+	if (s >= 4) {
+		Do(p, jointStereo_);
+	} else if (p.mode == p.MODE_READ) {
+		jointStereo_ = IsAtrac3StreamJointStereo(info.codec, info.sampleSize, info.numChan);
+	}
+
 	if (p.mode == p.MODE_READ && info.state != ATRAC_STATUS_NO_DATA) {
-		CreateDecoder(info.codec, info.sampleSize, info.numChan);
+		CreateDecoder(info.codec, info.sampleSize, info.numChan, jointStereo_);
 	}
 }
 
@@ -1003,9 +1020,13 @@ int Atrac2::SetData(const Track &track, u32 bufferAddr, u32 readSize, u32 buffer
 
 	SceAtracIdInfo &info = context_->info;
 
-	CreateDecoder(info.codec, info.sampleSize, info.numChan);
+	jointStereo_ = track.jointStereo != 0;
+	CreateDecoder(info.codec, info.sampleSize, info.numChan, jointStereo_);
 
 	outputChannels_ = outputChannels;
+	// Sized for the old frame size and channel count.
+	delete[] decodeTemp_;
+	decodeTemp_ = nullptr;
 
 	INFO_LOG(Log::Atrac,
 		"Atrac: sampleSize: %d buffer: %08x bufferByte: %d firstValidSample: %d\n"
@@ -1018,8 +1039,9 @@ int Atrac2::SetData(const Track &track, u32 bufferAddr, u32 readSize, u32 buffer
 		info.fileDataEnd, info.decodePos, info.numSkipFrames, info.numChan
 	);
 
-	int skipCount = 0;  // TODO: use for delay
+	int skipCount = 0;
 	retval = SkipFrames(&skipCount);
+	setDataSkippedFrames_ = skipCount;
 
 	// Seen in Mui Mui house. Things go very wrong after this..
 	if (retval == SCE_ERROR_ATRAC_API_FAIL) {
@@ -1135,10 +1157,14 @@ void Atrac2::InitLowLevel(const Atrac3LowLevelParams &params, int codecType) {
 	info.numChan = params.encodedChannels;
 	outputChannels_ = params.outputChannels;
 	info.sampleSize = params.bytesPerFrame;
+	delete[] decodeTemp_;
+	decodeTemp_ = nullptr;
 	info.dataOff = 0;
 	info.decodePos = 0;
 	info.state = ATRAC_STATUS_LOW_LEVEL;
-	CreateDecoder(codecType, info.sampleSize, info.numChan);
+	// There's no track header here, so go by the bitrate.
+	jointStereo_ = IsAtrac3StreamJointStereo(codecType, info.sampleSize, info.numChan);
+	CreateDecoder(codecType, info.sampleSize, info.numChan, jointStereo_);
 }
 
 int Atrac2::DecodeLowLevel(const u8 *srcData, int *bytesConsumed, s16 *dstData, int *bytesWritten) {
@@ -1238,13 +1264,21 @@ void Atrac2::DecodeForSas(s16 *dstData, int *bytesWritten, int *finish) {
 			return;
 		}
 
-		// Compute the part sizes using the current size.
+		// Compute the part sizes using the current size. The game can shrink the buffer under us,
+		// so keep both parts inside the assembly buffer.
 		int part1Size = sas_.bufSize[sas_.curBuffer] - sas_.streamOffset;
-		int part2Size = info.sampleSize - part1Size;
 		_dbg_assert_(part1Size >= 0);
-		if (part1Size >= 0) {
+		part1Size = std::clamp(part1Size, 0, (int)info.sampleSize);
+		int part2Size = info.sampleSize - part1Size;
+		if (part1Size > 0) {
 			// Grab the partial packet, before we switch over to the other buffer.
-			Memory::Memcpy(assembly, sas_.bufPtr[sas_.curBuffer] + sas_.streamOffset, part1Size);
+			const u32 part1Addr = sas_.bufPtr[sas_.curBuffer] + sas_.streamOffset;
+			if (!Memory::IsValidRange(part1Addr, part1Size)) {
+				ERROR_LOG(Log::Atrac, "SAS: bad buffer %08x", part1Addr);
+				*finish = 1;
+				return;
+			}
+			Memory::MemcpyUnchecked(assembly, part1Addr, part1Size);
 		}
 
 		// Check if we hit the end.

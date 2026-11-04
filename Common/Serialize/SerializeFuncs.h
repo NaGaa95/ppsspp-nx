@@ -66,6 +66,9 @@ void DoClass(PointerWrap &p, T *&x) {
 	if (p.mode == PointerWrap::MODE_READ) {
 		delete x;
 		x = new T();
+	} else if (p.mode == PointerWrap::MODE_NOOP && !x) {
+		// A load that failed partway leaves the rest of a container unfilled.
+		return;
 	}
 	x->DoState(p);
 }
@@ -76,6 +79,8 @@ void DoSubClass(PointerWrap &p, T *&x, Args... args) {
 		if (x != nullptr)
 			delete x;
 		x = new S(args...);
+	} else if (p.mode == PointerWrap::MODE_NOOP && !x) {
+		return;
 	}
 	x->DoState(p);
 }
@@ -83,6 +88,22 @@ void DoSubClass(PointerWrap &p, T *&x, Args... args) {
 template<class T>
 void DoArray(PointerWrap &p, T *x, int count) {
 	DoHelper_<T>::DoArray(p, x, count);
+}
+
+// For a fixed-size string inside a struct that was just loaded whole. Nothing makes a savestate
+// terminate it, and these get used as C strings.
+template<size_t N>
+void TerminateLoadedCString(PointerWrap &p, char (&str)[N]) {
+	if (p.mode == PointerWrap::MODE_READ) {
+		str[N - 1] = '\0';
+	}
+}
+
+// A fixed-size string, serialized like DoArray, and always terminated after loading.
+template<size_t N>
+void DoCString(PointerWrap &p, char (&str)[N]) {
+	p.DoVoid(str, (int)N);
+	TerminateLoadedCString(p, str);
 }
 
 // Lower bound on the bytes one element of a serialized container takes up, used to sanity check
@@ -121,6 +142,13 @@ void DoVector(PointerWrap &p, std::vector<T> &x, T &default_val) {
 
 template<class T>
 void Do(PointerWrap &p, std::vector<T *> &x) {
+	if (p.mode == PointerWrap::MODE_READ) {
+		// The elements are owned (DoClass replaces them), and a shorter vector would drop the rest.
+		for (T *elem : x) {
+			delete elem;
+		}
+		x.clear();
+	}
 	T *dv = nullptr;
 	DoVector(p, x, dv);
 }

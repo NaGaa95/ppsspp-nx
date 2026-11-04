@@ -89,7 +89,6 @@ void DrawEngineVulkan::InitDeviceObjects() {
 	res = vkCreateSampler(device, &samp, nullptr, &nullSampler_);
 	_dbg_assert_(VK_SUCCESS == res);
 
-	draw_->SetInvalidationCallback(std::bind(&DrawEngineVulkan::Invalidate, this, std::placeholders::_1));
 }
 
 DrawEngineVulkan::~DrawEngineVulkan() {
@@ -106,6 +105,7 @@ void DrawEngineVulkan::DestroyDeviceObjects() {
 	VulkanRenderManager *renderManager = (VulkanRenderManager *)draw_->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
 
 	draw_->SetInvalidationCallback(InvalidationCallback());
+	invalidationCallbackInstalled_ = false;
 
 	pushUBO_ = nullptr;
 
@@ -133,6 +133,10 @@ void DrawEngineVulkan::DestroyDeviceObjects() {
 void DrawEngineVulkan::DeviceLost() {
 	DestroyDeviceObjects();
 	DirtyAllUBOs();
+	// The pipelines and views these point to are gone (BeginFrame resets them too, but a flush could come first).
+	lastPipeline_ = nullptr;
+	boundDepal_ = VK_NULL_HANDLE;
+	boundSecondary_ = VK_NULL_HANDLE;
 	draw_ = nullptr;
 }
 
@@ -143,6 +147,10 @@ void DrawEngineVulkan::DeviceRestore(Draw::DrawContext *draw) {
 
 void DrawEngineVulkan::BeginFrame() {
 	DrawEngineCommon::BeginFrame();
+	if (!invalidationCallbackInstalled_) {
+		draw_->SetInvalidationCallback(std::bind(&DrawEngineVulkan::Invalidate, this, std::placeholders::_1));
+		invalidationCallbackInstalled_ = true;
+	}
 
 	lastPipeline_ = nullptr;
 
@@ -426,6 +434,7 @@ void DrawEngineVulkan::Flush() {
 		params.allowSeparateAlphaClear = false;
 		params.everUsedEqualDepth = everUsedEqualDepth_;
 		params.clipInfoFlags = clipInfoFlags_;
+		params.trianglesReversed = BatchTrianglesReversed();
 
 		// The texture needs to have been applied when running RunSoftwareTransform, however we must not have applied the sampler yet since it takes
 		// result.pixelMapped as an input.
@@ -550,6 +559,8 @@ void DrawEngineVulkan::ResetAfterSkippedDraw() {
 	numDrawVerts_ = 0;
 	numDrawInds_ = 0;
 	vertexCountInDrawCalls_ = 0;
+	expandedVertsInDrawCalls_ = 0;
+	numVertsToDecode_ = 0;
 	decodeIndsCounter_ = 0;
 	decodeVertsCounter_ = 0;
 	gstate_c.vertexFullAlpha = true;

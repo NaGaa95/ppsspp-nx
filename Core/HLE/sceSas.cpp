@@ -28,6 +28,7 @@
 
 #include <cstdlib>
 #include <functional>
+#include <atomic>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -47,8 +48,10 @@
 #include "Core/HLE/ErrorCodes.h"
 #include "Core/HLE/FunctionWrappers.h"
 #include "Core/HLE/sceSas.h"
+#include "Core/HLE/sceVideocodec.h"
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceKernelThread.h"
+#include "Core/HLE/sceKernelInterrupt.h"
 
 // TODO - allow more than one, associating each with one Core pointer (passed in to all the functions)
 // No known games use more than one instance of Sas though.
@@ -75,7 +78,8 @@ static std::mutex sasWakeMutex;
 static std::mutex sasDoneMutex;
 static std::condition_variable sasWake;
 static std::condition_variable sasDone;
-static volatile int sasThreadState = SasThreadState::DISABLED;
+// Changed under sasWakeMutex (and sasDoneMutex for READY), but also read outside them.
+static std::atomic<int> sasThreadState{ SasThreadState::DISABLED };
 static SasThreadParams sasThreadParams;
 static int sasMixEvent = -1;
 
@@ -91,7 +95,10 @@ int __SasThread() {
 
 	std::unique_lock<std::mutex> guard(sasWakeMutex);
 	while (sasThreadState != SasThreadState::DISABLED) {
-		sasWake.wait(guard);
+		// Check before sleeping, the mix may have been queued before we got here.
+		while (sasThreadState == SasThreadState::READY) {
+			sasWake.wait(guard);
+		}
 		if (sasThreadState == SasThreadState::QUEUED) {
 			const bool mute = g_sasMuteFlag;
 			sas->Mix(sasThreadParams.outAddr, sasThreadParams.inAddr, sasThreadParams.leftVol, sasThreadParams.rightVol, mute);
@@ -204,6 +211,12 @@ void __SasDoState(PointerWrap &p) {
 	CoreTiming::RestoreRegisterEvent(sasMixEvent, "SasMix", sasMixFinish);
 }
 
+void __SasWaitForMix() {
+	if (sasThreadState == SasThreadState::QUEUED) {
+		__SasDrain();
+	}
+}
+
 void __SasShutdown() {
 	__SasDisableThread();
 
@@ -257,7 +270,13 @@ static u32 sceSasGetEndFlag(u32 core) {
 }
 
 static int delaySasResult(int result) {
-	const int usec = sas->EstimateMixUs();
+	// The mix runs on the Media Engine, after anything else it's busy with.
+	const int usec = MEScheduleJob(sas->EstimateMixUs());
+
+	// Nothing can wait in an interrupt handler (the wait would go to the idle thread it runs on.)
+	if (__IsInInterrupt()) {
+		return result;
+	}
 
 	// No event, fall back.
 	if (sasMixEvent == -1) {
@@ -758,7 +777,7 @@ void __SasGetDebugStats(char *stats, size_t bufsize) {
 
 const HLEFunction sceSasCore[] = {
 	{0X42778A9F, &WrapU_UUUUU<sceSasInit>,               "__sceSasInit",                  'x', "xxxxx"  },
-	{0XA3589D81, &WrapU_UU<_sceSasCore>,                 "__sceSasCore",                  'x', "xx"     },
+	{0XA3589D81, &WrapU_UU<_sceSasCore>,                 "__sceSasCore",                  'x', "xx",    HLE_NOT_IN_INTERRUPT },
 	{0X50A14DFC, &WrapU_UUII<_sceSasCoreWithMix>,        "__sceSasCoreWithMix",           'x', "xxii"   },
 	{0X68A46B95, &WrapU_U<sceSasGetEndFlag>,             "__sceSasGetEndFlag",            'x', "x"      },
 	{0X440CA7D8, &WrapU_UIIIII<sceSasSetVolume>,         "__sceSasSetVolume",             'x', "xiiiii" },

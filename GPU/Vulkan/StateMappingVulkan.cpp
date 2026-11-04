@@ -135,10 +135,8 @@ void DrawEngineVulkan::ConvertStateToVulkanKey(FramebufferManagerVulkan &fbManag
 			key.destAlpha = VK_BLEND_FACTOR_ZERO;
 			dynState.useBlendColor = false;
 
-			// Color Mask
-			bool colorMask = gstate.isClearModeColorMask();
-			bool alphaMask = gstate.isClearModeAlphaMask();
-			key.colorWriteMask = (colorMask ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT) : 0) | (alphaMask ? VK_COLOR_COMPONENT_A_BIT : 0);
+			// The bits match VK_COLOR_COMPONENT_R_BIT etc.
+			key.colorWriteMask = ClearModeChannelMask();
 		} else {
 			pipelineState_.Convert(draw_->GetShaderLanguageDesc().bitwiseOps, gstate_c.Use(GPU_USE_SHADER_BLENDING));
 			GenericMaskState &maskState = pipelineState_.maskState;
@@ -175,7 +173,7 @@ void DrawEngineVulkan::ConvertStateToVulkanKey(FramebufferManagerVulkan &fbManag
 				}
 				dynState.useBlendColor = blendState.useBlendColor;
 				if (blendState.useBlendColor) {
-					dynState.blendColor = blendState.blendColor;
+					blendState.blendColorToFloat4(dynState.blendColor);
 				}
 			} else {
 				key.blendEnable = false;
@@ -354,7 +352,7 @@ void DrawEngineVulkan::BindShaderBlendTex() {
 	if (!gstate.isModeClear()) {
 		if (fboTexBindState_ == FBO_TEX_COPY_BIND_TEX) {
 			VirtualFramebuffer *curRenderVfb = framebufferManager_->GetCurrentRenderVFB();
-			bool bindResult = framebufferManager_->BindFramebufferAsColorTexture(1, curRenderVfb, BINDFBCOLOR_MAY_COPY | BINDFBCOLOR_UNCACHED, Draw::ALL_LAYERS);
+			bool bindResult = framebufferManager_->BindFramebufferAsColorTexture(1, curRenderVfb, ShaderReadBindFlags(), Draw::ALL_LAYERS);
 			_dbg_assert_(bindResult);
 			boundSecondary_ = (VkImageView)draw_->GetNativeObject(Draw::NativeObject::BOUND_TEXTURE1_IMAGEVIEW);
 			fboTexBound_ = true;

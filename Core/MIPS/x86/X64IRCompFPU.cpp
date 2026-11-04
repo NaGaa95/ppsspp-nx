@@ -177,9 +177,21 @@ void X64JitBackend::CompIR_FArith(IRInst inst) {
 		break;
 
 	case IROp::FSqrt:
-		regs_.Map(inst);
+	{
+		X64Reg tempReg = regs_.MapWithFPRTemp(inst);
+		// x86 gives a negative NaN for a negative input, the PSP a positive one: clear the sign
+		// where the input was negative. -0 and NaN inputs come through as they are.
+		if (cpu_info.bAVX) {
+			VCMPSS(tempReg, regs_.FX(inst.src1), M(constants.positiveZeroes), CMP_LT);  // rip accessible
+		} else {
+			MOVAPS(tempReg, regs_.F(inst.src1));
+			CMPSS(tempReg, M(constants.positiveZeroes), CMP_LT);  // rip accessible
+		}
+		ANDPS(tempReg, M(constants.signBitAll));  // rip accessible
 		SQRTSS(regs_.FX(inst.dest), regs_.F(inst.src1));
+		XORPS(regs_.FX(inst.dest), R(tempReg));
 		break;
+	}
 
 	case IROp::FNeg:
 		regs_.Map(inst);
@@ -241,13 +253,19 @@ void X64JitBackend::CompIR_FAssign(IRInst inst) {
 		}
 		ORPS(tempReg, M(constants.positiveOnes));  // rip accessible
 
-		// Set dest = 0xFFFFFFFF if +0.0 or -0.0.
+		// Set dest = 0xFFFFFFFF if the exponent is zero: +0.0, -0.0 or a denormal, which the
+		// hardware also signs as zero.
 		if (inst.dest != inst.src1) {
-			XORPS(regs_.FX(inst.dest), regs_.F(inst.dest));
-			CMPPS(regs_.FX(inst.dest), regs_.F(inst.src1), CMP_EQ);
+			if (cpu_info.bAVX) {
+				VANDPS(128, regs_.FX(inst.dest), regs_.FX(inst.src1), M(constants.positiveInfinity));  // rip accessible
+			} else {
+				MOVAPS(regs_.FX(inst.dest), regs_.F(inst.src1));
+				ANDPS(regs_.FX(inst.dest), M(constants.positiveInfinity));  // rip accessible
+			}
 		} else {
-			CMPPS(regs_.FX(inst.dest), M(constants.positiveZeroes), CMP_EQ);  // rip accessible
+			ANDPS(regs_.FX(inst.dest), M(constants.positiveInfinity));  // rip accessible
 		}
+		CMPPS(regs_.FX(inst.dest), M(constants.positiveZeroes), CMP_EQ);  // rip accessible
 
 		// Now not the mask to keep zero if it was zero.
 		ANDNPS(regs_.FX(inst.dest), R(tempReg));
@@ -428,7 +446,14 @@ void X64JitBackend::CompIR_FCompare(IRInst inst) {
 			break;
 		case VC_EN:
 		case VC_NN:
-			CMPSS(tempReg, regs_.F(inst.src1), !condNegated ? CMP_UNORD : CMP_ORD);
+			// Compare src1 against itself: unordered exactly when it's a NaN. (tempReg holds whatever
+			// the previous lane left there, often an all-ones mask, which is a NaN too.)
+			if (cpu_info.bAVX) {
+				VCMPSS(tempReg, regs_.FX(inst.src1), regs_.F(inst.src1), !condNegated ? CMP_UNORD : CMP_ORD);
+			} else {
+				MOVAPS(tempReg, regs_.F(inst.src1));
+				CMPSS(tempReg, regs_.F(inst.src1), !condNegated ? CMP_UNORD : CMP_ORD);
+			}
 			break;
 		case VC_EI:
 		case VC_NI:
@@ -439,7 +464,8 @@ void X64JitBackend::CompIR_FCompare(IRInst inst) {
 				MOVAPS(tempReg, regs_.F(inst.src1));
 				ANDPS(tempReg, M(constants.noSignMask));  // rip accessible
 			}
-			CMPSS(tempReg, M(constants.positiveInfinity), !condNegated ? CMP_EQ : CMP_LT);  // rip accessible
+			// NEQ rather than LT so that a NaN counts as not infinite.
+			CMPSS(tempReg, M(constants.positiveInfinity), !condNegated ? CMP_EQ : CMP_NEQ);  // rip accessible
 			break;
 		case VC_ES:
 		case VC_NS:
@@ -454,7 +480,7 @@ void X64JitBackend::CompIR_FCompare(IRInst inst) {
 			break;
 		case VC_TR:
 			OR(32, regs_.R(IRREG_VFPU_CC), Imm8(affectedBit));
-			takeBitFromTempReg = true;
+			takeBitFromTempReg = false;
 			break;
 		case VC_FL:
 			AND(32, regs_.R(IRREG_VFPU_CC), Imm8(~affectedBit));
@@ -547,90 +573,37 @@ void X64JitBackend::CompIR_FCompare(IRInst inst) {
 void X64JitBackend::CompIR_FCondAssign(IRInst inst) {
 	CONDITIONAL_DISABLE;
 
-	FixupBranch skipNAN;
-	FixupBranch finishNAN;
-	FixupBranch negativeSigns;
-	FixupBranch finishNANSigns;
-	X64Reg tempReg = INVALID_REG;
-	switch (inst.op) {
-	case IROp::FMin:
-		tempReg = regs_.GetAndLockTempGPR();
-		regs_.Map(inst);
-		UCOMISS(regs_.FX(inst.src1), regs_.F(inst.src1));
-		skipNAN = J_CC(CC_NP, true);
-
-		// Slow path: NAN case.  Check if both are negative.
-		MOVD_xmm(R(tempReg), regs_.FX(inst.src1));
-		MOVD_xmm(R(SCRATCH1), regs_.FX(inst.src2));
-		TEST(32, R(SCRATCH1), R(tempReg));
-		negativeSigns = J_CC(CC_S);
-
-		// Okay, one or the other positive.
-		CMP(32, R(tempReg), R(SCRATCH1));
-		CMOVcc(32, tempReg, R(SCRATCH1), CC_G);
-		MOVD_xmm(regs_.FX(inst.dest), R(tempReg));
-		finishNAN = J();
-
-		// Okay, both negative.
-		SetJumpTarget(negativeSigns);
-		CMP(32, R(tempReg), R(SCRATCH1));
-		CMOVcc(32, tempReg, R(SCRATCH1), CC_L);
-		MOVD_xmm(regs_.FX(inst.dest), R(tempReg));
-		finishNANSigns = J();
-
-		SetJumpTarget(skipNAN);
-		if (cpu_info.bAVX) {
-			VMINSS(regs_.FX(inst.dest), regs_.FX(inst.src1), regs_.F(inst.src2));
-		} else {
-			if (inst.dest != inst.src1)
-				MOVAPS(regs_.FX(inst.dest), regs_.F(inst.src1));
-			MINSS(regs_.FX(inst.dest), regs_.F(inst.src2));
-		}
-		SetJumpTarget(finishNAN);
-		SetJumpTarget(finishNANSigns);
-		break;
-
-	case IROp::FMax:
-		tempReg = regs_.GetAndLockTempGPR();
-		regs_.Map(inst);
-		UCOMISS(regs_.FX(inst.src1), regs_.F(inst.src1));
-		skipNAN = J_CC(CC_NP, true);
-
-		// Slow path: NAN case.  Check if both are negative.
-		MOVD_xmm(R(tempReg), regs_.FX(inst.src1));
-		MOVD_xmm(R(SCRATCH1), regs_.FX(inst.src2));
-		TEST(32, R(SCRATCH1), R(tempReg));
-		negativeSigns = J_CC(CC_S);
-
-		// Okay, one or the other positive.
-		CMP(32, R(tempReg), R(SCRATCH1));
-		CMOVcc(32, tempReg, R(SCRATCH1), CC_L);
-		MOVD_xmm(regs_.FX(inst.dest), R(tempReg));
-		finishNAN = J();
-
-		// Okay, both negative.
-		SetJumpTarget(negativeSigns);
-		CMP(32, R(tempReg), R(SCRATCH1));
-		CMOVcc(32, tempReg, R(SCRATCH1), CC_G);
-		MOVD_xmm(regs_.FX(inst.dest), R(tempReg));
-		finishNANSigns = J();
-
-		SetJumpTarget(skipNAN);
-		if (cpu_info.bAVX) {
-			VMAXSS(regs_.FX(inst.dest), regs_.FX(inst.src1), regs_.F(inst.src2));
-		} else {
-			if (inst.dest != inst.src1)
-				MOVAPS(regs_.FX(inst.dest), regs_.F(inst.src1));
-			MAXSS(regs_.FX(inst.dest), regs_.F(inst.src2));
-		}
-		SetJumpTarget(finishNAN);
-		SetJumpTarget(finishNANSigns);
-		break;
-
-	default:
+	if (inst.op != IROp::FMin && inst.op != IROp::FMax)
 		INVALIDOP;
-		break;
-	}
+
+	// vmin/vmax: compare by vfpu_minmax_key, and select the operand with its bits.
+	X64Reg keyS = regs_.GetAndLockTempGPR();
+	X64Reg keyT = regs_.GetAndLockTempGPR();
+	regs_.Map(inst);
+	auto key = [&](X64Reg k, IRReg src) {
+		MOVD_xmm(R(SCRATCH1), regs_.FX(src));
+		MOV(32, R(k), R(SCRATCH1));
+		SAR(32, R(k), Imm8(31));
+		SHR(32, R(k), Imm8(1));
+		XOR(32, R(k), R(SCRATCH1));
+		// All ones unless the exponent is zero.
+		AND(32, R(SCRATCH1), Imm32(0x7F800000));
+		NEG(32, R(SCRATCH1));
+		SBB(32, R(SCRATCH1), R(SCRATCH1));
+		AND(32, R(k), R(SCRATCH1));
+	};
+	key(keyS, inst.src1);
+	key(keyT, inst.src2);
+	CMP(32, R(keyS), R(keyT));
+	// A tie takes src2.
+	FixupBranch useSrc2 = J_CC(inst.op == IROp::FMin ? CC_GE : CC_LE);
+	if (inst.dest != inst.src1)
+		MOVAPS(regs_.FX(inst.dest), regs_.F(inst.src1));
+	FixupBranch done = J();
+	SetJumpTarget(useSrc2);
+	if (inst.dest != inst.src2)
+		MOVAPS(regs_.FX(inst.dest), regs_.F(inst.src2));
+	SetJumpTarget(done);
 }
 
 void X64JitBackend::CompIR_FCvt(IRInst inst) {
@@ -902,13 +875,17 @@ void X64JitBackend::CompIR_FSat(IRInst inst) {
 		MOVSS(tempReg, M(constants.positiveOnes));
 		MINSS(tempReg, regs_.F(inst.src1));
 
-		// Now for NAN, we want known first again.
-		// Unfortunately, this will retain -0.0, which we'll fix next.
+		// Known first again, so a NAN stays, bits and all. This keeps -0.0 too, since a tie also
+		// takes the second argument.
 		XORPS(regs_.FX(inst.dest), regs_.F(inst.dest));
-		MAXSS(tempReg, regs_.F(inst.dest));
+		MAXSS(regs_.FX(inst.dest), R(tempReg));
 
-		// Important: this should clamp -0.0 to +0.0.
-		ADDSS(regs_.FX(inst.dest), R(tempReg));
+		// Important: this should clamp -0.0 to +0.0. Not by adding +0.0, which would quiet a
+		// signaling NAN: clear the result where it compares equal to zero, which a NAN never does.
+		XORPS(tempReg, R(tempReg));
+		CMPEQSS(tempReg, regs_.F(inst.dest));
+		ANDNPS(tempReg, regs_.F(inst.dest));
+		MOVAPS(regs_.FX(inst.dest), R(tempReg));
 		break;
 
 	case IROp::FSatMinus1_1:
@@ -941,6 +918,38 @@ static float X64JIT_XMM_CALL x64_cos(float f) {
 static float X64JIT_XMM_CALL x64_asin(float f) {
 	return vfpu_asin(f);
 }
+
+static float X64JIT_XMM_CALL x64_exp2(float f) {
+	return vfpu_exp2(f);
+}
+
+static float X64JIT_XMM_CALL x64_log2(float f) {
+	return vfpu_log2(f);
+}
+
+static double X64JIT_XMM_CALL x64_sincos(float f) {
+	return vfpu_sincos_packed(f);
+}
+
+static float X64JIT_XMM_CALL x64_h2f_lower(float f) {
+	return vfpu_h2f_lower(f);
+}
+
+static float X64JIT_XMM_CALL x64_h2f_upper(float f) {
+	return vfpu_h2f_upper(f);
+}
+
+static float X64JIT_XMM_CALL x64_vsqrt(float f) {
+	return vfpu_sqrt(f);
+}
+
+static float X64JIT_XMM_CALL x64_rsqrt(float f) {
+	return vfpu_rsqrt(f);
+}
+
+static float X64JIT_XMM_CALL x64_rcp(float f) {
+	return vfpu_rcp(f);
+}
 #else
 static uint32_t x64_sin(uint32_t v) {
 	float f;
@@ -962,6 +971,54 @@ static uint32_t x64_asin(uint32_t v) {
 	float f;
 	memcpy(&f, &v, sizeof(v));
 	f = vfpu_asin(f);
+	memcpy(&v, &f, sizeof(v));
+	return v;
+}
+
+static uint32_t x64_exp2(uint32_t v) {
+	float f;
+	memcpy(&f, &v, sizeof(v));
+	f = vfpu_exp2(f);
+	memcpy(&v, &f, sizeof(v));
+	return v;
+}
+
+static uint32_t x64_log2(uint32_t v) {
+	float f;
+	memcpy(&f, &v, sizeof(v));
+	f = vfpu_log2(f);
+	memcpy(&v, &f, sizeof(v));
+	return v;
+}
+
+static uint32_t x64_h2f_lower(uint32_t v) {
+	return vfpu_h2f((u16)(v & 0xFFFF));
+}
+
+static uint32_t x64_h2f_upper(uint32_t v) {
+	return vfpu_h2f((u16)(v >> 16));
+}
+
+static uint32_t x64_vsqrt(uint32_t v) {
+	float f;
+	memcpy(&f, &v, sizeof(v));
+	f = vfpu_sqrt(f);
+	memcpy(&v, &f, sizeof(v));
+	return v;
+}
+
+static uint32_t x64_rsqrt(uint32_t v) {
+	float f;
+	memcpy(&f, &v, sizeof(v));
+	f = vfpu_rsqrt(f);
+	memcpy(&v, &f, sizeof(v));
+	return v;
+}
+
+static uint32_t x64_rcp(uint32_t v) {
+	float f;
+	memcpy(&f, &v, sizeof(v));
+	f = vfpu_rcp(f);
 	memcpy(&v, &f, sizeof(v));
 	return v;
 }
@@ -1019,35 +1076,64 @@ void X64JitBackend::CompIR_FSpecial(IRInst inst) {
 		break;
 
 	case IROp::FRSqrt:
-		{
-			X64Reg tempReg = regs_.MapWithFPRTemp(inst);
-			SQRTSS(tempReg, regs_.F(inst.src1));
-
-			MOVSS(regs_.FX(inst.dest), M(constants.positiveOnes));  // rip accessible
-			DIVSS(regs_.FX(inst.dest), R(tempReg));
-			break;
-		}
+		callFuncF_F((const void *)&x64_rsqrt);
+		break;
 
 	case IROp::FRecip:
-		if (inst.dest != inst.src1) {
-			regs_.Map(inst);
-			MOVSS(regs_.FX(inst.dest), M(constants.positiveOnes));  // rip accessible
-			DIVSS(regs_.FX(inst.dest), regs_.F(inst.src1));
-		} else {
-			X64Reg tempReg = regs_.MapWithFPRTemp(inst);
-			MOVSS(tempReg, M(constants.positiveOnes));  // rip accessible
-			if (cpu_info.bAVX) {
-				VDIVSS(regs_.FX(inst.dest), tempReg, regs_.F(inst.src1));
-			} else {
-				DIVSS(tempReg, regs_.F(inst.src1));
-				MOVSS(regs_.FX(inst.dest), R(tempReg));
-			}
-		}
+		callFuncF_F((const void *)&x64_rcp);
 		break;
 
 	case IROp::FAsin:
 		callFuncF_F((const void *)&x64_asin);
 		break;
+
+	case IROp::FVSqrt:
+		callFuncF_F((const void *)&x64_vsqrt);
+		break;
+
+	case IROp::FExp2:
+		callFuncF_F((const void *)&x64_exp2);
+		break;
+
+	case IROp::FLog2:
+		callFuncF_F((const void *)&x64_log2);
+		break;
+
+	case IROp::FHalfToFloat:
+		callFuncF_F(inst.src2 ? (const void *)&x64_h2f_upper : (const void *)&x64_h2f_lower);
+		break;
+
+	case IROp::FSinCos:
+	{
+#if X64JIT_USE_XMM_CALL
+		// The helper returns the sine and cosine packed into the low 64 bits of XMM0. The cache
+		// can hand out XMM0 when mapping below, so park them in sincostemp meanwhile.
+		regs_.FlushBeforeCall();
+		WriteDebugProfilerStatus(IRProfilerStatus::MATH_HELPER);
+		if (regs_.IsFPRMapped(inst.src1)) {
+			int lane = regs_.GetFPRLane(inst.src1);
+			CopyVec4ToFPRLane0(XMM0, regs_.FX(inst.src1), lane);
+		} else {
+			// Account for CTXREG being increased by 128 to reduce imm sizes.
+			MOVSS(XMM0, MDisp(CTXREG, offsetof(MIPSState, f) + inst.src1 * 4 - 128));
+		}
+		ABI_CallFunction((const void *)&x64_sincos);
+		MOVSD(MDisp(CTXREG, offsetof(MIPSState, sincostemp) - 128), XMM0);
+		regs_.Map(inst);
+		MOVSD(regs_.FX(inst.dest), MDisp(CTXREG, offsetof(MIPSState, sincostemp) - 128));
+		WriteDebugProfilerStatus(IRProfilerStatus::IN_JIT);
+#else
+		// Two calls here. The frontend makes sure dest doesn't overlap src1.
+		IRInst sinInst = inst;
+		sinInst.op = IROp::FSin;
+		CompIR_FSpecial(sinInst);
+		IRInst cosInst = inst;
+		cosInst.op = IROp::FCos;
+		cosInst.dest = inst.dest + 1;
+		CompIR_FSpecial(cosInst);
+#endif
+		break;
+	}
 
 	default:
 		INVALIDOP;

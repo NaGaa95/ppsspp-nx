@@ -14,6 +14,7 @@
 
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+#include <algorithm>
 #include <map>
 #include <vector>
 
@@ -62,11 +63,19 @@ static bool volatileMemLocked;
 static int powerCbSlots[numberOfCBPowerSlots];
 static std::vector<VolatileWaitingThread> volatileWaitingThreads;
 
-// Should this belong here, or in CoreTiming?
+// What the game has set. These take effect unless the user has locked the CPU speed.
 static int RealpllFreq = 222000000;
 static int RealbusFreq = 111000000;
+static int RealcpuFreq = 222000000;
+// What's in effect, which the game reads back.
 static int pllFreq = 222000000;
 static int busFreq = 111000000;
+// The lock PowerApplyClocks() last applied, to notice when the setting changes.
+static int appliedLockMhz = 0;
+
+int PowerScaleFromDefaultClock(int us) {
+	return (int)((s64)us * 222000000 / (pllFreq > 0 ? pllFreq : 222000000));
+}
 
 int GetLockedCPUSpeedMhz() {
 	return PSP_CoreParameter().compat.flags().RequireDefaultCPUClock ? 0 : g_Config.iLockedCPUSpeed;
@@ -119,6 +128,20 @@ int PowerBusMhzToHz(int mhz) {
 	return mhz * 1000000;
 }
 
+// Puts the user's locked clock into effect, or the game's own when there's no lock.
+static void PowerApplyClocks() {
+	appliedLockMhz = GetLockedCPUSpeedMhz();
+	if (appliedLockMhz > 0) {
+		pllFreq = PowerPllMhzToHz(appliedLockMhz);
+		busFreq = PowerBusMhzToHz(pllFreq / 2000000);
+		CoreTiming::SetClockFrequencyHz(PowerCpuMhzToHz(appliedLockMhz, pllFreq));
+	} else {
+		pllFreq = RealpllFreq;
+		busFreq = RealbusFreq;
+		CoreTiming::SetClockFrequencyHz(RealcpuFreq);
+	}
+}
+
 void __PowerInit() {
 	memset(powerCbSlots, 0, sizeof(powerCbSlots));
 
@@ -128,20 +151,20 @@ void __PowerInit() {
 
 	volatileWaitingThreads.clear();
 
-	if (GetLockedCPUSpeedMhz() > 0) {
-		pllFreq = PowerPllMhzToHz(GetLockedCPUSpeedMhz());
-		busFreq = PowerBusMhzToHz(pllFreq / 2000000);
-		CoreTiming::SetClockFrequencyHz(PowerCpuMhzToHz(GetLockedCPUSpeedMhz(), pllFreq));
-	} else {
-		pllFreq = PowerPllMhzToHz(222);
-		busFreq = PowerBusMhzToHz(111);
-	}
 	RealpllFreq = PowerPllMhzToHz(222);
 	RealbusFreq = PowerBusMhzToHz(111);
+	RealcpuFreq = PowerCpuMhzToHz(222, RealpllFreq);
+	PowerApplyClocks();
+}
+
+void __PowerCheckLockedClock() {
+	if (GetLockedCPUSpeedMhz() != appliedLockMhz) {
+		PowerApplyClocks();
+	}
 }
 
 void __PowerDoState(PointerWrap &p) {
-	auto s = p.Section("scePower",1,2);
+	auto s = p.Section("scePower", 1, 3);
 	if (!s)
 		return;
 
@@ -157,13 +180,16 @@ void __PowerDoState(PointerWrap &p) {
 		RealpllFreq = PowerPllMhzToHz(222);
 		RealbusFreq = PowerBusMhzToHz(111);
 	}
-	if (GetLockedCPUSpeedMhz() > 0) {
-		pllFreq = PowerPllMhzToHz(GetLockedCPUSpeedMhz());
-		busFreq = PowerBusMhzToHz(pllFreq / 2000000);
-		CoreTiming::SetClockFrequencyHz(PowerCpuMhzToHz(GetLockedCPUSpeedMhz(), pllFreq));
+	if (s >= 3) {
+		Do(p, RealcpuFreq);
 	} else {
-		pllFreq = RealpllFreq;
-		busFreq = RealbusFreq;
+		// Older states only have the effective clock, which CoreTiming has already restored, and
+		// it was the locked one if the user had a lock on. One above the game's PLL must have been.
+		const int cpuHz = CoreTiming::GetClockFrequencyHz();
+		RealcpuFreq = cpuHz <= RealpllFreq ? cpuHz : RealpllFreq;
+	}
+	if (p.mode == p.MODE_READ) {
+		PowerApplyClocks();
 	}
 	DoArray(p, powerCbSlots, ARRAY_SIZE(powerCbSlots));
 	Do(p, volatileMemLocked);
@@ -328,11 +354,9 @@ static int sceKernelVolatileMemTryLock(int type, u32 paddr, u32 psize) {
 
 	switch (error) {
 	case 0:
-		// HACK: This fixes Crash Tag Team Racing.
-		// Should only wait 1200 cycles though according to Unknown's testing,
-		// and with that it's still broken. So it's not this, unfortunately.
-		// Leaving it in for the 0.9.8 release anyway.
-		hleEatCycles(500000);
+		// Under 100us on hardware (tests/threads/scheduling/syscallkinds). This used to eat 500000
+		// cycles as a hack for Crash Tag Team Racing, which no longer needs it.
+		hleEatCycles(1200);
 		DEBUG_LOG(Log::HLE, "sceKernelVolatileMemTryLock(%i, %08x, %08x) - success", type, paddr, psize);
 		break;
 
@@ -427,16 +451,22 @@ static int sceKernelVolatileMemLock(int type, u32 paddr, u32 psize) {
 	case SCE_KERNEL_ERROR_CAN_NOT_WAIT:
 		{
 			WARN_LOG(Log::HLE, "sceKernelVolatileMemLock(%i, %08x, %08x): dispatch disabled", type, paddr, psize);
-			Memory::WriteOrException_U32(0x08400000, paddr);
-			Memory::WriteOrException_U32(0x00400000, psize);
+			// Only through pointers that are there: intr/waits passes NULL and gets just the error.
+			if (Memory::IsValid4AlignedAddress(paddr))
+				Memory::WriteUnchecked_U32(0x08400000, paddr);
+			if (Memory::IsValid4AlignedAddress(psize))
+				Memory::WriteUnchecked_U32(0x00400000, psize);
 		}
 		break;
 
 	case SCE_KERNEL_ERROR_ILLEGAL_CONTEXT:
 		{
 			WARN_LOG(Log::HLE, "sceKernelVolatileMemLock(%i, %08x, %08x): in interrupt", type, paddr, psize);
-			Memory::WriteOrException_U32(0x08400000, paddr);
-			Memory::WriteOrException_U32(0x00400000, psize);
+			// Only through pointers that are there: intr/waits passes NULL and gets just the error.
+			if (Memory::IsValid4AlignedAddress(paddr))
+				Memory::WriteUnchecked_U32(0x08400000, paddr);
+			if (Memory::IsValid4AlignedAddress(psize))
+				Memory::WriteUnchecked_U32(0x00400000, psize);
 		}
 		break;
 
@@ -467,10 +497,9 @@ static u32 scePowerSetClockFrequency(u32 pllfreq, u32 cpufreq, u32 busfreq) {
 
 		RealpllFreq = PowerPllMhzToHz(pllfreq);
 		RealbusFreq = PowerBusMhzToHz(RealpllFreq / 2000000);
+		RealcpuFreq = PowerCpuMhzToHz(cpufreq, RealpllFreq);
 		if (GetLockedCPUSpeedMhz() <= 0) {
-			pllFreq = RealpllFreq;
-			busFreq = RealbusFreq;
-			CoreTiming::SetClockFrequencyHz(PowerCpuMhzToHz(cpufreq, pllFreq));
+			PowerApplyClocks();
 		}
 
 		// The delay depends on the source and destination frequency, most are 150ms.
@@ -483,8 +512,9 @@ static u32 scePowerSetClockFrequency(u32 pllfreq, u32 cpufreq, u32 busfreq) {
 
 		return hleDelayResult(hleNoLog(0), "scepower set clockFrequency", usec);
 	}
+	RealcpuFreq = PowerCpuMhzToHz(cpufreq, RealpllFreq);
 	if (GetLockedCPUSpeedMhz() <= 0) {
-		if (CoreTiming::SetClockFrequencyHz(PowerCpuMhzToHz(cpufreq, pllFreq))) {
+		if (CoreTiming::SetClockFrequencyHz(RealcpuFreq)) {
 			return hleLogInfo(Log::HLE, 0);
 		} else {
 			return hleLogDebug(Log::HLE, 0);
@@ -499,10 +529,16 @@ static u32 scePowerSetCpuClockFrequency(u32 cpufreq) {
 	if (cpufreq == 0 || cpufreq > 333) {
 		return hleLogWarning(Log::sceMisc, SCE_KERNEL_ERROR_INVALID_VALUE, "invalid frequency");
 	}
+	// The CPU can't run faster than the PLL it's divided from.
+	if ((u64)cpufreq * 1000000 > (u64)pllFreq) {
+		return hleLogWarning(Log::sceMisc, SCE_KERNEL_ERROR_INVALID_VALUE, "above the pll frequency");
+	}
+	// Under a lock, pllFreq is the locked one, which the game's own PLL may be below.
+	RealcpuFreq = PowerCpuMhzToHz(std::min((int)cpufreq, RealpllFreq / 1000000), RealpllFreq);
 	if (GetLockedCPUSpeedMhz() > 0) {
 		return hleLogDebug(Log::sceMisc, 0, "locked by user config at %i", GetLockedCPUSpeedMhz());
 	}
-	CoreTiming::SetClockFrequencyHz(PowerCpuMhzToHz(cpufreq, pllFreq));
+	CoreTiming::SetClockFrequencyHz(RealcpuFreq);
 	return hleLogDebug(Log::sceMisc, 0);
 }
 
@@ -510,24 +546,23 @@ static u32 scePowerSetBusClockFrequency(u32 busfreq) {
 	if (busfreq == 0 || busfreq > 111) {
 		return hleLogWarning(Log::sceMisc, SCE_KERNEL_ERROR_INVALID_VALUE, "invalid frequency");
 	}
+	// The value passed is validated, but then doesn't seem to matter for the result.
+	// However, this sets a different hz than scePowerSetClockFrequency would have.
+	if (RealpllFreq <= 190)
+		RealbusFreq = 94956673;
+	else if (RealpllFreq <= 222)
+		RealbusFreq = 111000000;
+	else if (RealpllFreq <= 266)
+		RealbusFreq = 132939331;
+	else if (RealpllFreq <= 333)
+		RealbusFreq = 165848343;
+	else
+		RealbusFreq = RealpllFreq / 2;
+
 	if (GetLockedCPUSpeedMhz() > 0) {
 		return hleLogDebug(Log::sceMisc, 0, "locked by user config at %i", GetLockedCPUSpeedMhz() / 2);
 	}
-
-	// The value passed is validated, but then doesn't seem to matter for the result.
-	// However, this sets a different hz than scePowerSetClockFrequency would have.
-
-	if (pllFreq <= 190)
-		busFreq = 94956673;
-	else if (pllFreq <= 222)
-		busFreq = 111000000;
-	else if (pllFreq <= 266)
-		busFreq = 132939331;
-	else if (pllFreq <= 333)
-		busFreq = 165848343;
-	else
-		busFreq = pllFreq / 2;
-
+	busFreq = RealbusFreq;
 	return hleLogDebug(Log::sceMisc, 0);
 }
 
@@ -545,7 +580,13 @@ static u32 scePowerGetBusClockFrequencyInt() {
 }
 
 static float scePowerGetCpuClockFrequencyFloat() {
-	float cpuFreq = CoreTiming::GetClockFrequencyHz() / 1000000.0f;
+	// The CPU runs at a multiple of pll/511, and the firmware works the value out in single
+	// precision, as pll * n / 511, rather than from whole Hz - which is off in the last digit
+	// (power/freq).
+	const double step = (double)pllFreq / 511.0;
+	const float steps = (float)std::round(CoreTiming::GetClockFrequencyHz() / step);
+	const float pllMhz = (float)(pllFreq / 1000000.0);
+	float cpuFreq = (pllMhz * steps) / 511.0f;
 	DEBUG_LOG(Log::sceMisc, "%f=scePowerGetCpuClockFrequencyFloat()", (float)cpuFreq);
 	return cpuFreq;
 }
@@ -562,6 +603,15 @@ static float scePowerGetBusClockFrequencyFloat() {
 
 static int scePowerTick() {
 	// Don't think we need to do anything.
+	return hleLogDebug(Log::sceMisc, 0);
+}
+
+// These keep the PSP from suspending while held, which we never do anyway.
+static int scePowerLock(int unknown) {
+	return hleLogDebug(Log::sceMisc, 0);
+}
+
+static int scePowerUnlock(int unknown) {
 	return hleLogDebug(Log::sceMisc, 0);
 }
 
@@ -598,8 +648,8 @@ static const HLEFunction scePower[] = {
 	{0X23436A4A, nullptr,                                     "scePowerGetInnerTemp",              '?', ""   },
 	{0X0CD21B1F, nullptr,                                     "scePowerSetPowerSwMode",            '?', ""   },
 	{0X165CE085, nullptr,                                     "scePowerGetPowerSwMode",            '?', ""   },
-	{0XD6D016EF, nullptr,                                     "scePowerLock",                      '?', ""   },
-	{0XCA3D34C1, nullptr,                                     "scePowerUnlock",                    '?', ""   },
+	{0XD6D016EF, &WrapI_I<scePowerLock>,                      "scePowerLock",                      'i', "i"  },
+	{0XCA3D34C1, &WrapI_I<scePowerUnlock>,                    "scePowerUnlock",                    'i', "i"  },
 	{0XDB62C9CF, &WrapI_U<scePowerCancelRequest>,             "scePowerCancelRequest",             'i', ""   },
 	{0X7FA406DD, nullptr,                                     "scePowerIsRequest",                 '?', ""   },
 	{0X2B7C7CF4, &WrapI_V<scePowerRequestStandby>,            "scePowerRequestStandby",            'I', ""   },
@@ -669,10 +719,28 @@ static int scePowerSetWakeupCondition(u32 condition) {
 const HLEFunction scePower_driver[] = {
 	{0X5F5006D2, &WrapI_V<scePower_driver_5F5006D2>,          "scePower_driver_5F5006D2",          'i', ""   },
 	{0XBA566CD0, &WrapI_U<scePowerSetWakeupCondition>,        "scePowerSetWakeupCondition",        'i', "x"  },
+	{0X469989AD, &WrapU_UUU<scePowerSetClockFrequency>,       "scePowerSetClockFrequency630",      'x', "xxx"},
 };
 
 void Register_scePower_driver() {
 	RegisterHLEModule("scePower_driver", ARRAY_SIZE(scePower_driver), scePower_driver);
+}
+
+// Powers the Media Engine's AVC decoder up or down (me_wrapper.prx). Nothing to power here, but the
+// VSH's sceVshBridge_Driver calls it when launching a game, and 2.00's gives up on the launch unless it
+// succeeds.
+static int sceMePowerControlAvcPower(int on) {
+	return hleLogDebug(Log::sceMisc, 0);
+}
+
+const HLEFunction sceMePower_driver[] = {
+	// The old NID (jpcsp's psplibdoc), and 6.60's (uOFW).
+	{0X05B2C420, &WrapI_I<sceMePowerControlAvcPower>,         "sceMePowerControlAvcPower",         'i', "i",  HLE_KERNEL_SYSCALL },
+	{0XB37562AA, &WrapI_I<sceMePowerControlAvcPower>,         "sceMePowerControlAvcPower",         'i', "i",  HLE_KERNEL_SYSCALL },
+};
+
+void Register_sceMePower_driver() {
+	RegisterHLEModule("sceMePower_driver", ARRAY_SIZE(sceMePower_driver), sceMePower_driver);
 }
 
 void Register_sceSuspendForUser() {

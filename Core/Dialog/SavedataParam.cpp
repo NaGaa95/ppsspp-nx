@@ -166,7 +166,7 @@ namespace
 
 void SaveFileInfo::DoState(PointerWrap &p)
 {
-	auto s = p.Section("SaveFileInfo", 1, 2);
+	auto s = p.Section("SaveFileInfo", 1, 3);
 	if (!s)
 		return;
 
@@ -174,11 +174,16 @@ void SaveFileInfo::DoState(PointerWrap &p)
 	Do(p, saveName);
 	Do(p, idx);
 
-	DoArray(p, title, sizeof(title));
-	DoArray(p, saveTitle, sizeof(saveTitle));
-	DoArray(p, saveDetail, sizeof(saveDetail));
+	DoCString(p, title);
+	DoCString(p, saveTitle);
+	DoCString(p, saveDetail);
 
 	Do(p, modif_time);
+	if (s >= 3) {
+		// The delete dialogs delete by it, and for LISTALLDELETE it isn't the game name and save name.
+		Do(p, saveDir);
+		Do(p, broken);
+	}
 
 	if (s <= 1) {
 		u32 textureData;
@@ -313,7 +318,7 @@ bool SavedataParam::HasKey(const SceUtilitySavedataParam *param) const
 	return false;
 }
 
-bool SavedataParam::Delete(SceUtilitySavedataParam* param, int saveId) {
+bool SavedataParam::Delete(SceUtilitySavedataParam* param, const std::string &saveDir) {
 	if (!param) {
 		return false;
 	}
@@ -324,7 +329,7 @@ bool SavedataParam::Delete(SceUtilitySavedataParam* param, int saveId) {
 		return false;
 	}
 
-	std::string dirPath = GetSaveFilePath(param, GetSaveDir(saveId));
+	std::string dirPath = GetSaveFilePath(param, saveDir);
 	if (dirPath.size() == 0) {
 		ERROR_LOG(Log::sceUtility, "GetSaveFilePath (%.*s) returned empty - cannot delete save directory. Might already be deleted?", (int)sizeof(param->gameName), param->gameName);
 		return false;
@@ -431,11 +436,10 @@ int SavedataParam::Save(SceUtilitySavedataParam* param, const std::string &saveD
 	if (param->secureVersion > 3) {
 		ERROR_LOG_REPORT(Log::sceUtility, "Savedata version requested on save: %d", param->secureVersion);
 		return SCE_UTILITY_SAVEDATA_ERROR_SAVE_PARAM;
+	} else if (secureMode && MissingRequiredKey(param)) {
+		ERROR_LOG_REPORT(Log::sceUtility, "Savedata version with missing key on save: %d", param->secureVersion);
+		return SCE_UTILITY_SAVEDATA_ERROR_SAVE_PARAM;
 	} else if (param->secureVersion != 0) {
-		if (param->secureVersion != 1 && !HasKey(param) && secureMode) {
-			ERROR_LOG_REPORT(Log::sceUtility, "Savedata version with missing key on save: %d", param->secureVersion);
-			return SCE_UTILITY_SAVEDATA_ERROR_SAVE_PARAM;
-		}
 		INFO_LOG(Log::sceUtility, "Savedata version requested on save: %d", param->secureVersion);
 	}
 
@@ -669,11 +673,10 @@ int SavedataParam::LoadSaveData(SceUtilitySavedataParam *param, const std::strin
 	if (param->secureVersion > 3) {
 		ERROR_LOG_REPORT(Log::sceUtility, "Savedata version requested: %d", param->secureVersion);
 		return SCE_UTILITY_SAVEDATA_ERROR_LOAD_PARAM;
+	} else if (secureMode && MissingRequiredKey(param)) {
+		ERROR_LOG_REPORT(Log::sceUtility, "Savedata version with missing key: %d", param->secureVersion);
+		return SCE_UTILITY_SAVEDATA_ERROR_LOAD_PARAM;
 	} else if (param->secureVersion != 0) {
-		if (param->secureVersion != 1 && !HasKey(param) && secureMode) {
-			ERROR_LOG_REPORT(Log::sceUtility, "Savedata version with missing key: %d", param->secureVersion);
-			return SCE_UTILITY_SAVEDATA_ERROR_LOAD_PARAM;
-		}
 		WARN_LOG_REPORT(Log::sceUtility, "Savedata version requested: %d", param->secureVersion);
 	}
 
@@ -727,19 +730,30 @@ int SavedataParam::LoadSaveData(SceUtilitySavedataParam *param, const std::strin
 	return 0;
 }
 
+// secureVersion and the key only matter for the full 1536-byte request (the two older sizes have
+// neither field). From there the game's SDK version decides between the old and new keyed hash:
+// SDK 2.07 and later get the new one for versions 0 and 3 (see utility/savedata/secureversion).
+bool SavedataParam::UsesSecureVersion(const SceUtilitySavedataParam *param) const {
+	return param->common.size >= 1536;
+}
+
+// secureVersion 0, 2 and 3 need a key, even where 3 then saves without one (older SDKs).
+// Hardware returns SAVE_PARAM for a save without one.
+bool SavedataParam::MissingRequiredKey(const SceUtilitySavedataParam *param) const {
+	return UsesSecureVersion(param) && param->secureVersion != 1 && !HasKey(param);
+}
+
 int SavedataParam::DetermineCryptMode(const SceUtilitySavedataParam *param) const {
-	int decryptMode = 1;
-	if (param->secureVersion == 1) {
-		decryptMode = 1;
-	} else if (param->secureVersion == 2) {
-		decryptMode = 3;
-	} else if (param->secureVersion == 3) {
-		decryptMode = GetSDKMainVersion(sceKernelGetCompiledSdkVersion()) >= 4 ? 5 : 1;
-	} else if (HasKey(param)) {
-		// TODO: This should ignore HasKey(), which would trigger errors.  Not doing that yet to play it safe.
-		decryptMode = GetSDKMainVersion(sceKernelGetCompiledSdkVersion()) >= 4 ? 5 : 3;
+	if (!UsesSecureVersion(param)) {
+		return 1;
 	}
-	return decryptMode;
+	const bool newHash = GetSDKMainVersion(sceKernelGetCompiledSdkVersion()) >= 4;
+	switch (param->secureVersion) {
+	case 0: return newHash ? 5 : 3;
+	case 2: return 3;
+	case 3: return newHash ? 5 : 1;
+	default: return 1;
+	}
 }
 
 u32 SavedataParam::LoadCryptedSave(SceUtilitySavedataParam *param, u8 *data, const u8 *saveData, int &saveSize, int prevCryptMode, const u8 *expectedHash, bool &saveDone) {
@@ -1272,7 +1286,7 @@ bool SavedataParam::GetList(SceUtilitySavedataParam *param)
 	return true;
 }
 
-int SavedataParam::GetFilesList(SceUtilitySavedataParam *param, u32 requestAddr) {
+int SavedataParam::GetFilesList(SceUtilitySavedataParam *param, u32 requestAddr, const std::string &saveDirName) {
 	if (!param)	{
 		return SCE_UTILITY_SAVEDATA_ERROR_RW_BAD_STATUS;
 	}
@@ -1330,7 +1344,7 @@ int SavedataParam::GetFilesList(SceUtilitySavedataParam *param, u32 requestAddr)
 	requestPtr->bind = 1021;
 
 	// Does not list directories, nor recurse into them, and ignores files not ALL UPPERCASE.
-	bool isCrypted = GetSaveCryptMode(param, GetSaveDirName(param, 0)) != 0;
+	bool isCrypted = GetSaveCryptMode(param, saveDirName) != 0;
 	for (const auto &file : files) {
 		if (file.type == FILETYPE_DIRECTORY) {
 			continue;
@@ -1450,9 +1464,7 @@ bool SavedataParam::GetSize(SceUtilitySavedataParam *param) {
 			// Note: this is "needed to overwrite".
 			param->sizeInfo->overwriteKB = 0;
 
-			spaceTxt = GetSpaceText(0, true);
-			truncate_cpy(param->sizeInfo->neededString, spaceTxt);
-			truncate_cpy(param->sizeInfo->overwriteString, spaceTxt);
+			// The strings are left alone when nothing is needed (tests/utility/savedata/getsize).
 		} else {
 			// Bytes needed to save additional data.
 			s64 neededBytes = writeBytes - freeBytes;
@@ -1545,18 +1557,20 @@ int SavedataParam::SetPspParam(SceUtilitySavedataParam *param) {
 
 		saveNameListData = param->saveNameList;
 
-		// Get number of fileName in array
-		saveDataListCount = 0;
-		while (saveNameListData[saveDataListCount][0] != 0) {
+		// Get number of fileName in array. Counted on the side, so a rejected name leaves the
+		// count at 0 to match the list Clear() freed (a savestate walks that many entries).
+		int count = 0;
+		while (saveNameListData[count][0] != 0) {
 			// saveName entries become part of host filesystem paths; reject
 			// path separators and bare dot components (path traversal).
-			const std::string_view entry = StringViewFromFixedSizeField(saveNameListData[saveDataListCount]);
+			const std::string_view entry = StringViewFromFixedSizeField(saveNameListData[count]);
 			if (HasPathTraversal(entry)) {
 				ERROR_LOG(Log::sceUtility, "SavedataParam: invalid saveName in list: %s", std::string(entry).c_str());
 				return SCE_ERROR_UTILITY_INVALID_PARAM_SIZE;
 			}
-			saveDataListCount++;
+			count++;
 		}
+		saveDataListCount = count;
 
 		if (saveDataListCount > 0) {
 			hasMultipleFileName = true;
@@ -1747,8 +1761,8 @@ PSPFileInfo SavedataParam::GetSaveInfo(const std::string &saveDir) {
 		for (auto file : allFiles) {
 			if (file.type == FILETYPE_DIRECTORY || file.name == "." || file.name == "..")
 				continue;
-			// Use a file to determine save date.
-			if (firstFile) {
+			// Use PARAM.SFO to determine save date, like the savedata manager does, or else the first file.
+			if (firstFile || file.name == SFO_FILENAME) {
 				info.ctime = file.ctime;
 				info.mtime = file.mtime;
 				info.atime = file.atime;
@@ -1788,6 +1802,9 @@ std::string SavedataParam::GetFilename(int idx) const
 }
 
 std::string SavedataParam::GetSaveDir(int idx) const {
+	if (!saveDataList || idx < 0 || idx >= saveDataListCount) {
+		return "";
+	}
 	return saveDataList[idx].saveDir;
 }
 
@@ -1943,20 +1960,83 @@ bool SavedataParam::WouldHaveMultiSaveName(const SceUtilitySavedataParam *param)
 	}
 }
 
+// Slots without an icon of their own shared noSaveIcon's image before the save, but come back as
+// separate images of the same texture. Share it again, or Clear() frees it once per slot.
+void SavedataParam::ShareLoadedIcons() {
+	for (int i = 0; i < saveDataListCount; i++) {
+		PPGeImage *texture = saveDataList[i].texture;
+		if (!texture || texture->TextureAddress() == 0) {
+			continue;
+		}
+		for (int j = 0; j < i; j++) {
+			PPGeImage *other = saveDataList[j].texture;
+			if (other && other->TextureAddress() == texture->TextureAddress()) {
+				if (!noSaveIcon) {
+					noSaveIcon = new SaveFileInfo();
+					noSaveIcon->texture = other;
+				}
+				texture->Forget();
+				delete texture;
+				saveDataList[i].texture = other;
+				break;
+			}
+		}
+	}
+}
+
 void SavedataParam::DoState(PointerWrap &p) {
 	auto s = p.Section("SavedataParam", 1, 2);
 	if (!s)
 		return;
 
+	if (p.mode == p.MODE_READ) {
+		// The load replaces kernel memory, so the icons' texture addresses now belong to whatever
+		// the loaded state allocated there. Drop them without freeing those.
+		std::vector<PPGeImage *> oldTextures;
+		for (int i = 0; saveDataList && i < saveDataListCount; i++) {
+			if (saveDataList[i].texture) {
+				oldTextures.push_back(saveDataList[i].texture);
+				saveDataList[i].texture = nullptr;
+			}
+		}
+		if (noSaveIcon) {
+			oldTextures.push_back(noSaveIcon->texture);
+			delete noSaveIcon;
+			noSaveIcon = nullptr;
+		}
+		// Entries may share noSaveIcon's image.
+		std::sort(oldTextures.begin(), oldTextures.end());
+		oldTextures.erase(std::unique(oldTextures.begin(), oldTextures.end()), oldTextures.end());
+		for (PPGeImage *texture : oldTextures) {
+			if (texture) {
+				texture->Forget();
+				delete texture;
+			}
+		}
+	}
+
 	// pspParam is handled in PSPSaveDialog.
 	Do(p, selectedSave);
+	if (p.mode != p.MODE_READ && !saveDataList) {
+		saveDataListCount = 0;
+	}
 	Do(p, saveDataListCount);
 	Do(p, saveNameListDataCount);
 	if (p.mode == p.MODE_READ) {
 		delete [] saveDataList;
+		saveDataList = nullptr;
+		if (saveDataListCount < 0 || !p.CheckRead(saveDataListCount)) {
+			saveDataListCount = 0;
+			saveNameListDataCount = 0;
+			p.SetError(p.ERROR_FAILURE);
+			return;
+		}
+		// Clear() leaves the name count behind, but it's only used to walk the list.
+		saveNameListDataCount = std::clamp(saveNameListDataCount, 0, saveDataListCount);
 		if (saveDataListCount != 0) {
 			saveDataList = new SaveFileInfo[saveDataListCount];
 			DoArray(p, saveDataList, saveDataListCount);
+			ShareLoadedIcons();
 		} else {
 			saveDataList = nullptr;
 		}

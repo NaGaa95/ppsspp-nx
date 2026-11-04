@@ -57,6 +57,8 @@ static std::map<SceUID, u64> umdPausedWaits;
 
 bool g_UMDReplacePermit = false;
 bool UMDInserted = true;
+// The image a disc swap or insert put in the drive. Empty if it's still the one we booted with.
+static Path g_umdPath;
 
 struct PspUmdInfo {
 	u32_le size;
@@ -81,6 +83,10 @@ void __UmdInit()
 	umdWaitingThreads.clear();
 	umdPausedWaits.clear();
 	g_UMDReplacePermit = false;
+	g_umdPath.clear();
+	// The XMB ejects the disc when it boots without one, and the next game boot mustn't inherit
+	// the empty drive.
+	UMDInserted = true;
 
 	__KernelRegisterWaitTypeFuncs(WAITTYPE_UMD, __UmdBeginCallback, __UmdEndCallback);
 }
@@ -92,7 +98,7 @@ void __UmdDoState(PointerWrap &p)
 		return;
 
 	u8 activatedByte = umdActivated ? 1 : 0;
-	Do(p, umdActivated);
+	Do(p, activatedByte);
 	umdActivated = activatedByte != 0;
 	Do(p, umdStatus);
 	Do(p, umdErrorStat);
@@ -106,9 +112,11 @@ void __UmdDoState(PointerWrap &p)
 
 	if (s > 1) {
 		Do(p, g_UMDReplacePermit);
-		if (g_UMDReplacePermit) {
+		if (g_UMDReplacePermit && p.mode == p.MODE_READ) {
 			System_Notify(SystemNotification::UI);
 		}
+	} else if (p.mode == p.MODE_READ) {
+		g_UMDReplacePermit = false;
 	}
 	if (s > 2) {
 		Do(p, umdInsertChangeEvent);
@@ -162,10 +170,29 @@ static void __UmdStatChange(u64 userdata, int cyclesLate) {
 	UmdWakeThreads();
 }
 
+// Callback notifications don't queue: a second one before the callback runs replaces the first's
+// argument. So a disc that goes in before the shell has run the callback for the one that came out
+// (both done from the pause menu) would look to it like nothing changed.
+static bool DriveCallbackPending() {
+	u32 error;
+	const PSPCallback *cb = driveCBId != 0 ? kernelObjects.Get<PSPCallback>(driveCBId, error) : nullptr;
+	return cb && cb->nc.notifyCount != 0;
+}
+
+// userdata 1: an insert waiting for the drive callback to see the drive empty, which then gets
+// the callback itself. 0: the second half of a disc swap.
 static void __UmdInsertChange(u64 userdata, int cyclesLate) {
+	if (userdata == 1 && DriveCallbackPending()) {
+		CoreTiming::ScheduleEvent(usToCycles(100 * 1000), umdInsertChangeEvent, 1);
+		return;
+	}
+
 	UMDInserted = true;
 
 	UmdWakeThreads();
+	if (userdata == 1 && driveCBId != 0) {
+		__KernelNotifyCallback(driveCBId, PSP_UMD_PRESENT | PSP_UMD_READABLE | PSP_UMD_CHANGED);
+	}
 }
 
 static void __KernelUmdActivate()
@@ -174,6 +201,10 @@ static void __KernelUmdActivate()
 	// PSP_UMD_READY will be returned when sceKernelGetCompiledSdkVersion() != 0
 	if (sceKernelGetCompiledSdkVersion() != 0) {
 		notifyArg |= PSP_UMD_READY;
+	}
+	// An empty drive (the XMB's) says so: the shell otherwise asks for the disc and reports it unreadable.
+	if (!UMDInserted) {
+		notifyArg = PSP_UMD_NOT_PRESENT;
 	}
 	if (driveCBId != 0)
 		__KernelNotifyCallback(driveCBId, notifyArg);
@@ -185,7 +216,7 @@ static void __KernelUmdActivate()
 
 static void __KernelUmdDeactivate()
 {
-	u32 notifyArg = PSP_UMD_PRESENT | PSP_UMD_READY;
+	u32 notifyArg = UMDInserted ? PSP_UMD_PRESENT | PSP_UMD_READY : PSP_UMD_NOT_PRESENT;
 	if (driveCBId != 0)
 		__KernelNotifyCallback(driveCBId, notifyArg);
 
@@ -199,8 +230,8 @@ static void __UmdBeginCallback(SceUID threadID, SceUID prevCallbackId)
 
 	if (HLEKernel::VerifyWait(threadID, WAITTYPE_UMD, 1))
 	{
-		// This means two callbacks in a row.  PSP crashes if the same callback runs inside itself.
-		// TODO: Handle this better?
+		// Shouldn't happen: each nesting level pauses under its own key, and on hardware a callback can
+		// nest only one level (a CB wait that would go deeper never returns.)
 		if (umdPausedWaits.find(pauseKey) != umdPausedWaits.end())
 			return;
 
@@ -250,7 +281,9 @@ static void __UmdEndCallback(SceUID threadID, SceUID prevCallbackId)
 	else
 	{
 		_dbg_assert_msg_(umdStatTimeoutEvent != -1, "Must have a umd timer");
-		CoreTiming::ScheduleEvent(cyclesLeft, umdStatTimeoutEvent, __KernelGetCurThread());
+		// A deadline of 0 means the wait has no timeout.
+		if (waitDeadline != 0)
+			CoreTiming::ScheduleEvent(cyclesLeft, umdStatTimeoutEvent, __KernelGetCurThread());
 
 		umdWaitingThreads.push_back(threadID);
 
@@ -266,24 +299,35 @@ static int sceUmdCheckMedium() {
 	return hleLogDebug(Log::sceKernel, retVal);
 }
 	
+// A user mode caller can't pass a kernel address. (mediaman.prx checks these with k1.)
+static bool IsUserAddress(u32 addr) {
+	return (addr & 0x80000000) == 0;
+}
+
 static u32 sceUmdGetDiscInfo(u32 infoAddr) {
 	DEBUG_LOG(Log::sceIo, "sceUmdGetDiscInfo(%08x)", infoAddr);
 
-	if (Memory::IsValidAddress(infoAddr)) {
+	if (Memory::IsValidRange(infoAddr, 8) && IsUserAddress(infoAddr) && IsUserAddress(infoAddr + 4)) {
 		auto info = PSPPointer<PspUmdInfo>::Create(infoAddr);
 		if (info->size != 8)
 			return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT);
 
-		info->type = PSP_UMD_TYPE_GAME;
+		// Games see a game disc, whatever else is on it.
+		const u32 type = __UmdDiscType();
+		info->type = (type & PSP_UMD_TYPE_GAME) || type == 0 ? PSP_UMD_TYPE_GAME : type;
 		return hleLogDebug(Log::sceIo, 0);
 	} else {
 		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT);
 	}
 }
 
-static int sceUmdActivate(u32 mode, const char *name) {
+static int sceUmdActivate(u32 mode, u32 namePtr) {
 	if (mode < 1 || mode > 2)
 		return hleLogWarning(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT);
+	// The firmware compares the name before checking the pointer, so a bad one crashes there.
+	const char *name = namePtr != 0 && Memory::IsValidAddress(namePtr) ? Memory::GetCharPointer(namePtr) : nullptr;
+	if (!name || strncmp(name, "disc0:", 7) != 0 || !IsUserAddress(namePtr))
+		return hleLogWarning(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT, "bad name");
 
 	__KernelUmdActivate();
 
@@ -293,11 +337,14 @@ static int sceUmdActivate(u32 mode, const char *name) {
 	return hleLogDebug(Log::sceIo, 0);
 }
 
-static int sceUmdDeactivate(u32 mode, const char *name)
+static int sceUmdDeactivate(u32 mode, u32 namePtr)
 {
 	// Why 18?  No idea.
 	if (mode > 18)
 		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT);
+	// Unlike sceUmdActivate(), the name isn't compared, and only mode 2 requires one.
+	if ((mode == 2 && namePtr == 0) || !IsUserAddress(namePtr))
+		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT, "bad name");
 
 	__KernelUmdDeactivate();
 
@@ -312,8 +359,7 @@ static u32 sceUmdRegisterUMDCallBack(u32 cbId)
 {
 	int retVal = 0;
 
-	// TODO: If the callback is invalid, return SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT.
-	if (!kernelObjects.IsValid(cbId)) {
+	if (!kernelObjects.Is<PSPCallback>(cbId)) {
 		retVal = SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
 	} else {
 		// There's only ever one.
@@ -361,13 +407,18 @@ static void __UmdStatTimeout(u64 userdata, int cyclesLate)
 	HLEKernel::RemoveWaitingThread(umdWaitingThreads, threadID);
 }
 
-static void __UmdWaitStat(u32 timeout)
+// The firmware waits on an event flag holding the drive state (mediaman.prx), and passes no
+// timeout at all for 0, so that waits forever.
+static void __UmdWaitStat(u32 timeout, bool callbacks)
 {
-	// This happens to be how the hardware seems to time things.
-	if (timeout <= 4)
-		timeout = 15;
-	else if (timeout <= 215)
-		timeout = 250;
+	if (timeout == 0)
+		return;
+
+	// Measured on hardware. Oddly, the CB version doesn't have the shortest step.
+	if (timeout <= 1 && !callbacks)
+		timeout = 25;
+	else if (timeout <= 209)
+		timeout = 240;
 
 	CoreTiming::ScheduleEvent(usToCycles((int) timeout), umdStatTimeoutEvent, __KernelGetCurThread());
 }
@@ -414,7 +465,7 @@ static int sceUmdWaitDriveStatWithTimer(u32 stat, u32 timeout) {
 
 	hleEatCycles(520);
 	if ((stat & __KernelUmdGetState()) == 0) {
-		__UmdWaitStat(timeout);
+		__UmdWaitStat(timeout, false);
 		umdWaitingThreads.push_back(__KernelGetCurThread());
 		__KernelWaitCurThread(WAITTYPE_UMD, 1, stat, 0, false, "umd stat waited with timer");
 		return hleLogDebug(Log::sceIo, 0, "waiting");
@@ -439,11 +490,7 @@ static int sceUmdWaitDriveStatCB(u32 stat, u32 timeout) {
 	hleEatCycles(520);
 	hleCheckCurrentCallbacks();
 	if ((stat & __KernelUmdGetState()) == 0) {
-		if (timeout == 0) {
-			timeout = 8000;
-		}
-
-		__UmdWaitStat(timeout);
+		__UmdWaitStat(timeout, true);
 		umdWaitingThreads.push_back(__KernelGetCurThread());
 		__KernelWaitCurThread(WAITTYPE_UMD, 1, stat, 0, true, "umd stat waited");
 		return hleLogDebug(Log::sceIo, 0, "waiting");
@@ -478,6 +525,7 @@ void __UmdReplace(const Path &filepath) {
 	}
 
 	Achievements::ChangeUMD(filepath, fileLoader);
+	g_umdPath = filepath;
 
 	UMDInserted = false;
 	// Wake any threads waiting for the disc to be removed.
@@ -488,6 +536,87 @@ void __UmdReplace(const Path &filepath) {
 	u32 notifyArg = PSP_UMD_PRESENT | PSP_UMD_READABLE | PSP_UMD_CHANGED;
 	if (driveCBId != 0)
 		__KernelNotifyCallback(driveCBId, notifyArg);
+}
+
+bool __UmdInsert(const Path &filepath, std::string *error) {
+	if (__UmdIsInserted()) {
+		*error = "a disc is already in the drive";
+		return false;
+	}
+	FileLoader *fileLoader;
+	if (!UmdMount(filepath, &fileLoader, *error)) {
+		return false;
+	}
+	Achievements::ChangeUMD(filepath, fileLoader);
+	g_umdPath = filepath;
+
+	CoreTiming::UnscheduleEvent(umdInsertChangeEvent, 1);
+	if (DriveCallbackPending()) {
+		CoreTiming::ScheduleEvent(usToCycles(100 * 1000), umdInsertChangeEvent, 1);
+		return true;
+	}
+
+	UMDInserted = true;
+	UmdWakeThreads();
+	if (driveCBId != 0)
+		__KernelNotifyCallback(driveCBId, PSP_UMD_PRESENT | PSP_UMD_READABLE | PSP_UMD_CHANGED);
+	return true;
+}
+
+void __UmdEject() {
+	// A disc still waiting to go in comes back out without the shell ever hearing of it.
+	const bool insertPending = CoreTiming::UnscheduleEvent(umdInsertChangeEvent, 1) != 0;
+	if (!UMDInserted && !insertPending) {
+		return;
+	}
+	pspFileSystem.Unmount("umd0:");
+	pspFileSystem.Unmount("umd1:");
+	pspFileSystem.Unmount("umd:");
+	pspFileSystem.Unmount("disc0:");
+	if (!UMDInserted) {
+		return;
+	}
+	UMDInserted = false;
+	UmdWakeThreads();
+	if (driveCBId != 0)
+		__KernelNotifyCallback(driveCBId, PSP_UMD_NOT_PRESENT | PSP_UMD_CHANGED);
+}
+
+Path __UmdGetPath() {
+	if (!UMDInserted) {
+		return Path();
+	}
+	if (!g_umdPath.empty()) {
+		return g_umdPath;
+	}
+	const CoreParameter &coreParam = PSP_CoreParameter();
+	if (!coreParam.mountIso.empty()) {
+		return coreParam.mountIso;
+	}
+	switch (coreParam.fileType) {
+	case IdentifiedFileType::PSP_ISO:
+	case IdentifiedFileType::PSP_ISO_NP:
+	case IdentifiedFileType::PSP_UMD_VIDEO_ISO:
+	case IdentifiedFileType::PSP_DISC_DIRECTORY:
+		return coreParam.fileToStart;
+	default:
+		// A homebrew or PS1 EBOOT, with no disc behind disc0:.
+		return Path();
+	}
+}
+
+bool __UmdIsInserted() {
+	// Counting a disc that's on its way in, which can't finish while emulation is paused.
+	return UMDInserted || CoreTiming::IsScheduled(umdInsertChangeEvent);
+}
+
+u32 __UmdDiscType() {
+	if (!UMDInserted) {
+		return 0;
+	}
+	const u32 type = DetectUmdDiscType(&pspFileSystem, "disc0:");
+	// A loose game directory or an ISO without the usual layout still boots as a game.
+	return type != 0 ? type : PSP_UMD_TYPE_GAME;
 }
 
 bool getUMDReplacePermit() {
@@ -517,10 +646,10 @@ static u32 sceUmdReplacePermit() {
 
 const HLEFunction sceUmdUser[] = 
 {
-	{0XC6183D47, &WrapI_UC<sceUmdActivate>,               "sceUmdActivate",               'i', "is"},
+	{0XC6183D47, &WrapI_UU<sceUmdActivate>,               "sceUmdActivate",               'i', "is"},
 	{0X6B4A146C, &WrapU_V<sceUmdGetDriveStat>,            "sceUmdGetDriveStat",           'x', ""  },
 	{0X46EBB729, &WrapI_V<sceUmdCheckMedium>,             "sceUmdCheckMedium",            'i', ""  },
-	{0XE83742BA, &WrapI_UC<sceUmdDeactivate>,             "sceUmdDeactivate",             'i', "xs"},
+	{0XE83742BA, &WrapI_UU<sceUmdDeactivate>,             "sceUmdDeactivate",             'i', "xs"},
 	{0X8EF08FCE, &WrapI_U<sceUmdWaitDriveStat>,           "sceUmdWaitDriveStat",          'i', "x" },
 	{0X56202973, &WrapI_UU<sceUmdWaitDriveStatWithTimer>, "sceUmdWaitDriveStatWithTimer", 'i', "xx"},
 	{0X4A9E5E29, &WrapI_UU<sceUmdWaitDriveStatCB>,        "sceUmdWaitDriveStatCB",        'i', "xx"},

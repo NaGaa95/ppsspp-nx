@@ -20,6 +20,7 @@
 #include "CommonTypes.h"
 #include "Swap.h"
 
+#include <atomic>
 #include <mutex>
 
 extern u32 dummyThreadHackAddr;

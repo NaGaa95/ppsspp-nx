@@ -15,7 +15,7 @@ struct VulkanDynamicState {
 	VkViewport viewport;
 	ScissorRect scissor;
 	bool useBlendColor;
-	uint32_t blendColor;
+	float blendColor[4];
 	bool useStencil;
 	uint8_t stencilRef;
 	uint8_t stencilWriteMask;
@@ -27,6 +27,8 @@ struct VulkanDynamicState {
 // also be set to 0.
 // ~64 bits.
 // Can't use enums unfortunately, they end up signed and breaking values above half their ranges.
+// Stored in the shader cache on disk (as part of VulkanPipelineKey): changing it requires bumping
+// CACHE_VERSION in ShaderManagerVulkan.cpp.
 struct VulkanPipelineRasterStateKey {
 	// Blend
 	unsigned int blendEnable : 1;

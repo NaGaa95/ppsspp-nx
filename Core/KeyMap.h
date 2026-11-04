@@ -82,6 +82,7 @@ enum VirtKey : u32 {
 	VIRTKEY_PAUSE_NO_MENU = 0x40000034,
 	VIRTKEY_TOGGLE_TILT = 0x40000035,
 	VIRTKEY_AXIS_SWAP_HOLD = 0x40000036,
+	VIRTKEY_CREATE_FRAME_DUMP = 0x40000037,
 	VIRTKEY_LAST,
 	VIRTKEY_COUNT = VIRTKEY_LAST - VIRTKEY_FIRST
 };
@@ -186,6 +187,8 @@ namespace KeyMap {
 
 	// Careful with these.
 	bool InputMappingsFromPspButtonNoLock(int btn, std::vector<MultiInputMapping> *keys, bool ignoreMouse);
+	// Collects every mapping that consists of more than one input, ie. a combo.
+	void GetAllComboMappingsNoLock(std::vector<MultiInputMapping> *combos);
 	void LockMappings();
 	void UnlockMappings();
 

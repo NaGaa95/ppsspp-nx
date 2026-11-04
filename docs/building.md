@@ -16,16 +16,32 @@ An agent can drive the VS solution non-interactively with `MSBuild.exe` instead 
 ```powershell
 $installPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
 $msbuild = "$installPath\MSBuild\Current\Bin\MSBuild.exe"
-& $msbuild "Windows\PPSSPP.sln" /t:UnitTest /p:Configuration=Debug /p:Platform=x64 /m
+& $msbuild "Windows\PPSSPP.sln" /t:UnitTest /p:Configuration=Debug /p:Platform=<platform> /m
 ```
 
 (swap `/t:UnitTest` for `/t:PPSSPPWindows` or another project name as needed; drop it entirely to build the whole solution).
+
+On an ARM64 host, use `$installPath\MSBuild\Current\Bin\arm64\MSBuild.exe` instead. The MSBuild in
+`Bin\` itself runs emulated and picks the 32-bit x86-hosted compiler (`bin\HostX86\arm64\CL.exe`),
+which can't always map the precompiled headers into its address space. Builds then fail
+intermittently, every file of a project at line 1, with `C3859: Failed to create virtual memory for
+PCH` and `C1076: compiler limit: internal heap limit reached`. That looks like running out of
+memory, but lowering `/m` or `CL_MPCount` doesn't help, and `/p:PreferredToolArchitecture=arm64`
+has no effect. The build log's `CL.exe` path shows which host compiler ran.
+
+`<platform>` is `ARM64` or `x64` - whichever the machine actually is, so look it up rather than
+picking a default. The output directory follows it (`Windows\<platform>\<configuration>\`), which
+makes building one and running the other an easy mistake. It is easiest to make on Windows-on-ARM,
+where an x64 build runs anyway under emulation: everything appears to work, but it is slower than
+the native build and any performance measurement from it describes the emulator rather than the
+code. `platform.machine()` in Python reports the host; `$PROCESSOR_ARCHITECTURE` reports the shell,
+which is `AMD64` in an emulated shell even on an ARM64 machine.
 
 In addition to the pspautotests runner (test.py), there is a separate binary with C++ unit tests
 in the /unittest subdirectory. After substantial changes (at the end of a chunk of work, not
 necessarily after every edit), run these too:
 
-- Windows: build the `UnitTest` project (unittest/UnitTests.vcxproj), then run `Windows/x64/Debug/UnitTest.exe all`
+- Windows: build the `UnitTest` project (unittest/UnitTests.vcxproj), then run `Windows/<platform>/Debug/UnitTest.exe all` (`<platform>` being `ARM64` or `x64`, whichever you built)
 - Linux/Mac: configure with `-DUNITTEST=ON`, then run `build/PPSSPPUnitTest all`
 
 This runs all tests in `availableTests` in unittest/UnitTest.cpp. You can run one or more
@@ -61,6 +77,46 @@ bug, since CI runs the equivalent of `UnitTest.exe all` on every commit across m
 platforms without apparent issue. If `all`/`Jit` hangs in your environment, run every other
 test by name instead (skip `Jit`) to still get real coverage.
 
+## FFmpeg
+
+Every build compiles FFmpeg (3.0.2) itself, from the copy vendored into `ext/ffmpeg`. There's no
+configure step: `ext/ffmpeg-build` has a hand-kept `config.h` and `sources.mk`, the one list of
+files that every build system uses. After changing the list, run `ext/ffmpeg-build/update_vcxproj.py`
+to copy it into the VS projects. How it works, how to add a codec and why it's done this way are in
+`ext/ffmpeg/README.md`. CMake still links the system's FFmpeg with `-DUSE_SYSTEM_FFMPEG=ON`, or one
+in `FFMPEG_DIR`.
+
+## UWP build
+
+UWP has its own solution, `UWP\PPSSPP_UWP.sln`. Build the app with `/t:PPSSPP_UWP` (or a single
+library such as `/t:CoreUWP`), same MSBuild setup as above:
+
+```powershell
+& $msbuild "UWP\PPSSPP_UWP.sln" /t:PPSSPP_UWP /p:Configuration=Debug /p:Platform=<platform> /m
+```
+
+## iOS simulator build
+
+On an Apple Silicon Mac, `./b-ios-simulator.sh` builds the App Store variant for the iOS simulator
+into `build-ios-sim/`, then installs and launches it. `./b-ios-simulator.sh "iPhone Duo"` runs it on a
+simulator of that type (names from `xcrun simctl list devicetypes`), creating and booting one if
+needed. Without a name it uses the booted simulator, or boots the newest iPhone. The script also
+opens the simulator UI, which Xcode 27 calls DeviceHub (it replaced Simulator.app). Set
+`CONFIGURATION=Release` for a release build.
+
+`xcrun simctl io booted screenshot shot.png` saves a screenshot at the device's full resolution,
+as App Store Connect wants it. To work in Xcode instead, `open build-ios-sim/PPSSPP.xcodeproj` and
+pick a simulator as the run destination.
+
+The simulator build renders with Metal only and doesn't link MoltenVK.
+
+## Android assets
+
+The APK's `assets/` directory is the repo-root `assets/` directory, wired up by
+`assets.directories.add("../assets")` in `android/build.gradle.kts`. There's no copy step, so a file dropped
+in `assets/` ships as-is. `ndk-build` doesn't read assets at all, and nothing populates `android/assets/` -
+if you have one, it's a leftover from the old Ant/Eclipse build and is ignored.
+
 ## Legacy Android build (android/jni)
 
 There is a legacy Android build using the raw NDK build system (`android/jni/Android.mk` + `ndk-build`), separate from the
@@ -69,10 +125,30 @@ useful for quick test builds (it can build `ppsspp_headless` and the unit tests 
 by default, but if you want to test-build it locally:
 
 - The NDK path is hardcoded in `android/ab.cmd` (Windows) or passed via the `NDK` env var to `android/ab.sh` (POSIX).
-  It should match the `ndkVersion` in `android/build.gradle.kts`. The scripts copy assets first, then run ndk-build with
-  a core count derived from the machine (nproc / %NUMBER_OF_PROCESSORS%).
+  It should match the `ndkVersion` in `android/build.gradle.kts`. The scripts just run ndk-build with a core count
+  derived from the machine (nproc / %NUMBER_OF_PROCESSORS%).
 - Example (POSIX): `cd android && NDK=/path/to/ndk ./ab.sh APP_ABI=arm64-v8a HEADLESS=1`
 - The `ppsspp_headless` executable ends up in `android/libs/<abi>/`.
+
+## tvOS
+
+The tvOS app is the iOS app with the iPhone-only parts compiled out, checked with
+`PPSSPP_PLATFORM(TVOS)` (tvOS also gets `PPSSPP_PLATFORM(IOS)`). The CMake side is the iOS toolchain
+with `-DIOS_PLATFORM=TVOS`, which sets `TVOS`.
+
+- `./b-tvos.sh` builds an unsigned app into `build-tvos-xcode/Release-appletvos/`.
+  `DEVELOPMENT_TEAM=<team> DEVICE=<udid> ./b-tvos.sh` signs it, registers the Apple TV with the team
+  if needed, installs it and launches it with the console attached.
+- To pair an Apple TV, put it on Settings > Remotes and Devices > Remote App and Devices. It doesn't
+  show in `xcrun devicectl list devices` until paired; find it with
+  `dns-sd -B _remotepairing-manual-pairing._tcp` and `xcrun devicectl device info details --device <name>`,
+  then `xcrun devicectl manage pair --device <identifier>` and enter the code it shows.
+- `./b.sh --tvos --libretro` (and `./b.sh --ios --libretro`) build the libretro cores. tvOS has no
+  `sigaltstack`, among other things, so this is the build that catches it.
+- There's no tvOS simulator build. FFmpeg having no tvOS simulator libraries was what stopped it,
+  which no longer applies now that it's built from source, but nobody has tried since.
+- tvOS apps have no persistent storage except about 500 KB of `NSUserDefaults`. Anything else may be
+  purged, so the memory stick is in Caches for now.
 
 ## libretro core build (Windows)
 
@@ -120,13 +196,25 @@ main functions (and also stub out most of the System_ functions as needed). Take
 when making cross platform changes.
 
 New unit tests are added by listing them in availableTests in unittest.cpp. If they are large, put them in
-separate files in the unittest subdirectory. Remember to update both CMakeLists.txt and the visual studio project.
+separate files in the unittest subdirectory. A new file has to be listed in three build files, not two:
+`CMakeLists.txt`, `unittest/UnitTests.vcxproj` (and its `.filters`), and `android/jni/Android.mk`, which
+builds a unit test executable of its own. The Android one is the easiest to forget, since missing it builds
+fine everywhere you are likely to try it and only fails on Android CI.
 
 A unit test is often the first thing to call a given function from outside its own .cpp, which makes the
 `ppsspp_unittest` target in the legacy Android build (`android/jni/Android.mk`, see above) the strictest check
 we have: MSVC links an `inline` function defined in a .cpp anyway, clang correctly does not. So a test can
 build and pass on Windows and fail to link only on Android CI, with an undefined symbol pointing at a header
 line. Fix it by dropping the bogus `inline` from the definition, not by avoiding the call.
+
+The compilers also disagree about floating point contraction, which matters for any test asserting that a JIT
+is bit-identical to its C++ reference. Clang folds `a * b + c` into a single fused multiply-add by default;
+MSVC never does, under `/fp:precise`, in Debug or Release. So on arm64, where the JITs emit `FMLA`, a
+reference written as `a * b + c` matches on Mac, Linux and Android and is off by one ULP on Windows on ARM.
+Don't leave it to the compiler: write `fmaf(a, b, c)` when the fused result is wanted (MSVC compiles it to a
+single `fmadd`), and `a * b + c` when it isn't. `PrescaleUV` in `GPU/Common/VertexDecoderCommon.cpp` picks per
+architecture, matching what each JIT does. x86 doesn't have the problem, since the SSE2 baseline has no FMA
+instruction to contract into.
 
 pspautotests are a large set of tests of the PSP OS's API surface, and thus tests our HLE implementation.
 
@@ -146,6 +234,55 @@ Note the runner prints a debug-CRT "Detected memory leaks!" dump after the summa
 That's normal and not a test failure - read the `N tests passed, N tests failed` line, which comes before it.
 
 See docs/pspautotests.md for a workflow for running pspautotests and improving PPSSPP with the results.
+
+### LoongArch64, RISC-V and ARM32 JITs under qemu
+
+CI tests these JITs by cross-building headless and running pspautotests under qemu-user, and you can do the
+same on Linux (packages: `gcc-14-loongarch64-linux-gnu g++-14-loongarch64-linux-gnu qemu-user`, or the riscv64
+equivalents):
+
+```bash
+./b.sh --loongarch64 PPSSPPHeadless     # builds into build-loongarch64/
+mkdir -p build-qemu
+printf '#!/bin/bash\nexec qemu-loongarch64 -L /usr/loongarch64-linux-gnu "$(dirname "$0")/../build-loongarch64/PPSSPPHeadless" "$@"\n' > build-qemu/PPSSPPHeadless
+chmod +x build-qemu/PPSSPPHeadless
+python3 test.py -g --graphics=software --cpu=jit-ir --timeout=60 --known-failures=loongarch64
+```
+
+`test.py` runs the most recently modified `build*/PPSSPPHeadless`, so `touch` the shim after rebuilding the real
+binary, or it runs your native build instead. The full suite takes a couple of minutes.
+
+qemu reports LSX and LASX as present, so CI only exercises the LoongArch vector paths.
+The scalar fallbacks never run here, so passing tells you nothing about them.
+
+The 32-bit ARM JIT works the same way with `./b.sh --armhf` (into `build-armhf/`) and `qemu-arm -L
+/usr/arm-linux-gnueabihf`. The cross packages are `gcc-14-arm-linux-gnueabihf g++-14-arm-linux-gnueabihf`, and
+`sudo cmake/scripts/setup-cross.sh armhf` adds the GL and EGL stubs the link needs. Without root, `apt-get download`
+the packages, `dpkg-deb -x` them into one directory, and point `CROSS_ARMHF` at it: the toolchain file then takes
+the sysroot from `$CROSS_ARMHF/usr/arm-linux-gnueabihf`. The binutils need `LD_LIBRARY_PATH` to include
+`$CROSS_ARMHF/usr/lib/x86_64-linux-gnu`, glibc's `libc.so` linker script names absolute paths that have to be
+rewritten to the new root, and the stubs are copied in by hand. For a debugger, run `qemu-arm -g PORT` and attach
+`gdb-multiarch` to it.
+
+GitHub's arm64 runners can't run the armhf build natively: some of their hosts are Neoverse V3, which has no
+AArch32, and a job can't pick its host. So CI runs ARM32 under qemu on x86-64 too.
+
+Without a cross toolchain (on macOS, say) two things still help:
+
+- **A syntax check of the other JITs.** The RISC-V and LoongArch backends (`Core/MIPS/RiscV`,
+  `Core/MIPS/LoongArch64` and their emitters) have no architecture guards, so the host compiler can check
+  them: `clang++ -fsyntax-only` per file, with the `-I`/`-D`/`-std`/`-isystem` flags of any Core file from
+  `compile_commands.json`, plus `-I<repo> -I<repo>/ext -I<repo>/Common` (the database's include paths are
+  relative to the build directory). Check that a copy with a deliberate syntax error does report errors: zsh
+  doesn't word-split a `$FLAGS` variable, which once made a broken check look clean. This proves the code
+  compiles, nothing about its output.
+- **The portable software-renderer paths.** riscv64 and loongarch64 run the software renderer's non-SSE,
+  non-NEON C++ paths, so their test failures reproduce natively: wrap the two NEON defines in the
+  `__aarch64__` block of `ppsspp_config.h` in `#ifndef PPSSPP_TEST_NO_SIMD`, configure a separate
+  `build-nosimd` with `-DHEADLESS=ON` and `-DPPSSPP_TEST_NO_SIMD` in `CMAKE_C_FLAGS` and `CMAKE_CXX_FLAGS`,
+  and build `PPSSPPHeadless` there. Delete it and revert `ppsspp_config.h` afterwards, since `test.py` keeps
+  picking the newest binary. A failure that's the same on both architectures points at the portable path, not
+  the JITs.
 
 ## Quick rebuild on Linux
 

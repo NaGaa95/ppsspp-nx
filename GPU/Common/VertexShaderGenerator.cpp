@@ -69,7 +69,8 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 	*vertexShaderFlags = (VertexShaderFlags)0;
 
 	bool highpFog = false;
-	bool highpTexcoord = false;
+	// Highp costs nothing here, and the fragment shader can then pick it up where it needs it (CLUT8 depal).
+	bool highpTexcoord = gstate_c.Use(GPU_USE_FULL_PRECISION_IN_FRAGMENT);
 
 	const bool isModeThrough = id.Bit(VS_BIT_IS_THROUGH);
 	const bool useHWTransform = id.Bit(VS_BIT_USE_HW_TRANSFORM);
@@ -135,7 +136,9 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 	int matUpdate = id.Bits(VS_BIT_MATERIAL_UPDATE, 3);
 
 	bool lightUberShader = id.Bit(VS_BIT_LIGHT_UBERSHADER) && enableLighting;  // checking lighting here for the shader test's benefit, in reality if ubershader is set, lighting is set.
-	if (lightUberShader && !compat.bitwiseOps) {
+	// With the ubershader, shade mapping reads its lights' type and computation from u_lightControl.
+	bool shadeUberShader = id.Bit(VS_BIT_LIGHT_UBERSHADER) && doShadeMapping;
+	if ((lightUberShader || shadeUberShader) && !compat.bitwiseOps) {
 		*errorString = "Light ubershader requires bitwise ops in shader language";
 		return false;
 	}
@@ -201,12 +204,15 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 				WRITE(p, "layout (location = %d) in vec3 color1;\n", (int)PspAttributeLocation::COLOR1);
 		}
 
-		WRITE(p, "layout (location = 1) %sout lowp vec4 v_color0;\n", shading);
+		// Centroid keeps them inside the primitive on pixels it only partly covers with MSAA, so that
+		// textures aren't sampled from outside the UV range. Without MSAA, it's the same as center.
+		const char *colorQualifier = *shading ? shading : "centroid ";
+		WRITE(p, "layout (location = 1) %sout lowp vec4 v_color0;\n", colorQualifier);
 		if (lmode) {
-			WRITE(p, "layout (location = 2) %sout lowp vec3 v_color1;\n", shading);
+			WRITE(p, "layout (location = 2) %sout lowp vec3 v_color1;\n", colorQualifier);
 		}
 
-		WRITE(p, "layout (location = 0) out highp vec3 v_texcoord;\n");
+		WRITE(p, "layout (location = 0) centroid out highp vec3 v_texcoord;\n");
 
 		WRITE(p, "layout (location = 3) out highp float v_fogdepth;\n");
 
@@ -322,7 +328,8 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		WRITE(p, "uniform float u_NaN;\n");
 		*uniformMask |= DIRTY_FRAMEBUFFER_DIM;
 
-		WRITE(p, "uniform vec2 u_minZmaxZ;\n");
+		// highp to match the fragment shader's (see there).
+		WRITE(p, "uniform highp vec2 u_minZmaxZ;\n");
 		*uniformMask |= DIRTY_RASTER_OFFSET;  // this flag is shared with raster offset.
 
 		if (!isModeThrough) {
@@ -349,7 +356,7 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 			WRITE(p, "uniform vec4 u_uvscaleoffset;\n");
 			*uniformMask |= DIRTY_UVSCALEOFFSET;
 
-			if (lightUberShader) {
+			if (lightUberShader || shadeUberShader) {
 				p.C("uniform uint u_lightControl;\n");
 				*uniformMask |= DIRTY_LIGHT_CONTROL;
 			}
@@ -428,6 +435,23 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		WRITE(p, "   float len2 = dot(v, v);\n");
 		WRITE(p, "   return len2 == 0.0 ? vec3(0.0, 0.0, 1.0) : (v * inversesqrt(len2));\n");
 		WRITE(p, "}\n");
+		WRITE(p, "vec3 normalizeOr000(vec3 v) {\n");
+		WRITE(p, "   float len2 = dot(v, v);\n");
+		WRITE(p, "   return len2 == 0.0 ? splat3(0.0) : (v * inversesqrt(len2));\n");
+		WRITE(p, "}\n");
+		// The GE's pow for lighting: 1 for e <= 0, else 0 for x <= 0. Otherwise exp2(e * log2(x)) with
+		// log2 and exp2 each a straight line between powers of two, which is what reading a float's
+		// bits as an integer gives: exponent plus mantissa, scaled by 2^23. Without integers, a true
+		// pow is close enough.
+		WRITE(p, "float pspPow(float x, float e) {\n");
+		if (compat.bitwiseOps) {
+			// 1065353216 is 1.0's bits. Not written in hex: HLSL makes 0x3F800000 a uint, and the subtraction wraps.
+			WRITE(p, "   float t = max(e, 0.0) * float(floatBitsToInt(max(x, 1e-30)) - 1065353216) + 1065353216.0;\n");
+			WRITE(p, "   return x > 0.0 || e <= 0.0 ? intBitsToFloat(int(max(t, 0.0))) : 0.0;\n");
+		} else {
+			WRITE(p, "   return e <= 0.0 ? 1.0 : pow(max(x, 0.0), e);\n");
+		}
+		WRITE(p, "}\n");
 	}
 
 	if (ShaderLanguageIsOpenGL(compat.shaderLanguage) || compat.shaderLanguage == GLSL_VULKAN) {
@@ -479,7 +503,7 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		// If non-through, the viewport has already been applied here.
 		WRITE(p, "  vec4 outPos = position;\n");
 
-		if (fsMinmaxDiscard || fsDepthClamp) {
+		if (fsMinmaxDiscard) {
 			WRITE(p, "  %sv_zw = vec2(outPos.z * outPos.w, outPos.w);\n", compat.vsOutPrefix);
 		}
 	} else {
@@ -489,6 +513,14 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 			WRITE(p, "  mediump vec3 worldnormal = normalizeOr001(mul(vec4(%snormal, 0.0), u_world).xyz);\n", flipNormal ? "-" : "");
 		} else {
 			WRITE(p, "  mediump vec3 worldnormal = normalizeOr001(mul(vec4(0.0, 0.0, %s1.0, 0.0), u_world).xyz);\n", flipNormal ? "-" : "");
+		}
+		if (enableLighting || doShadeMapping) {
+			// The viewer is at infinity along view space +z: in world space, the view matrix's third column.
+			if (compat.shaderLanguage == HLSL_D3D11) {
+				WRITE(p, "  mediump vec3 viewDir = normalizeOr001(vec3(u_view[0].z, u_view[1].z, u_view[2].z));\n");
+			} else {
+				WRITE(p, "  mediump vec3 viewDir = normalizeOr001(u_view[2].xyz);\n");
+			}
 		}
 
 		WRITE(p, "  vec4 viewPos = vec4(mul(vec4(worldpos, 1.0), u_view).xyz, 1.0);\n");
@@ -505,6 +537,11 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		if (gstate_c.Use(GPU_USE_VIRTUAL_REALITY)) {
 			WRITE(p, "  vec4 outPos = mul(u_proj_lens, viewPos);\n");
 			WRITE(p, "  vec4 orgPos = mul(u_proj, viewPos);\n");
+#ifdef __LIBRETRO__
+			// Preserve game depth before clipping and viewport conversion. The VR lens
+			// changes XY, but depth must still agree with through-mode draws and clears.
+			WRITE(p, "  outPos.z = orgPos.z * (outPos.w / orgPos.w);\n");
+#endif
 		} else {
 			WRITE(p, "  vec4 outPos = mul(u_proj, viewPos);\n");
 		}
@@ -516,6 +553,11 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		WRITE(p, "  if (outPos.z < -outPos.w) {\n");
 		WRITE(p, "    zClipped = true;\n");
 		WRITE(p, "  }\n");
+		if (fsDepthClamp) {
+			// For the rasterizer's Z below: 0 at the near plane, so it still clips there, and past W only beyond
+			// 65535 * W, so nothing else is clipped. The fragment shader writes the real depth.
+			WRITE(p, "  float nearPlaneZ = (outPos.z + outPos.w) * (1.0 / 65536.0);\n");
+		}
 		// Then we actually add the clip plane.
 		if (clipNearPlane) {
 			WRITE(p, "  %sgl_ClipDistance%s = outPos.z + outPos.w;\n", compat.vsOutPrefix, zClipPlaneSuffix);
@@ -533,7 +575,7 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		WRITE(p, "  float recip = 1.0 / outPos.w;\n");
 		WRITE(p, "  outPos.xyz = (outPos.xyz * u_vpScale.xyz) * recip + u_vpOffset.xyz;\n");
 
-		if (fsMinmaxDiscard || fsDepthClamp) {
+		if (fsMinmaxDiscard) {
 			WRITE(p, "  %sv_zw = vec2(outPos.z * outPos.w, outPos.w);\n", compat.vsOutPrefix);
 		}
 
@@ -643,7 +685,7 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 				p.C("      } else {\n");  // type must be 0x02 - GE_LIGHTTYPE_SPOT
 				p.F("        angle = dot(u_lightdir%s, toLight);\n", iStr);
 				p.F("        if (angle >= u_lightangle_spotCoef%s.x) {\n", iStr);
-				p.F("          lightScale = attenuation * (u_lightangle_spotCoef%s.y <= 0.0 ? 1.0 : pow(angle, u_lightangle_spotCoef%s.y));\n", iStr, iStr, iStr);
+				p.F("          lightScale = attenuation * pspPow(angle, u_lightangle_spotCoef%s.y);\n", iStr, iStr);
 				p.C("        } else {\n");
 				p.C("          lightScale = 0.0;\n");
 				p.C("        }\n");
@@ -653,17 +695,13 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 				p.C("    }\n");
 				p.C("    ldot = dot(toLight, worldnormal);\n");
 				p.C("    if (comp == 0x2u) {\n");  // GE_LIGHTCOMP_ONLYPOWDIFFUSE
-				p.C("      ldot = u_matspecular.a > 0.0 ? pow(max(ldot, 0.0), u_matspecular.a) : 1.0;\n");
+				p.C("      ldot = pspPow(ldot, u_matspecular.a);\n");
 				p.C("    }\n");
 				p.F("    diffuse = (u_lightdiffuse%s * diffuseColor) * max(ldot, 0.0);\n", iStr);
 				p.C("    if (comp == 0x1u && ldot >= 0.0) {\n");  // do specular. note - must allow for the >= case, since the u_matspecular.a <= 0.0 case relies on it.
-				p.C("      if (u_matspecular.a > 0.0) {\n");
-				p.C("        vec3 halfVec = toLight + vec3(0.0, 0.0, 1.0);\n");
-				p.C("        float halfInvLen = inversesqrt(dot(halfVec, halfVec));\n");
-				p.C("        ldot = pow(max(dot(halfVec, worldnormal) * halfInvLen, 0.0), u_matspecular.a);\n");
-				p.C("      } else {\n");
-				p.C("        ldot = 1.0;\n");
-				p.C("      }\n");
+				p.C("      vec3 halfVec = toLight + viewDir;\n");
+				p.C("      float halfInvLen = inversesqrt(dot(halfVec, halfVec));\n");
+				p.C("      ldot = pspPow(dot(halfVec, worldnormal) * halfInvLen, u_matspecular.a);\n");
 				p.F("      lightSum1 += u_lightspecular%s * specularColor * ldot * lightScale;\n", iStr);
 				p.C("    }\n");
 				p.F("    lightSum0.rgb += (u_lightambient%s * ambientColor.rgb + diffuse) * lightScale;\n", iStr);
@@ -703,11 +741,7 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 				if (poweredDiffuse) {
 					// pow(0.0, 0.0) may be undefined, but the PSP seems to treat it as 1.0.
 					// Seen in Tales of the World: Radiant Mythology (#2424.)
-					p.C("  if (u_matspecular.a > 0.0) {\n");
-					p.C("    ldot = pow(max(ldot, 0.0), u_matspecular.a);\n");
-					p.C("  } else {\n");
-					p.C("    ldot = 1.0;\n");
-					p.C("  }\n");
+					p.C("  ldot = pspPow(ldot, u_matspecular.a);\n");
 				}
 
 				const char *timesLightScale = " * lightScale";
@@ -724,7 +758,7 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 				case GE_LIGHTTYPE_UNKNOWN:
 					p.F("  angle = dot(u_lightdir%s, toLight);\n", iStr, iStr);
 					p.F("  if (angle >= u_lightangle_spotCoef%s.x) {\n", iStr);
-					p.F("    lightScale = clamp(1.0 / dot(u_lightatt%s, vec3(1.0, distance, distSq)), 0.0, 1.0) * (u_lightangle_spotCoef%s.y <= 0.0 ? 1.0 : pow(max(angle, 0.0), u_lightangle_spotCoef%s.y));\n", iStr, iStr, iStr);
+					p.F("    lightScale = clamp(1.0 / dot(u_lightatt%s, vec3(1.0, distance, distSq)), 0.0, 1.0) * pspPow(angle, u_lightangle_spotCoef%s.y);\n", iStr, iStr);
 					p.C("  } else {\n");
 					p.C("    lightScale = 0.0;\n");
 					p.C("  }\n");
@@ -737,13 +771,9 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 				p.F("  diffuse = (u_lightdiffuse%s * diffuseColor) * max(ldot, 0.0);\n", iStr);
 				if (doSpecular) {
 					p.C("  if (ldot >= 0.0) {\n");
-					p.C("    if (u_matspecular.a > 0.0) {\n");
-					p.C("      vec3 halfVec = toLight + vec3(0.0, 0.0, 1.0);\n");
-					p.C("      float halfInvLen = inversesqrt(dot(halfVec, halfVec));\n");
-					p.C("      ldot = pow(max(dot(halfVec, worldnormal) * halfInvLen, 0.0), u_matspecular.a);\n");
-					p.C("    } else {\n");
-					p.C("      ldot = 1.0;\n");
-					p.C("    }\n");
+					p.C("    vec3 halfVec = toLight + viewDir;\n");
+					p.C("    float halfInvLen = inversesqrt(dot(halfVec, halfVec));\n");
+					p.C("    ldot = pspPow(dot(halfVec, worldnormal) * halfInvLen, u_matspecular.a);\n");
 					p.C("    if (ldot > 0.0)\n");
 					p.F("      lightSum1 += u_lightspecular%s * specularColor * ldot %s;\n", iStr, timesLightScale);
 					p.C("  }\n");
@@ -851,9 +881,31 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 						snprintf(ls0Str, sizeof(ls0Str), "%d", ls0);
 						snprintf(ls1Str, sizeof(ls1Str), "%d", ls1);
 					}
-					std::string lightFactor0 = StringFromFormat("(length(u_lightpos%s) == 0.0 ? worldnormal.z : dot(normalize(u_lightpos%s), worldnormal))", ls0Str, ls0Str);
-					std::string lightFactor1 = StringFromFormat("(length(u_lightpos%s) == 0.0 ? worldnormal.z : dot(normalize(u_lightpos%s), worldnormal))", ls1Str, ls1Str);
-					WRITE(p, "  %sv_texcoord = vec3(u_uvscaleoffset.xy * vec2(1.0 + %s, 1.0 + %s) * 0.5, 1.0);\n", compat.vsOutPrefix, lightFactor0.c_str(), lightFactor1.c_str());
+					// N.L with L the light vector as lighting sees it (zero stays zero), or the half vector
+					// if the light does specular. Whether lighting or the light is on doesn't matter.
+					auto shadeLight = [&](int ls, const char *lsStr, const char *name) {
+						if (shadeUberShader) {
+							p.F("  vec3 %s = u_lightpos%s;\n", name, lsStr);
+							p.F("  if (((u_lightControl >> 0x%02xu) & 0x3u) != 0x0u) %s = u_lightpos%s - worldpos;\n", 4 + 4 * ls + 2, name, lsStr);
+							p.F("  %s = normalizeOr000(%s);\n", name, name);
+							p.F("  if (((u_lightControl >> 0x%02xu) & 0x3u) == 0x1u) %s = normalizeOr000(%s + viewDir);\n", 4 + 4 * ls, name, name);
+							return;
+						}
+						GELightType type = static_cast<GELightType>(id.Bits(VS_BIT_LIGHT0_TYPE + 4 * ls, 2));
+						GELightComputation comp = static_cast<GELightComputation>(id.Bits(VS_BIT_LIGHT0_COMP + 4 * ls, 2));
+						if (type == GE_LIGHTTYPE_DIRECTIONAL) {
+							// Prenormalized.
+							p.F("  vec3 %s = u_lightpos%s;\n", name, lsStr);
+						} else {
+							p.F("  vec3 %s = normalizeOr000(u_lightpos%s - worldpos);\n", name, lsStr);
+						}
+						if (comp == GE_LIGHTCOMP_BOTH) {
+							p.F("  %s = normalizeOr000(%s + viewDir);\n", name, name);
+						}
+					};
+					shadeLight(ls0, ls0Str, "shadeL0");
+					shadeLight(ls1, ls1Str, "shadeL1");
+					WRITE(p, "  %sv_texcoord = vec3(u_uvscaleoffset.xy * vec2(1.0 + dot(shadeL0, worldnormal), 1.0 + dot(shadeL1, worldnormal)) * 0.5, 1.0);\n", compat.vsOutPrefix);
 				}
 				break;
 
@@ -904,6 +956,17 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		WRITE(p, "  %sgl_ClipDistance%s = u_minZmaxZ.y < 65535.0 ? (u_minZmaxZ.y - clipZFar) * outPos.w : 1.0;\n", compat.vsOutPrefix, maxZClipPlaneSuffix);
 	}
 
+	// Snap screen Z to 1/8 and W to 16 significant bits. Hardware and software transform (which
+	// does the matrices on the CPU) differ by a few ulps here, which is enough to fail an
+	// equal-depth GEQUAL test when a frame mixes the two, as with draws that cross the near plane
+	// on GPUs without cull distances (DBZ Tenkaichi Tag Team's outlines, Naruto's grass). This is
+	// for the two to agree, not PSP behavior. Z steps of a whole unit break decals (Star Wars Lethal
+	// Alliance).
+	WRITE(p, "  outPos.z = floor(outPos.z * 8.0 + 0.5) * 0.125;\n");
+	if (compat.bitwiseOps) {
+		WRITE(p, "  outPos.w = uintBitsToFloat((floatBitsToUint(outPos.w) + 128u) & 4294967040u);\n");
+	}
+
 	// Convert to NDC space, using the framebuffer offset and (inverse size * 2) stored in u_xywh.
 	WRITE(p, "  outPos.xy = (((outPos.xy + u_xywh.xy) * u_xywh.zw) - vec2(1.0, 1.0)) * outPos.w;\n");
 
@@ -911,6 +974,13 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 		// Actually 15-bit. Truncate here fixes Afterburner (similarly to the min/max clipping above).
 		// Possibly this should only be 15-bit in transformed mode? Full 16 in through? needs hardware testing.
 		WRITE(p, "  outPos.z = floor(outPos.z * 0.5) * 2.0;\n");
+	}
+
+	if (fsDepthClamp) {
+		// After the rounding, so the fragment shader clamps the Z that hardware depth clamp would. With fsMinmaxDiscard
+		// too, this replaces its unrounded Z: the same for the max side, which rounds down anyway, and up to 2 off for
+		// the min one, which only meets the clamp when max is 65535.
+		WRITE(p, "  %sv_zw = vec2(outPos.z * outPos.w, outPos.w);\n", compat.vsOutPrefix);
 	}
 
 	// It seems that depth values of 65535.6 should survive. Seen in NBA2K12 for example.
@@ -939,10 +1009,12 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 	WRITE(p, "  %sgl_Position = outPos;\n", compat.vsOutPrefix);
 
 	if (gstate_c.Use(GPU_USE_VIRTUAL_REALITY)) {
+#ifndef __LIBRETRO__
 		// Z correction for the depth buffer
 		if (useHWTransform) {
 			WRITE(p, "  %sgl_Position.z = orgPos.z / abs(orgPos.w) * abs(outPos.w);\n", compat.vsOutPrefix);
 		}
+#endif
 
 		// HUD scaling
 		WRITE(p, "  %sgl_Position.x *= u_scaleX;\n", compat.vsOutPrefix);
@@ -950,9 +1022,14 @@ bool GenerateVertexShader(const VShaderID &id, char *buffer, const ShaderLanguag
 	}
 
 	if (fsDepthClamp) {
-		// Overwrite Z with a value that will not be clipped.
+		// Overwrite Z with a value that only the near plane clips.
 		// Then we will overwrite the Z in the fragment shader with the per-pixel value computed from the interpolated v_zw.
-		WRITE(p, "  %sgl_Position.z = (u_minZmaxZ.x + u_minZmaxZ.y) * (0.5 / 65536.0) * outPos.w;\n", compat.vsOutPrefix);
+		if (useHWTransform) {
+			WRITE(p, "  %sgl_Position.z = nearPlaneZ;\n", compat.vsOutPrefix);
+		} else {
+			// Software transform has clipped against the near plane already.
+			WRITE(p, "  %sgl_Position.z = (u_minZmaxZ.x + u_minZmaxZ.y) * (0.5 / 65536.0) * outPos.w;\n", compat.vsOutPrefix);
+		}
 	}
 
 	if (compat.depthMinusOneToOne) {

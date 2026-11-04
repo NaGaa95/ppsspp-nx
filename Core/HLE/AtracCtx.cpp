@@ -32,6 +32,11 @@
 
 const size_t overAllocBytes = 16384;
 
+// A decode reads a whole frame from any offset within the file, so the slack must cover one.
+static u32 DataBufSize(const Track &track) {
+	return track.fileSize + std::max((u32)overAllocBytes, (u32)track.bytesPerFrame);
+}
+
 Atrac::~Atrac() {
 	ResetData();
 }
@@ -72,10 +77,16 @@ void Atrac::DoState(PointerWrap &p) {
 	Do(p, hasDataBuf);
 	if (hasDataBuf) {
 		if (p.mode == p.MODE_READ) {
+			// Straight from the file, and it sizes the buffer.
+			if (!p.CheckRead(track_.fileSize) || first_.size > track_.fileSize) {
+				ERROR_LOG(Log::SaveState, "Atrac: bad file size %d (first buffer %d) in savestate", track_.fileSize, first_.size);
+				p.SetError(p.ERROR_FAILURE);
+				return;
+			}
 			if (dataBuf_)
 				delete[] dataBuf_;
-			dataBuf_ = new u8[track_.fileSize + overAllocBytes];
-			memset(dataBuf_, 0, track_.fileSize + overAllocBytes);
+			dataBuf_ = new u8[DataBufSize(track_)];
+			memset(dataBuf_, 0, DataBufSize(track_));
 		}
 		DoArray(p, dataBuf_, track_.fileSize);
 	}
@@ -141,7 +152,7 @@ void Atrac::DoState(PointerWrap &p) {
 
 	// Make sure to do this late; it depends on track parameters.
 	if (p.mode == p.MODE_READ && bufferState_ != ATRAC_STATUS_NO_DATA) {
-		CreateDecoder(track_.codecType, track_.bytesPerFrame, track_.channels);
+		CreateDecoder(track_.codecType, track_.bytesPerFrame, track_.channels, track_.jointStereo != 0);
 	}
 
 	if (s >= 2 && s < 9) {
@@ -283,8 +294,11 @@ void Atrac::CalculateStreamInfo(u32 *outReadOffset) {
 			}
 		}
 
-		if (readOffset + first_.writableBytes > track_.fileSize) {
-			// Never ask for past the end of file, even when the space is free.
+		// Never ask for past the end of file, even when the space is free. A crafted loop start
+		// can put readOffset past the end, so check that before subtracting.
+		if (readOffset >= track_.fileSize) {
+			first_.writableBytes = 0;
+		} else if (first_.writableBytes > track_.fileSize - readOffset) {
 			first_.writableBytes = track_.fileSize - readOffset;
 		}
 
@@ -301,26 +315,27 @@ void Atrac::CalculateStreamInfo(u32 *outReadOffset) {
 	}
 }
 
-void AtracBase::CreateDecoder(int codecType, int bytesPerFrame, int channels) {
+void AtracBase::CreateDecoder(int codecType, int bytesPerFrame, int channels, bool jointStereo) {
 	if (decoder_) {
 		delete decoder_;
 	}
 
 	// First, init the standalone decoder.
 	if (codecType == PSP_CODEC_AT3) {
-		// TODO: This is maybe not entirely reliable? Mui Mui house in LocoRoco 2 fails. Although also fails
-		// when I override this, so maybe the issue is something different...
-		bool jointStereo = IsAtrac3StreamJointStereo(codecType, bytesPerFrame, channels);
-
-		// We don't pull this from the RIFF so that we can support OMA also.
+		// The layout comes from the frame size and the joint stereo flag, as on hardware. A mono
+		// decoder still fills both output channels when the track says stereo.
+		int decoderChannels = channels;
+		if (!Atrac3DecoderChannels(bytesPerFrame, jointStereo, &decoderChannels)) {
+			WARN_LOG(Log::ME, "Atrac3: %d-byte frames with joint stereo %d aren't in libatrac3plus's table, decoding as %d channels", bytesPerFrame, (int)jointStereo, channels);
+		}
+		// Built here rather than taken from the RIFF, so that OMA works too.
 		uint8_t extraData[14]{};
-		// The only thing that changes are the jointStereo_ values.
 		extraData[0] = 1;
-		extraData[3] = channels << 3;
+		extraData[3] = decoderChannels << 3;
 		extraData[6] = jointStereo;
 		extraData[8] = jointStereo;
 		extraData[10] = 1;
-		decoder_ = CreateAtrac3Audio(channels, bytesPerFrame, extraData, sizeof(extraData));
+		decoder_ = CreateAtrac3Audio(decoderChannels, bytesPerFrame, extraData, sizeof(extraData));
 	} else {
 		decoder_ = CreateAtrac3PlusAudio(channels, bytesPerFrame);
 	}
@@ -459,13 +474,13 @@ int Atrac::SetData(const Track &track, u32 buffer, u32 readSize, u32 bufferSize,
 	// Over-allocate databuf to prevent going off the end if the bitstream is bad or if there are
 	// bugs in the decoder. This happens, see issue #15788. Arbitrary, but let's make it a whole page on the popular
 	// architecture that has the largest pages (M1).
-	dataBuf_ = new u8[track_.fileSize + overAllocBytes];
-	memset(dataBuf_, 0, track_.fileSize + overAllocBytes);
+	dataBuf_ = new u8[DataBufSize(track_)];
+	memset(dataBuf_, 0, DataBufSize(track_));
 	if (!ignoreDataBuf_) {
 		u32 copybytes = std::min(bufferSize, track_.fileSize);
 		Memory::Memcpy(dataBuf_, buffer, copybytes, "AtracSetData");
 	}
-	CreateDecoder(track.codecType, track.bytesPerFrame, track.channels);
+	CreateDecoder(track.codecType, track.bytesPerFrame, track.channels, track.jointStereo != 0);
 	INFO_LOG(Log::Atrac, "Atrac::SetData (buffer=%08x, readSize=%d, bufferSize=%d): %s %s (%d channels) audio", buffer, readSize, bufferSize, codecName, channelName, track_.channels);
 	INFO_LOG(Log::Atrac, "BufferState: %s", AtracStatusToString(bufferState_));
 	INFO_LOG(Log::Atrac,
@@ -551,10 +566,8 @@ int Atrac::AddStreamData(u32 bytesToAdd) {
 
 	if (bytesToAdd > 0) {
 		first_.fileoffset = readOffset;
-		int addbytes = std::min(bytesToAdd, track_.fileSize - first_.fileoffset);
-		if (!ignoreDataBuf_) {
-			Memory::Memcpy(dataBuf_ + first_.fileoffset, first_.addr + first_.offset, addbytes, "AtracAddStreamData");
-		}
+		u32 addbytes = readOffset < track_.fileSize ? std::min(bytesToAdd, track_.fileSize - readOffset) : 0;
+		CopyToDataBuf(first_.fileoffset, first_.addr + first_.offset, addbytes, "AtracAddStreamData");
 		first_.fileoffset += addbytes;
 	}
 	first_.size += bytesToAdd;
@@ -628,7 +641,8 @@ void Atrac::SeekToSample(int sample) {
 		const u32 backfill = track_.bytesPerFrame * 2;
 		const u32 start = off - track_.dataByteOffset < backfill ? track_.dataByteOffset : off - backfill;
 
-		for (u32 pos = start; pos < off; pos += track_.bytesPerFrame) {
+		// The loop start can be past the end of the file, so don't read beyond it.
+		for (u32 pos = start; pos < off && pos < track_.fileSize; pos += track_.bytesPerFrame) {
 			decoder_->Decode(BufferStart() + pos, track_.bytesPerFrame, nullptr, 2, nullptr, nullptr);
 		}
 	}
@@ -869,9 +883,7 @@ int Atrac::ResetPlayPosition(int sample, int bytesWrittenFirstBuf, int bytesWrit
 	} else if (bufferState_ == ATRAC_STATUS_HALFWAY_BUFFER) {
 		// Okay, it's a valid number of bytes.  Let's set them up.
 		if (bytesWrittenFirstBuf != 0) {
-			if (!ignoreDataBuf_) {
-				Memory::Memcpy(dataBuf_ + first_.size, first_.addr + first_.size, bytesWrittenFirstBuf, "AtracResetPlayPosition");
-			}
+			CopyToDataBuf(first_.size, first_.addr + first_.size, bytesWrittenFirstBuf, "AtracResetPlayPosition");
 			first_.fileoffset += bytesWrittenFirstBuf;
 			first_.size += bytesWrittenFirstBuf;
 			first_.offset += bytesWrittenFirstBuf;
@@ -893,9 +905,7 @@ int Atrac::ResetPlayPosition(int sample, int bytesWrittenFirstBuf, int bytesWrit
 		first_.fileoffset = bufferInfo.first.filePos;
 
 		if (bytesWrittenFirstBuf != 0) {
-			if (!ignoreDataBuf_) {
-				Memory::Memcpy(dataBuf_ + first_.fileoffset, first_.addr, bytesWrittenFirstBuf, "AtracResetPlayPosition");
-			}
+			CopyToDataBuf(first_.fileoffset, first_.addr, bytesWrittenFirstBuf, "AtracResetPlayPosition");
 			first_.fileoffset += bytesWrittenFirstBuf;
 		}
 		first_.size = first_.fileoffset;
@@ -942,7 +952,7 @@ void Atrac::InitLowLevel(const Atrac3LowLevelParams &params, int codecType) {
 	track_.fileSize = track_.bytesPerFrame;  // not really meaningful
 	bufferState_ = ATRAC_STATUS_LOW_LEVEL;
 	currentSample_ = 0;
-	CreateDecoder(codecType, track_.bytesPerFrame, track_.channels);
+	CreateDecoder(codecType, track_.bytesPerFrame, track_.channels, track_.jointStereo != 0);
 	WriteContextToPSPMem();
 }
 
@@ -953,6 +963,16 @@ int Atrac::DecodeLowLevel(const u8 *srcData, int *bytesConsumed, s16 *dstData, i
 	*bytesWritten = outSamples * channels * sizeof(int16_t);
 	// TODO: Possibly return a decode error on bad data.
 	return 0;
+}
+
+// dataBuf_ mirrors the file, so a copy into it can't go past the end of the file, whatever offset
+// and size the guest's stream info led to.
+void Atrac::CopyToDataBuf(u32 fileOffset, u32 srcAddr, u32 size, const char *tag) {
+	if (ignoreDataBuf_ || !dataBuf_ || fileOffset >= track_.fileSize) {
+		return;
+	}
+	size = std::min(size, track_.fileSize - fileOffset);
+	Memory::Memcpy(dataBuf_ + fileOffset, srcAddr, size, tag, strlen(tag));
 }
 
 void Atrac::CheckForSas() {

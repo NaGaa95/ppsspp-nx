@@ -131,10 +131,7 @@ void DrawEngineGLES::ApplyDrawState(int prim) {
 
 	if (gstate_c.IsDirty(DIRTY_BLEND_STATE)) {
 		if (gstate.isModeClear()) {
-			// Color Test
-			bool colorMask = gstate.isClearModeColorMask();
-			bool alphaMask = gstate.isClearModeAlphaMask();
-			renderManager->SetNoBlendAndMask((colorMask ? 7 : 0) | (alphaMask ? 8 : 0));
+			renderManager->SetNoBlendAndMask(ClearModeChannelMask());
 		} else {
 			pipelineState_.Convert(draw_->GetShaderLanguageDesc().bitwiseOps, gstate_c.Use(GPU_USE_SHADER_BLENDING));
 			GenericMaskState &maskState = pipelineState_.maskState;
@@ -151,7 +148,7 @@ void DrawEngineGLES::ApplyDrawState(int prim) {
 				// fboTexNeedsBind_ won't be set if we can read directly from the target.
 				if (fboTexBindState == FBO_TEX_COPY_BIND_TEX) {
 					// Note that this is positions, not UVs, that we need the copy from.
-					framebufferManager_->BindFramebufferAsColorTexture(1, framebufferManager_->GetCurrentRenderVFB(), BINDFBCOLOR_MAY_COPY | BINDFBCOLOR_UNCACHED, 0);
+					framebufferManager_->BindFramebufferAsColorTexture(1, framebufferManager_->GetCurrentRenderVFB(), ShaderReadBindFlags(), 0);
 					// If we are rendering at a higher resolution, linear is probably best for the dest color.
 					renderManager->SetTextureSampler(1, GL_CLAMP_TO_EDGE, GL_CLAMP_TO_EDGE, GL_LINEAR, GL_LINEAR, 0.0f);
 					fboTexBound_ = true;
@@ -183,9 +180,8 @@ void DrawEngineGLES::ApplyDrawState(int prim) {
 					gstate_c.Dirty(DIRTY_SHADERBLEND);
 				}
 				if (blendState.useBlendColor) {
-					uint32_t color = blendState.blendColor;
 					float col[4];
-					Uint8x4ToFloat4(col, color);
+					blendState.blendColorToFloat4(col);
 					renderManager->SetBlendFactor(col);
 				}
 			}

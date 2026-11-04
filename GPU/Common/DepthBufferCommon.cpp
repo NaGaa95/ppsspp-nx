@@ -54,11 +54,17 @@ static const VaryingDef varyings[] = {
 };
 
 void GenerateDepthDownloadFs(ShaderWriter &writer) {
+	// 24 bits of depth need full precision, through the sampler too (GLES samplers default to lowp).
+	writer.HighPrecisionFloat();
+	if (ShaderLanguageIsOpenGL(writer.Lang().shaderLanguage) && writer.Lang().gles) {
+		writer.C("precision highp sampler2D;\n");
+	}
 	writer.DeclareSamplers(samplers);
 	writer.BeginFSMain(depthUniforms, varyings);
 	writer.C("  float depth = ").SampleTexture2D("tex", "v_texcoord").C(".r;\n");
-	// At this point, clamped maps [0, 1] to [0, 65535].
-	writer.C("  float clamped = clamp(depth, 0.0, 1.0);\n");
+	// Depth is stored as z / 65536 (clears as z / 65535), so the PSP's z is the top 16 of 24 bits of
+	// depth * 2^24. Clamp just below 1.0 so a cleared 65535 doesn't wrap to 0.
+	writer.C("  float clamped = clamp(depth, 0.0, 16777215.0 / 16777216.0);\n");
 	writer.C("  vec4 enc = u_depthShift * clamped;\n");
 	writer.C("  enc = floor(mod(enc, 256.0)) * u_depthTo8;\n");
 	writer.C("  vec4 outColor = enc.yzww;\n"); // Let's ignore the bits outside 16 bit precision.
@@ -183,6 +189,7 @@ bool FramebufferManagerCommon::ReadbackDepthbuffer(Draw::Framebuffer *fbo, int x
 
 	bool useColorPath = gl_extensions.IsGLES || scaleX != 1.0f || scaleY != 1.0f;
 	bool format16Bit = false;
+	bool copied = false;
 
 	if (useColorPath) {
 		if (!depthReadbackPipeline_) {
@@ -199,7 +206,9 @@ bool FramebufferManagerCommon::ReadbackDepthbuffer(Draw::Framebuffer *fbo, int x
 
 		auto *blitFBO = GetTempFBO(TempFBO::Z_COPY, fbo->Width() * scaleX, fbo->Height() * scaleY);
 		draw_->BindFramebufferAsRenderTarget(blitFBO, { RPAction::DONT_CARE, RPAction::DONT_CARE, RPAction::DONT_CARE }, "ReadbackDepthbufferSync");
-		Draw::Viewport viewport = { 0.0f, 0.0f, (float)destW, (float)destH, 0.0f, 1.0f };
+		// The whole fbo is drawn, so the viewport has to cover all of it at the destination scale. Not just
+		// destW x destH, which would squeeze it whenever the read rectangle is smaller than the fbo.
+		Draw::Viewport viewport = { 0.0f, 0.0f, fbo->Width() * scaleX, fbo->Height() * scaleY, 0.0f, 1.0f };
 		draw_->SetViewport(viewport);
 		draw_->SetScissorRect(0, 0, fbo->Width() * scaleX, fbo->Height() * scaleY);
 
@@ -212,7 +221,7 @@ bool FramebufferManagerCommon::ReadbackDepthbuffer(Draw::Framebuffer *fbo, int x
 		DepthUB ub{};
 
 		// These are for packing a float in u8x4 colors. We should support more suitable readback formats on APIs that can do it.
-		static constexpr float shifts[] = { 16777215.0f, 16777215.0f / 256.0f, 16777215.0f / 65536.0f, 16777215.0f / 16777216.0f };
+		static constexpr float shifts[] = { 16777216.0f, 65536.0f, 256.0f, 1.0f };
 		memcpy(ub.u_depthShift, shifts, sizeof(shifts));
 		static constexpr float to8[] = { 1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f, 1.0f / 255.0f };
 		memcpy(ub.u_depthTo8, to8, sizeof(to8));
@@ -227,7 +236,7 @@ bool FramebufferManagerCommon::ReadbackDepthbuffer(Draw::Framebuffer *fbo, int x
 		};
 		draw_->DrawUP(positions, 3);
 
-		draw_->CopyFramebufferToMemory(blitFBO, Aspect::COLOR_BIT,
+		copied = draw_->CopyFramebufferToMemory(blitFBO, Aspect::COLOR_BIT,
 			x * scaleX, y * scaleY, w * scaleX, h * scaleY,
 			DataFormat::R8G8B8A8_UNORM, convBuf_, destW, mode, "ReadbackDepthbufferSync");
 
@@ -235,8 +244,14 @@ bool FramebufferManagerCommon::ReadbackDepthbuffer(Draw::Framebuffer *fbo, int x
 		// TODO: Use 4444 (or better, R16_UNORM) so we can copy lines directly (instead of 32 -> 16 on CPU)?
 		format16Bit = true;
 	} else {
-		draw_->CopyFramebufferToMemory(fbo, Aspect::DEPTH_BIT, x, y, w, h, DataFormat::D32F, convBuf_, w, mode, "ReadbackDepthbufferSync");
+		copied = draw_->CopyFramebufferToMemory(fbo, Aspect::DEPTH_BIT, x, y, w, h, DataFormat::D32F, convBuf_, w, mode, "ReadbackDepthbufferSync");
 		format16Bit = false;
+	}
+
+	if (!copied) {
+		// Don't write whatever convBuf_ last held into the game's depth buffer.
+		gstate_c.Dirty(DIRTY_ALL_RENDER_STATE);
+		return false;
 	}
 
 	// TODO: Move this conversion into the backends.
@@ -259,7 +274,8 @@ bool FramebufferManagerCommon::ReadbackDepthbuffer(Draw::Framebuffer *fbo, int x
 		const float *packedf = (float *)convBuf_;
 		for (int yp = 0; yp < destH; ++yp) {
 			for (int xp = 0; xp < destW; ++xp) {
-				dest[xp] = (u16)std::clamp(65535.0f * packedf[xp], 0.0f, 65535.0f);
+				// Depth is stored as z / 65536 (clears as z / 65535), and the PSP truncates.
+				dest[xp] = (u16)std::clamp(65536.0f * packedf[xp], 0.0f, 65535.0f);
 			}
 			dest += pixelsStride;
 			packedf += destW;

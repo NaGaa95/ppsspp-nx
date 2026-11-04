@@ -54,7 +54,6 @@
       <Filter>Serialize</Filter>
     </ClInclude>
     <ClInclude Include="TimeUtil.h" />
-    <ClInclude Include="FakeEmitter.h" />
     <ClInclude Include="SysError.h" />
     <ClInclude Include="..\ext\libpng17\png.h">
       <Filter>ext\libpng17</Filter>
@@ -305,6 +304,9 @@
     <ClInclude Include="GPU\Vulkan\VulkanContext.h">
       <Filter>GPU\Vulkan</Filter>
     </ClInclude>
+    <ClInclude Include="GPU\Vulkan\FixedSPIRVCache.h">
+      <Filter>GPU\Vulkan</Filter>
+    </ClInclude>
     <ClInclude Include="GPU\Vulkan\VulkanDebug.h">
       <Filter>GPU\Vulkan</Filter>
     </ClInclude>
@@ -336,9 +338,6 @@
       <Filter>Data\Collections</Filter>
     </ClInclude>
     <ClInclude Include="Data\Collections\Hashmaps.h">
-      <Filter>Data\Collections</Filter>
-    </ClInclude>
-    <ClInclude Include="Data\Collections\ThreadSafeList.h">
       <Filter>Data\Collections</Filter>
     </ClInclude>
     <ClInclude Include="GPU\Shader.h">
@@ -518,9 +517,6 @@
     <ClInclude Include="Math\CrossSIMD.h">
       <Filter>Math</Filter>
     </ClInclude>
-    <ClInclude Include="..\ext\minimp3\minimp3.h">
-      <Filter>ext\minimp3</Filter>
-    </ClInclude>
     <ClInclude Include="..\ext\at3_standalone\atrac3data.h">
       <Filter>ext\at3_standalone</Filter>
     </ClInclude>
@@ -695,8 +691,14 @@
     <ClInclude Include="Audio\AudioBackend.h">
       <Filter>Audio</Filter>
     </ClInclude>
+    <ClInclude Include="Audio\SampleRing.h">
+      <Filter>Audio</Filter>
+    </ClInclude>
     <ClInclude Include="LoongArch64Emitter.h" />
     <ClInclude Include="Render\AtlasGen.h">
+      <Filter>Render</Filter>
+    </ClInclude>
+    <ClInclude Include="Render\DropShadow.h">
       <Filter>Render</Filter>
     </ClInclude>
     <ClInclude Include="..\ext\nanosvg\src\nanosvg.h">
@@ -730,6 +732,45 @@
       <Filter>ext\aemu_postoffice</Filter>
     </ClInclude>
     <ClInclude Include="..\ext\aemu_postoffice\client\sock_impl.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\client\list.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\client\enet.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\adhocctl\client\adhocctl.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\adhocctl\client\adhocctl_mem.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\server_cpp\server.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\server_cpp\session.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\server_cpp\semaphore.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\server_cpp\log.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\server_cpp\common.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\server_cpp\enet.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\server_cpp\snapshot.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\server_cpp\native_socket.h">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClInclude>
+    <ClInclude Include="..\ext\aemu_postoffice\server_cpp\config.h">
       <Filter>ext\aemu_postoffice</Filter>
     </ClInclude>
     <ClInclude Include="UI\Notice.h">
@@ -803,6 +844,12 @@
     </ClInclude>
     <ClInclude Include="UI\ScreenManager.h">
       <Filter>UI</Filter>
+    </ClInclude>
+    <ClInclude Include="Render\DrawEnum.h">
+      <Filter>Render</Filter>
+    </ClInclude>
+    <ClInclude Include="GPU\Vulkan\VulkanDriverVars.h">
+      <Filter>GPU\Vulkan</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
@@ -1249,9 +1296,6 @@
     <ClCompile Include="GPU\Vulkan\VulkanDescSet.cpp">
       <Filter>GPU\Vulkan</Filter>
     </ClCompile>
-    <ClCompile Include="..\ext\minimp3\minimp3.cpp">
-      <Filter>ext\minimp3</Filter>
-    </ClCompile>
     <ClCompile Include="..\ext\at3_standalone\atrac3.cpp">
       <Filter>ext\at3_standalone</Filter>
     </ClCompile>
@@ -1409,6 +1453,9 @@
     <ClCompile Include="Render\AtlasGen.cpp">
       <Filter>Render</Filter>
     </ClCompile>
+    <ClCompile Include="Render\DropShadow.cpp">
+      <Filter>Render</Filter>
+    </ClCompile>
     <ClCompile Include="UI\TabHolder.cpp">
       <Filter>UI</Filter>
     </ClCompile>
@@ -1428,6 +1475,42 @@
       <Filter>ext\aemu_postoffice</Filter>
     </ClCompile>
     <ClCompile Include="..\ext\aemu_postoffice\client\sock_impl_windows.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\client\list.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\client\enet.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\adhocctl\client\adhocctl.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\adhocctl\client\adhocctl_mem.c">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\server_cpp\server.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\server_cpp\session.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\server_cpp\semaphore.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\server_cpp\log.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\server_cpp\common.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\server_cpp\enet.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\server_cpp\snapshot.cpp">
+      <Filter>ext\aemu_postoffice</Filter>
+    </ClCompile>
+    <ClCompile Include="..\ext\aemu_postoffice\server_cpp\native_socket_windows.cpp">
       <Filter>ext\aemu_postoffice</Filter>
     </ClCompile>
     <ClCompile Include="UI\Notice.cpp">
@@ -1590,9 +1673,6 @@
     </Filter>
     <Filter Include="ext\libchdr">
       <UniqueIdentifier>{b681797d-7747-487f-b448-5ef5b2d2805b}</UniqueIdentifier>
-    </Filter>
-    <Filter Include="ext\minimp3">
-      <UniqueIdentifier>{83cd76d0-d1ac-4ed1-9bdc-11fb5a20e5d3}</UniqueIdentifier>
     </Filter>
     <Filter Include="ext\at3_standalone">
       <UniqueIdentifier>{586da66e-922a-4479-9dac-9d608a1b9183}</UniqueIdentifier>

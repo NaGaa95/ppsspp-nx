@@ -91,7 +91,6 @@ void DrawEngineGLES::InitDeviceObjects() {
 	entries.push_back({ ATTR_NORMAL, 1, GL_FLOAT, GL_FALSE, offsetof(TransformedVertex, fog) });
 	softwareInputLayout_ = render_->CreateInputLayout(entries, stride);
 
-	draw_->SetInvalidationCallback(std::bind(&DrawEngineGLES::Invalidate, this, std::placeholders::_1));
 }
 
 void DrawEngineGLES::DestroyDeviceObjects() {
@@ -99,6 +98,7 @@ void DrawEngineGLES::DestroyDeviceObjects() {
 		return;
 	}
 	draw_->SetInvalidationCallback(InvalidationCallback());
+	invalidationCallbackInstalled_ = false;
 
 	// Beware: this could be called twice in a row, sometimes.
 	for (int i = 0; i < GLRenderManager::MAX_INFLIGHT_FRAMES; i++) {
@@ -129,6 +129,10 @@ void DrawEngineGLES::ClearInputLayoutMap() {
 
 void DrawEngineGLES::BeginFrame() {
 	DrawEngineCommon::BeginFrame();
+	if (!invalidationCallbackInstalled_) {
+		draw_->SetInvalidationCallback(std::bind(&DrawEngineGLES::Invalidate, this, std::placeholders::_1));
+		invalidationCallbackInstalled_ = true;
+	}
 
 	FrameData &frameData = frameData_[render_->GetCurFrame()];
 	frameData.pushIndex->Begin();
@@ -229,6 +233,8 @@ void DrawEngineGLES::Flush() {
 		numDrawVerts_ = 0;
 		numDrawInds_ = 0;
 		vertexCountInDrawCalls_ = 0;
+		expandedVertsInDrawCalls_ = 0;
+		numVertsToDecode_ = 0;
 		decodeVertsCounter_ = 0;
 		decodeIndsCounter_ = 0;
 		return;
@@ -395,6 +401,7 @@ void DrawEngineGLES::Flush() {
 		params.allowClear = true;  // Clear in OpenGL respects scissor rects, so we'll use it.
 		params.allowSeparateAlphaClear = true;
 		params.clipInfoFlags = clipInfoFlags_;
+		params.trianglesReversed = BatchTrianglesReversed();
 
 		const SoftwareTransformAction action = RunSoftwareTransform(params, prim, dec_->VertexType(), dec_->GetDecVtxFmt(), numDecodedVerts_, VERTEX_BUFFER_MAX, vertexCount, inds, RemainingIndices(inds), &result);
 		if (textureNeedsApply) {

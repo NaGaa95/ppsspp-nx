@@ -17,6 +17,10 @@ You need this whenever the answer to "what does the hardware actually do?" isn't
   On macOS it lives in `~/pspdev` by default and is *not* on `PATH`, so prefix commands with
   `PATH="$HOME/pspdev/bin:$PATH"` or export it once per shell. On macOS you also need
   `brew install libusb-compat`; on Windows, the libusbK driver via Zadig.
+- **On Windows, all of it runs in WSL**, not in Git Bash or PowerShell: the toolchain is in WSL's
+  `~/pspdev`, and the PSP is passed through to WSL with usbipd-win (see "Under WSL" below). Run
+  `gentest.py`, `pspsh` and `make` with `wsl.exe bash -lc '...'` from the repo's `/mnt/c/...` path.
+  `usbipd.exe list` on the Windows side shows whether the PSP ("PSP Type B") is attached to WSL.
 
 Ask the user to connect the PSP and start PSPLink - you can't do it for them. To confirm it's
 there before touching anything else:
@@ -39,6 +43,12 @@ ioreg -p IOUSB -l -w 0 | grep -i "USB Product Name"     # macOS; want "PSP Type 
 - **`gentest.py`** builds a test, runs it through `pspsh`, waits for it to finish and copies the
   output over the `.expected` file. It starts `usbhostfs_pc` itself if the port isn't already open.
 
+**One PSP, one test at a time.** Never start a second `gentest.py` or `pspsh` while one is still
+running, and that includes an agent issuing several as parallel tool calls. They share the one
+PSPLink session and the output files in `host0:/`, so they collide: tests that pass alone "time out
+after 10 seconds", or the PSP hangs. Re-recording a directory means running its tests one after
+another.
+
 Bringing it up, once, from the repo root:
 
 ```bash
@@ -51,6 +61,12 @@ pspsh -p 3000 -e ls                 # sanity check - should list the pspautotest
 
 If `ls` shows `host0:/` contents you have a working chain. If it hangs or shows nothing, PSPLink
 isn't running or the USB driver didn't bind.
+
+**Under WSL** the PSP first has to be passed through from Windows with usbipd-win (steps 10-12 of
+<https://pspdev.github.io/psplink/windows.html>). `Tools/psplink_wsl.sh` does that and then starts
+`usbhostfs_pc` in the current directory, so run it from `pspautotests` in place of the
+`usbhostfs_pc` line above. It asks for a UAC prompt the first time the PSP is shared, and re-attaches
+after a PSPLink reset or a move to another USB port.
 
 ## How a test reports its results
 
@@ -141,15 +157,23 @@ python3 test.py --graphics=software io/shortname/shortname
   builds with pspdev GCC 15 as of the "Make the tests build with a current pspdev toolchain"
   commit; if you hit a broken one anyway, `gentest.py -k` (`--keep`) skips `make` entirely and
   you can build your own target by hand with `make yourtest.prx`.
-- **Rebuilding a `.prx` is not free, so don't regenerate one you didn't change.** The binaries are
-  committed and were built with a much older SDK. Rebuilding with the current toolchain grows them
-  by roughly a third (`testgp.prx`: 117 KB to 191 KB), and it can change what a test *does*:
-  `time_t` is 64-bit now, so `rtc/convert`'s `sceRtcSetTime_t(&pt, 62135596800ULL)` marshals
-  differently than the committed binary and stops matching its own `.expected`. Check
-  `git status` and revert any `.prx` you didn't mean to touch.
-- **A `.prx` you did rebuild deserves a hardware run before you commit it.** Build it, run it, and
-  diff the output against the committed `.expected` - if it differs, decide whether the test
-  genuinely changed or whether the toolchain did. Note the committed `.expected` files have CRLF
+- **When you touch one test, rebuild every `.prx` in its directory and re-record them all.** Many
+  committed binaries were built with a much older SDK, and a rebuild with the current toolchain can
+  change what a test *does*: `time_t` is 64-bit now, so `rtc/convert`'s
+  `sceRtcSetTime_t(&pt, 62135596800ULL)` marshals differently, and in `tests/intr` the SDK's
+  `ModuleMgrForUser` stubs, linked next to the directory's own import of that library, silently did
+  nothing - `waits` printed `sceKernelGetModuleId`'s result for `sceKernelStartModule`. Rebuilding
+  a whole directory at once turns such surprises up while you're there to explain them, rather
+  than one at a time whenever someone happens to touch a neighbour. So run a plain `make` in the
+  directory, record each test on hardware, and commit the binaries and `.expected` files together.
+  (The binaries also grow by roughly a third: `testgp.prx` went from 117 KB to 191 KB.)
+- **Diff every re-recorded `.expected` against the old one before committing.** A difference means
+  the test changed on purpose, the toolchain changed what it does (fix the test), or the firmware
+  did. Many old recordings are likely from a PSP on an earlier firmware than today's 6.61, and a
+  driver change or a bug fix between versions shows up regardless of `sceKernelSetCompiledSdkVersion`
+  (`intr/registersub` depends on which drivers have hooked which interrupts: interrupt 8 had a
+  handler in the old recording and has none on 6.61). Say which in the commit message, and keep
+  the 6.61 result, since that's the firmware PPSSPP models. Note the committed `.expected` files have CRLF
   line endings (they were recorded on Windows) while a fresh run writes LF, so compare with
   `diff <(tr -d '\r' < __testoutput.txt) <(tr -d '\r' < the.expected)`.
 - **Each test PRX stays resident after it runs.** Run a handful back to back and the next
@@ -161,9 +185,25 @@ python3 test.py --graphics=software io/shortname/shortname
   `1.txt` rather than `1.TXT`. Anything testing FAT semantics has to run against `ms0:` - create a
   scratch directory on the real memory stick and clean it up - and anything reading `host0:` will
   only reproduce on the OS it was recorded on.
+- **Start `usbhostfs_pc` yourself before the first `gentest.py` run in a scripted session.** When
+  `gentest.py` has to start it, the bridge inherits the script's stdout and keeps running, so
+  anything waiting for the pipe to close (`gentest.py ... | tail`, or an agent's shell tool) hangs
+  long after the `.expected` file has been written. With the port already open it returns at once.
 - **A test that hangs leaves the PSP wedged.** `gentest.py` issues `pspsh -e reset` after a
   timeout, but if you ran the PRX by hand, do that yourself. Default timeout is 10s; raise it with
   `-t SECONDS`.
+- **Bound every wait on the PSP, including the whole command.** A test that hasn't finished in 10
+  seconds is hung; a longer timeout only delays finding out which call blocks. To check whether the
+  PSP is alive, run `pspsh -p 3000 -e ls` in the background and give up after 10 seconds (macOS has
+  no `timeout` command). `gentest.py -t` doesn't cap the run either: its recovery `pspsh -e reset`
+  blocks forever if the PSP is really gone, so put a limit on the shell command as well.
+- **A PSP that doesn't answer may only need the host side restarted.** If it still enumerates over
+  USB (`ioreg -p IOUSB -l -w 0 | grep -i "USB Product Name"` shows "PSP Type B" on macOS), kill
+  `usbhostfs_pc`, start it again from the pspautotests root, and probe once more. Otherwise someone has
+  to restart PSPLink or reconnect the cable.
+- **Never let a test exit with a utility dialog still active.** A dialog left in INIT, RUNNING or
+  FINISHED keeps the utility module busy, and the next `reset` hangs PSPLink until it's restarted by
+  hand. In utility tests, bound every wait, and run a case that might not finish last and alone.
 - **`tests_to_generate` in `gentest.py`** - the list used when you pass no arguments - is stale;
   several paths in it no longer exist. Always name the test you want.
 - **`--sdkver` matters for some APIs.** `gentest.py --sdkver=6060010 --sdkver-func=606` makes the
@@ -171,6 +211,10 @@ python3 test.py --graphics=software io/shortname/shortname
   known version reporting which ones behave differently - a fast way to find version-gated
   behavior. A test can also call `sceKernelSetCompiledSdkVersion*()` mid-run to cover several
   versions in one `.expected`.
+- **On a PSP, printed output is also drawn on the screen**, into the display framebuffer. A GPU test that
+  renders into that framebuffer and prints between draws reads its own text back: each line changed the
+  alpha of a few pixels under it in the next draw, deterministically on the PSP and never in PPSSPP. Set
+  `HAS_DISPLAY = 0` (`extern "C" int HAS_DISPLAY;`, from `common.c`) after setting up the display.
 - **The module must be named `TESTMODULE`** (`common.c` does this) or `gentest.py` prints the load
   line as an unexpected result.
 
@@ -253,12 +297,53 @@ hardware preserves the original case in `d_name` (`readme.txt`) where PPSSPP upp
 uppercase 8.3 (`readme.txt` -> `README~1.TXT`, `MiXeD.txt` -> `MIXED~1.TXT`) where PPSSPP only does
 so on a collision.
 
+## Tests that need two PSPs
+
+The ad hoc tests in `tests/net/adhoc/pair` and `tests/net/inet/pair` need two consoles talking to each
+other. Each test is two programs, `X_host` and `X_client`, built from one `X.inc`, each with its own
+`.expected`. They print only relative facts ("peer", "local"), so the files don't depend on which
+console ran which side.
+
+Both PSPs are connected over USB, each with its own bridge, and the second bridge needs its own base
+port (a bridge takes 8 ports from its base, so 3001 is taken) and its own root, so the two consoles'
+`__testoutput.txt` don't collide:
+
+```bash
+cd pspautotests && usbhostfs_pc -b 3000 &
+cd pspautotests/tests && usbhostfs_pc -b 4000 . &
+```
+
+Which console each bridge claims isn't up to you, and can change after a reconnect; check with
+`pspsh -p 3000 -e pspver`. Then record both sides at once:
+
+```bash
+python3 tests/net/adhoc/pair/record.py --host-port 3000 basic
+python3 tests/net/adhoc/pair/record.py --host-port 3000 net/inet/pair/lan
+```
+
+This is the one case where two test programs run at once - one per console, never two on one PSP.
+Things learned the hard way:
+
+- **Sync the two sides, don't sleep.** `pair.h` has `pairSync(step)`, which exchanges step numbers over a
+  PDP port until both sides have reached the same point. Anything that depends on how fast the other
+  side gets somewhere is a flaky test.
+- **Print buckets, not counts or times.** Radio loss and timing vary: print "45 or more of 50", "1-2s".
+- **Run each pair test twice** and diff the results before believing them.
+- **make doesn't track `.inc` and header dependencies by itself**; the Makefiles here add them. Without
+  that, a change to `pair.h` silently runs the old binary.
+- **Real access points need slack.** The first unicast to a new IP can be lost while ARP resolves, and a
+  weak signal stalls TCP for seconds.
+
+To run the same tests on several PPSSPP instances, see `Tools/adhoc_multi.py` and
+[pspautotests.md](pspautotests.md#multi-console-ad-hoc-tests).
+
 ## Committing
 
 `pspautotests` is a git submodule, so a new test is two commits:
 
-1. Commit and push inside `pspautotests/` (the new test directory, including the built `.prx` and
-   the generated `.expected`).
+1. Commit inside `pspautotests/` (the new test directory, including the built `.prx` and the
+   generated `.expected`), rebase it onto `origin/master`, and push it straight to `master` - no
+   branch, no PR, and no need to ask first.
 2. Commit in the PPSSPP repo, including **both** the `test.py` change and the bumped submodule
    pointer (`git add pspautotests`) - otherwise CI checks out the old submodule and the test
    doesn't exist.

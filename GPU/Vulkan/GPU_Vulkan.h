@@ -39,7 +39,7 @@ public:
 	GPU_Vulkan(GraphicsContext *gfxCtx, Draw::DrawContext *draw);
 	~GPU_Vulkan();
 
-	void FinishInitOnMainThread() override;
+	bool IsLoadingShaderCache() const override;
 
 	// This gets called on startup and when we get back from settings.
 	u32 CheckGPUFeatures() const override;

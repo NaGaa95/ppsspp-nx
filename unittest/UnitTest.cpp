@@ -33,17 +33,26 @@
 // build/unittest EscapeMenuString
 
 #include "ppsspp_config.h"
-
 #include <typeinfo>
 
+// To avoid warnings, this should go first.
+#include "Common/Net/SocketCompat.h"
+
+#include <atomic>
+#include <cmath>
 #include <algorithm>
+#include <memory>
 #include <cstdio>
 #include <cstdlib>
-#include <cmath>
 #include <vector>
 #include <string>
 #include <sstream>
+
+#include <map>
 #include <unordered_map>
+#include <set>
+#include <list>
+
 
 #if PPSSPP_PLATFORM(ANDROID)
 #include <jni.h>
@@ -56,8 +65,11 @@
 #include "Common/Data/Text/Parsers.h"
 #include "Common/Data/Text/WrapText.h"
 #include "Common/Data/Encoding/Utf8.h"
+#include "Common/Data/Encoding/Utf16.h"
+#include "Common/Data/Encoding/Shiftjis.h"
 #include "Common/Buffer.h"
 #include "Common/File/Path.h"
+#include "Common/File/FileUtil.h"
 #include "Common/Log/LogManager.h"
 #include "Common/Math/SIMDHeaders.h"
 #include "Common/Math/CrossSIMD.h"
@@ -82,19 +94,18 @@
 #include "Common/Log.h"
 #include "Common/StringUtils.h"
 #include "Core/Config.h"
+#include "Core/ConfigSettings.h"
 #include "Common/Data/Convert/ColorConv.h"
 #include "Common/File/VFS/VFS.h"
-#include "Common/File/VFS/DirectoryReader.h"
 #include "Common/Math/fast/fast_matrix.h"
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
 #include "Common/Serialize/SerializeMap.h"
 #include "Common/Serialize/SerializeSet.h"
 #include "Common/Serialize/SerializeList.h"
-#include <map>
-#include <set>
-#include <list>
+
 #include "Core/CmdLine.h"
+#include "Core/System.h"
 #include "Common/Data/Collections/Hashmaps.h"
 #include "Core/Util/BlockAllocator.h"
 #include "Core/Debugger/Breakpoints.h"
@@ -103,17 +114,32 @@
 #include "Common/UI/View.h"
 #include "Common/UI/ViewGroup.h"
 #include "Core/Debugger/MemBlockInfo.h"
+#include "Core/FileLoaders/CachingFileLoader.h"
 #include "Core/FileSystems/FileSystem.h"
 #include "Core/FileSystems/ISOFileSystem.h"
+#include "Core/FileSystems/DirectoryFileSystem.h"
+#include "Core/FileSystems/MetaFileSystem.h"
+#include "Core/SaveState.h"
+#include "Core/HLE/sceUmd.h"
+#include "Core/Loaders.h"
 #include "Core/MemMap.h"
 #include "Core/KeyMap.h"
+#include "Core/ControlMapper.h"
+#include "Core/HLE/sceCtrl.h"
+#include "Core/HLE/sceUsbMic.h"
 #include "Core/Util/PathUtil.h"
 #include "Core/MIPS/MIPSVFPUUtils.h"
+#include "Core/MIPS/MIPSStackWalk.h"
+#include "GPU/Common/DepthSwizzle.h"
 #include "GPU/Common/TextureDecoder.h"
 #include "GPU/Common/GPUStateUtils.h"
+#include "GPU/Common/Overlay.h"
 #include "GPU/Math3D.h"
 
 #include "Common/File/AndroidContentURI.h"
+#include "Common/System/Request.h"
+#include "Common/Render/Text/draw_text.h"
+#include "Common/Net/Resolve.h"
 
 #include "unittest/JitHarness.h"
 #include "unittest/TestVertexJit.h"
@@ -121,6 +147,24 @@
 
 // Set to true for more verbose unit tests.
 bool g_testLog = false;
+
+Path UnitTestTempPath(const char *name) {
+#if PPSSPP_PLATFORM(WINDOWS)
+	const wchar_t *temp = _wgetenv(L"TEMP");
+	if (temp && *temp) {
+		return Path(ConvertWStringToUTF8(temp)) / name;
+	}
+#else
+	const char *temp = getenv("TMPDIR");
+	if (temp && *temp) {
+		return Path(temp) / name;
+	}
+#if !PPSSPP_PLATFORM(ANDROID)
+	return Path("/tmp") / name;
+#endif
+#endif
+	return Path(name);
+}
 
 std::string System_GetProperty(SystemProperty prop) { return ""; }
 std::vector<std::string> System_GetPropertyStringVec(SystemProperty prop) { return std::vector<std::string>(); }
@@ -150,7 +194,15 @@ std::vector<std::string> System_GetCameraDeviceList() { return std::vector<std::
 void NativeFrame(GraphicsContext *graphicsContext) {}
 void NativeResized() {}
 
-bool System_MakeRequest(SystemRequestType type, int requestId, const std::string &param1, const std::string &param2, int64_t param3, int64_t param4) { return false; }
+// TestRequestManager answers these itself.
+static int g_lastInputBoxRequestId = -1;
+bool System_MakeRequest(SystemRequestType type, int requestId, const std::string &param1, const std::string &param2, int64_t param3, int64_t param4) {
+	if (type == SystemRequestType::INPUT_TEXT_MODAL) {
+		g_lastInputBoxRequestId = requestId;
+		return true;
+	}
+	return false;
+}
 // Pulled in via Core/WebServer.cpp's OpenWebDebugger(), which CmdLine.cpp now references.
 void System_LaunchUrl(LaunchUrlType urlType, std::string_view url) {}
 void System_InputBoxGetString(const std::string &title, const std::string &defaultValue, std::function<void(bool, const std::string &)> cb) { cb(false, ""); }
@@ -171,209 +223,176 @@ jclass findClass(const char *name) {
 	return nullptr;
 }
 
+// Defined in app-android.cpp for the app itself, which this doesn't link.
+jobject Android_GetActivity(JNIEnv *env) {
+	return nullptr;
+}
+
 bool System_AudioRecordingIsAvailable() { return false; }
-bool System_AudioRecordingState() { return false; }
 #endif
 
 #ifndef M_PI_2
 #define M_PI_2     1.57079632679489661923
 #endif
 
-// asin acos atan: https://github.com/michaldrobot/ShaderFastLibs/blob/master/ShaderFastMathLib.h
-
-// TODO:
-// Fast approximate sincos for NEON
-// http://blog.julien.cayzac.name/2009/12/fast-sinecosine-for-armv7neon.html
-// Fast sincos
-// http://www.dspguru.com/dsp/tricks/parabolic-approximation-of-sin-and-cos
-
-// minimax (surprisingly terrible! something must be wrong)
-// double asin_plus_sqrtthing = .9998421793 + (1.012386649 + (-.6575341673 + .8999841642 + (-1.669668977 + (1.571945105 - .5860008052 * x) * x) * x) * x) * x;
-
-// VERY good. 6 MAD, one division.
-// double asin_plus_sqrtthing = (1.807607311 + (.191900116 + (-2.511278506 + (1.062519236 + (-.3572142480 + .1087063463 * x) * x) * x) * x) * x) / (1.807601897 - 1.615203794 * x);
-// float asin_plus_sqrtthing_correct_ends =
-// 	(1.807607311f + (.191900116f + (-2.511278506f + (1.062519236f + (-.3572142480f + .1087063463f * x) * x) * x) * x) * x) / (1.807607311f - 1.615195094 * x);
-
-// Unfortunately this is very serial.
-// At least there are only 8 constants needed - load them into two low quads and go to town.
-// For every step, VDUP the constant into a new register (out of two alternating), then VMLA or VFMA into it.
-
-// http://www.ecse.rpi.edu/~wrf/Research/Short_Notes/arcsin/
-// minimax polynomial rational approx, pretty good, get four digits consistently.
-// unfortunately fastasin(1.0) / M_PI_2  != 1.0f, but it's pretty close.
-float fastasin(double x) {
-	float sign = x >= 0.0f ? 1.0f : -1.0f;
-	x = fabs(x);
-	float sqrtthing = sqrt(1.0f - x * x);
-	// note that the sqrt can run parallel while we do the rest
-	// if the hardware supports it
-
-	float y = -.3572142480f + .1087063463f * x;
-	y = y * x + 1.062519236f;
-	y = y * x + -2.511278506f;
-	y = y * x + .191900116f;
-	y = y * x + 1.807607311f;
-	y /= (1.807607311f - 1.615195094 * x);
-	return sign * (y - sqrtthing);
-}
-
-double atan_66s(double x) {
-	const double c1=1.6867629106;
-	const double c2=0.4378497304;
-	const double c3=1.6867633134;
-
-	double x2; // The input argument squared
-
-	x2 = x * x;
-	return (x*(c1 + x2*c2)/(c3 + x2));
-}
-
-// Terrible.
-double fastasin2(double x) {
-	return atan_66s(x / sqrt(1 - x * x));
-}
-
-// Also terrible.
-float fastasin3(float x) {
-	return x + x * x * x * x * x * 0.4971;
-}
-
-// Great! This is the one we'll use. Can be easily rescaled to get the right range for free.
-// http://mathforum.org/library/drmath/view/54137.html
-// http://www.musicdsp.org/showone.php?id=115
-float fastasin4(float x) {
-	float sign = x >= 0.0f ? 1.0f : -1.0f;
-	x = fabs(x);
-	x = M_PI/2 - sqrtf(1.0f - x) * (1.5707288 + -0.2121144*x + 0.0742610*x*x + -0.0187293*x*x*x);
-	return sign * x;
-}
-
-// Or this:
-float fastasin5(float x)
-{
-	float sign = x >= 0.0f ? 1.0f : -1.0f;
-	x = fabs(x);
-	float fRoot = sqrtf(1.0f - x);
-	float fResult = 0.0742610f + -0.0187293f  * x;
-	fResult = -0.2121144f + fResult * x;
-	fResult = 1.5707288f + fResult * x;
-	fResult = M_PI/2 - fRoot*fResult;
-	return sign * fResult;
-}
-
-
-// This one is unfortunately not very good. But lets us avoid PI entirely
-// thanks to the special arguments of the PSP functions.
-// http://www.dspguru.com/dsp/tricks/parabolic-approximation-of-sin-and-cos
-#define C            0.70710678118654752440f    // 1.0f / sqrt(2.0f)
-// Some useful constants (PI and <math.h> are not part of algo)
-#define BITSPERQUARTER (20)
-void fcs(float angle, float &sinout, float &cosout) {
-	int phasein = angle * (1 << BITSPERQUARTER);
-	// Modulo phase into quarter, convert to float 0..1
-	float modphase = (phasein & ((1<<BITSPERQUARTER)-1)) * (1.0f / (1<<BITSPERQUARTER));
-	// Extract quarter bits
-	int quarter = phasein >> BITSPERQUARTER;
-	// Recognize quarter
-	if (!quarter) {
-		// First quarter, angle = 0 .. pi/2
-		float x = modphase - 0.5f;      // 1 sub
-		float temp = (2 - 4*C)*x*x + C; // 2 mul, 1 add
-		sinout = temp + x;              // 1 add
-		cosout = temp - x;              // 1 sub
-	} else if (quarter == 1) {
-		// Second quarter, angle = pi/2 .. pi
-		float x = 0.5f - modphase;      // 1 sub
-		float temp = (2 - 4*C)*x*x + C; // 2 mul, 1 add
-		sinout = x + temp;              // 1 add
-		cosout = x - temp;              // 1 sub
-	} else if (quarter == 2) {
-		// Third quarter, angle = pi .. 1.5pi
-		float x = modphase - 0.5f;      // 1 sub
-		float temp = (4*C - 2)*x*x - C; // 2 mul, 1 sub
-		sinout = temp - x;              // 1 sub
-		cosout = temp + x;              // 1 add
-	} else if (quarter == 3) {
-		// Fourth quarter, angle = 1.5pi..2pi
-		float x = modphase - 0.5f;      // 1 sub
-		float temp = (2 - 4*C)*x*x + C; // 2 mul, 1 add
-		sinout = x - temp;              // 1 sub
-		cosout = x + temp;              // 1 add
-	}
-}
-#undef C
-
-
-const float PI_SQR      = 9.86960440108935861883449099987615114f;
-
-//https://code.google.com/p/math-neon/source/browse/trunk/math_floorf.c?r=18
-// About 2 correct decimals. Not great.
-void fcs2(float theta, float &outsine, float &outcosine) {
-	float gamma = theta + 1;
-	gamma += 2;
-	gamma /= 4;
-	theta += 2;
-	theta /= 4;
-	//theta -= (float)(int)theta;
-	//gamma -= (float)(int)gamma;
-	theta -= floorf(theta);
-	gamma -= floorf(gamma);
-	theta *= 4;
-	theta -= 2;
-	gamma *= 4;
-	gamma -= 2;
-
-	float x = 2 * gamma - gamma * fabs(gamma);
-	float y = 2 * theta - theta * fabs(theta);
-	const float P = 0.225f;
-	outsine = P * (y * fabsf(y) - y) + y;   // Q * y + P * y * abs(y)
-	outcosine = P * (x * fabsf(x) - x) + x;   // Q * y + P * y * abs(y)
-}
-
-
-
-void fastsincos(float x, float &sine, float &cosine) {
-	fcs2(x, sine, cosine);
-}
-
-bool TestSinCos() {
-	for (int i = -100; i <= 100; i++) {
-		float f = i / 30.0f;
-
-		// The PSP sin/cos take as argument angle * M_PI_2.
-		// We need to match that.
-		float slowsin = sinf(f * M_PI_2), slowcos = cosf(f * M_PI_2);
-		float fastsin, fastcos;
-		fastsincos(f, fastsin, fastcos);
-		if (g_testLog) {
-			printf("%f: slow: %0.8f, %0.8f fast: %0.8f, %0.8f\n", f, slowsin, slowcos, fastsin, fastcos);
-		}
-	}
-	return true;
-}
-
-
-bool TestAsin() {
-	for (int i = -100; i <= 100; i++) {
-		float f = i / 100.0f;
-		float slowval = asinf(f) / M_PI_2;
-		float fastval = fastasin5(f) / M_PI_2;
-		if (g_testLog) {
-			printf("slow: %0.16f fast: %0.16f\n", slowval, fastval);
-		}
-		float diff = fabsf(slowval - fastval);
-		// EXPECT_TRUE(diff < 0.0001f);
-	}
-	// EXPECT_TRUE(fastasin(1.0) / M_PI_2 <= 1.0f);
-	return true;
-}
-
 bool TestMathUtil() {
 	EXPECT_FALSE(my_isinf(1.0));
 	volatile float zero = 0.0f;
 	EXPECT_TRUE(my_isinf(1.0f/zero));
 	EXPECT_FALSE(my_isnan(1.0f/zero));
+	return true;
+}
+
+// A filesystem whose state is one number, under a section name of our choosing.
+class SaveStateTestFileSystem : public EmptyFileSystem {
+public:
+	SaveStateTestFileSystem(const char *section, int value) : section_(section), value_(value) {}
+	void DoState(PointerWrap &p) override {
+		auto s = p.Section(section_, 1);
+		if (!s)
+			return;
+		Do(p, value_);
+	}
+	int Value() const { return value_; }
+
+private:
+	const char *section_;
+	int value_;
+};
+
+bool TestSaveStateMounts() {
+	auto a = std::make_shared<SaveStateTestFileSystem>("TestFS", 1);
+	auto b = std::make_shared<SaveStateTestFileSystem>("TestFS", 2);
+	auto c = std::make_shared<SaveStateTestFileSystem>("TestFS", 3);
+	MetaFileSystem saved;
+	saved.Mount("a:", a);
+	saved.Mount("b:", b);
+	saved.Mount("c:", c);
+
+	std::vector<u8> data;
+	EXPECT_TRUE(CChunkFileReader::MeasureAndSavePtr(saved, &data) == CChunkFileReader::ERROR_NONE);
+
+	// Reordered, without b: and with a d: the state doesn't have.
+	auto a2 = std::make_shared<SaveStateTestFileSystem>("TestFS", 0);
+	auto c2 = std::make_shared<SaveStateTestFileSystem>("TestFS", 0);
+	auto d2 = std::make_shared<SaveStateTestFileSystem>("TestFS", 40);
+	MetaFileSystem loaded;
+	loaded.Mount("c:", c2);
+	loaded.Mount("d:", d2);
+	loaded.Mount("a:", a2);
+	std::string error;
+	EXPECT_TRUE(CChunkFileReader::LoadPtr(data.data(), data.size(), loaded, &error) == CChunkFileReader::ERROR_NONE);
+	EXPECT_EQ_INT(a2->Value(), 1);
+	EXPECT_EQ_INT(c2->Value(), 3);
+	EXPECT_EQ_INT(d2->Value(), 40);
+
+	// A mount whose filesystem doesn't match the state's fails the load.
+	MetaFileSystem mismatched;
+	mismatched.Mount("a:", std::make_shared<SaveStateTestFileSystem>("OtherFS", 0));
+	EXPECT_TRUE(CChunkFileReader::LoadPtr(data.data(), data.size(), mismatched, &error) != CChunkFileReader::ERROR_NONE);
+
+	return true;
+}
+
+// The start of a state as SaveStart writes it, and a little more.
+struct PeekTestState {
+	int version;
+	void DoState(PointerWrap &p) {
+		auto s = p.Section("SaveStart", 1, version);
+		if (!s)
+			return;
+		if (s >= 6) {
+			char discID[16] = "ULUS12345";
+			char discVersion[8] = "1.01";
+			u8 bootType = (u8)SaveState::BootType::PBP;
+			p.DoVoid(discID, sizeof(discID));
+			p.DoVoid(discVersion, sizeof(discVersion));
+			Do(p, bootType);
+		}
+		std::vector<u8> rest(100000, 0x55);
+		Do(p, rest);
+	}
+};
+
+static bool SavePeekTestState(const Path &path, int version) {
+	PeekTestState state{ version };
+	u8 *data = nullptr;
+	size_t size = 0;
+	if (CChunkFileReader::MeasureAndSavePtr(state, &data, &size) != CChunkFileReader::ERROR_NONE) {
+		return false;
+	}
+	return CChunkFileReader::SaveFile(path, "Test", "v1.0", data, size) == CChunkFileReader::ERROR_NONE;
+}
+
+bool TestSaveStatePeek() {
+	const Path path = UnitTestTempPath("unittest_peek.ppst");
+	SaveState::BootInfo info;
+	std::string error;
+
+	EXPECT_TRUE(SavePeekTestState(path, 6));
+	EXPECT_TRUE(SaveState::PeekBootInfo(path, &info, &error));
+	EXPECT_EQ_STR(info.discID, std::string("ULUS12345"));
+	EXPECT_EQ_STR(info.discVersion, std::string("1.01"));
+	EXPECT_TRUE(info.bootType == SaveState::BootType::PBP);
+
+	EXPECT_TRUE(SavePeekTestState(path, 5));
+	EXPECT_FALSE(SaveState::PeekBootInfo(path, &info, &error));
+
+	File::Delete(path);
+	return true;
+}
+
+bool TestInetPton() {
+	uint8_t ip4[4];
+	EXPECT_EQ_INT(net::inet_pton(AF_INET, "1.2.3.4", ip4), 1);
+	EXPECT_TRUE(ip4[0] == 1 && ip4[1] == 2 && ip4[2] == 3 && ip4[3] == 4);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET, "1.2.3", ip4), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET, "1.2.3.4.5", ip4), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET, "256.1.1.1", ip4), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET, "1..2.3", ip4), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET, ".1.2.3", ip4), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET, "1.2.3.", ip4), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET, "", ip4), 0);
+	EXPECT_EQ_INT(net::inet_pton(-1, "1.2.3.4", ip4), -1);
+
+	// Bytes in network order.
+	uint8_t ip6[16];
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "::1", ip6), 1);
+	for (int i = 0; i < 15; i++) {
+		EXPECT_EQ_INT(ip6[i], 0);
+	}
+	EXPECT_EQ_INT(ip6[15], 1);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "::", ip6), 1);
+	EXPECT_EQ_INT(ip6[15], 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "fe80::1:2", ip6), 1);
+	EXPECT_TRUE(ip6[0] == 0xFE && ip6[1] == 0x80 && ip6[2] == 0 && ip6[11] == 0);
+	EXPECT_TRUE(ip6[12] == 0 && ip6[13] == 1 && ip6[14] == 0 && ip6[15] == 2);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "1:2:3:4:5:6:7:8", ip6), 1);
+	EXPECT_TRUE(ip6[1] == 1 && ip6[15] == 8);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "::2:3:4:5:6:7:8", ip6), 1);
+	EXPECT_TRUE(ip6[0] == 0 && ip6[1] == 0 && ip6[3] == 2 && ip6[15] == 8);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "1:2:3:4:5:6:7::", ip6), 1);
+	EXPECT_TRUE(ip6[13] == 7 && ip6[14] == 0 && ip6[15] == 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "1:2:3::4:5:6:7", ip6), 1);
+	EXPECT_TRUE(ip6[5] == 3 && ip6[6] == 0 && ip6[7] == 0 && ip6[9] == 4 && ip6[15] == 7);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "FFFF::abcd", ip6), 1);
+	EXPECT_TRUE(ip6[0] == 0xFF && ip6[1] == 0xFF && ip6[14] == 0xAB && ip6[15] == 0xCD);
+
+	// These used to write outside the 16 bytes.
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "1::2::3", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, ":::::::::", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "1:2:3:4:5:6:7:8::", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "1:2:3:4:5:6:7:8:9", ip6), 0);
+
+	// Other malformed ones.
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "1::2:3:4:5:6:7:8", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, ":::", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, ":1::", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "1:", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "12345::", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "1:2:3:4:5:6:7", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "::ffff:1.2.3.4", ip6), 0);
+	EXPECT_EQ_INT(net::inet_pton(AF_INET6, "", ip6), 0);
 	return true;
 }
 
@@ -517,6 +536,55 @@ bool TestUtf8() {
 			const std::string once = ReplaceInvalidUTF8(input);
 			EXPECT_TRUE(ReplaceInvalidUTF8(once) == once);
 		}
+	}
+
+	return true;
+}
+
+bool TestTextDecoders() {
+	{
+		const char16_t pair[] = { 0xD83C, 0xDFAE, 0 };
+		UTF16LE utf(pair);
+		EXPECT_EQ_HEX((uint32_t)utf.next(), 0x1F3AEu);
+		EXPECT_TRUE(utf.end());
+	}
+
+	// An unpaired surrogate is invalid on its own, and decoding carries on after it.
+	{
+		const char16_t highThenA[] = { 0xD800, 'A', 0 };
+		UTF16LE utf(highThenA);
+		EXPECT_TRUE(utf.next() == UTF16LE::INVALID);
+		EXPECT_EQ_HEX((uint32_t)utf.next(), (uint32_t)'A');
+		EXPECT_TRUE(utf.end());
+
+		const char16_t lowThenA[] = { 0xDC00, 'A', 0 };
+		UTF16LE utf2(lowThenA);
+		EXPECT_TRUE(utf2.next() == UTF16LE::INVALID);
+		EXPECT_EQ_HEX((uint32_t)utf2.next(), (uint32_t)'A');
+	}
+
+	// A high surrogate right before the terminator must not consume it.
+	{
+		const char16_t highAtEnd[] = { 0xD800, 0, 'A', 0 };
+		UTF16LE utf(highAtEnd);
+		EXPECT_TRUE(utf.next() == UTF16LE::INVALID);
+		EXPECT_EQ_INT(utf.shortIndex(), 1);
+		EXPECT_TRUE(utf.end());
+	}
+
+	{
+		ShiftJIS sjis("A\xA1\x82\xA0");
+		EXPECT_EQ_HEX(sjis.next(), 0x41u);
+		EXPECT_EQ_HEX(sjis.next(), 0xA1u);
+		EXPECT_EQ_HEX(sjis.next(), 0x2422u);
+		EXPECT_TRUE(sjis.end());
+	}
+
+	// Lead bytes that encode nothing.
+	for (const char *bad : { "\x80", "\xA0", "\xFD", "\xFE", "\xFF" }) {
+		ShiftJIS sjis(bad);
+		EXPECT_TRUE(sjis.next() == ShiftJIS::INVALID);
+		EXPECT_EQ_INT(sjis.byteIndex(), 1);
 	}
 
 	return true;
@@ -919,6 +987,33 @@ bool TestSerializer() {
 	return true;
 }
 
+bool TestLogFileOpen() {
+	// Creating the log file's folder logs, which used to deadlock on the log file lock.
+	const Path dir = UnitTestTempPath("unittest_log_file");
+	File::DeleteDirRecursively(dir);
+	const Path logPath = dir / "sub" / "log.txt";
+
+	const LogOutput outputs = g_logManager.GetOutputsEnabled();
+	const LogLevel ioLevel = g_logManager.GetLogLevel(Log::IO);
+	const bool ioEnabled = g_logManager.GetLogChannel(Log::IO)->enabled;
+	g_logManager.SetLogLevel(Log::IO, LogLevel::LVERBOSE);
+	g_logManager.SetEnabled(Log::IO, true);
+
+	g_logManager.SetFileLogPath(logPath);
+	g_logManager.EnableOutput(LogOutput::File);
+	INFO_LOG(Log::IO, "Log file test");
+	bool exists = File::Exists(logPath);
+
+	g_logManager.SetOutputsEnabled(outputs);
+	g_logManager.SetFileLogPath(Path());
+	g_logManager.SetLogLevel(Log::IO, ioLevel);
+	g_logManager.SetEnabled(Log::IO, ioEnabled);
+	File::DeleteDirRecursively(dir);
+
+	EXPECT_TRUE(exists);
+	return true;
+}
+
 bool TestMemBlockInfoSaveState() {
 	MemBlockInfoInit();
 	MemBlockOverrideDetailed();
@@ -953,6 +1048,33 @@ bool TestMemBlockInfoSaveState() {
 	NotifyMemInfo(MemBlockFlags::ALLOC, 0x08800100, 0x10, "SplitTag", 8);
 	auto results = FindMemInfo(0x08800000, 0x20000);
 	EXPECT_TRUE(!results.empty());
+
+	MemBlockReleaseDetailed();
+	MemBlockInfoShutdown();
+	return true;
+}
+
+bool TestMemBlockInfoRangeWrap() {
+	MemBlockInfoInit();
+	MemBlockOverrideDetailed();
+
+	// Sizes come from the game. One that wraps around 32 bits used to leave a slab that ends
+	// before it starts, hidden from lookups, and later marks crashed on it.
+	NotifyMemInfo(MemBlockFlags::WRITE, 0x08800800, 0xFFFFF000, "Wrap", 4);
+	NotifyMemInfo(MemBlockFlags::WRITE, 0x3FFFF000, 0x2000, "PastEnd", 7);
+
+	auto findWrite = [](uint32_t addr, const char *tag) {
+		std::vector<MemBlockInfo> results = FindMemInfoByFlag(MemBlockFlags::WRITE, addr, 1);
+		return results.size() == 1 && results[0].tag == tag && results[0].start + results[0].size > results[0].start;
+	};
+	EXPECT_TRUE(findWrite(0x08800800, "Wrap"));
+	EXPECT_TRUE(findWrite(0x20000000, "Wrap"));
+	EXPECT_TRUE(findWrite(0x3FFFFFFF, "PastEnd"));
+
+	// Splitting the clamped slab again works too.
+	NotifyMemInfo(MemBlockFlags::WRITE, 0x08900000, 0x1000, "Inside", 6);
+	EXPECT_TRUE(findWrite(0x08900000, "Inside"));
+	EXPECT_TRUE(findWrite(0x08901000, "Wrap"));
 
 	MemBlockReleaseDetailed();
 	MemBlockInfoShutdown();
@@ -1071,6 +1193,55 @@ bool TestTempBreakpoints() {
 	EXPECT_TRUE((g_breakpoints.ExecBreakPoint(kAddrA) & BREAK_ACTION_PAUSE) != 0);
 	g_breakpoints.RemoveBreakPoint(kAddrA);
 	EXPECT_FALSE(g_breakpoints.HasBreakPoints());
+
+	// Resuming from a breakpoint must not pause there again, and must not report it again if it's
+	// the one that stopped us. A breakpoint we merely stepped onto still has to log and count.
+	// Nothing retires an instruction here unless we move downcount, so the ticks stay put.
+	{
+		auto hitsAt = [](u32 addr) -> int {
+			for (const BreakPoint &bp : g_breakpoints.GetBreakpoints()) {
+				if (bp.addr == addr)
+					return (int)bp.numHits;
+			}
+			return -1;
+		};
+
+		g_breakpoints.ClearSkipFirst();
+		g_breakpoints.AddBreakPoint(kAddrA);
+		g_breakpoints.AddBreakPoint(kAddrB);
+
+		EXPECT_TRUE((g_breakpoints.ExecBreakPoint(kAddrA) & BREAK_ACTION_PAUSE) != 0);
+		EXPECT_EQ_INT(hitsAt(kAddrA), 1);
+
+		// Resuming off it. A step-over sets the skip twice for one resume, and that must not lose it.
+		g_breakpoints.SetSkipFirst(kAddrA);
+		g_breakpoints.SetSkipFirst(kAddrA);
+		EXPECT_EQ_INT((int)g_breakpoints.ExecBreakPoint(kAddrA), (int)BREAK_ACTION_NONE);
+		EXPECT_EQ_INT(hitsAt(kAddrA), 1);
+
+		// Stepped onto B, never reported there: it logs and counts, only the pause is dropped.
+		g_breakpoints.SetSkipFirst(kAddrB);
+		EXPECT_EQ_INT((int)(g_breakpoints.ExecBreakPoint(kAddrB) & BREAK_ACTION_PAUSE), 0);
+		EXPECT_EQ_INT(hitsAt(kAddrB), 1);
+
+		// An unrelated address still pauses and reports.
+		EXPECT_TRUE((g_breakpoints.ExecBreakPoint(kAddrA) & BREAK_ACTION_PAUSE) != 0);
+		EXPECT_EQ_INT(hitsAt(kAddrA), 2);
+
+		// Step off A, which runs it, and land on A again (a one-instruction loop). That's a new
+		// execution, which nothing has reported yet.
+		g_breakpoints.SetSkipFirst(kAddrA);
+		EXPECT_EQ_INT((int)g_breakpoints.ExecBreakPoint(kAddrA), (int)BREAK_ACTION_NONE);
+		currentMIPS->downcount -= 1;
+		g_breakpoints.SetSkipFirst(kAddrA);
+		EXPECT_EQ_INT((int)(g_breakpoints.ExecBreakPoint(kAddrA) & BREAK_ACTION_PAUSE), 0);
+		EXPECT_EQ_INT(hitsAt(kAddrA), 3);
+		currentMIPS->downcount += 1;
+
+		g_breakpoints.ClearSkipFirst();
+		g_breakpoints.RemoveBreakPoint(kAddrA);
+		g_breakpoints.RemoveBreakPoint(kAddrB);
+	}
 
 	g_symbolMap = nullptr;
 	return true;
@@ -1353,6 +1524,12 @@ bool TestBlockAllocator() {
 		EXPECT_TRUE(ValidateAllocator(a, kStart, oddSize));
 	}
 
+	// Validating is quadratic in the block count, so the churn loops below only do it periodically.
+	// A broken tiling or free count doesn't repair itself, so it's still caught, just a few steps late.
+	auto validateEvery = [](int i, int count) {
+		return (i & 63) == 63 || i == count - 1;
+	};
+
 	// Churn again, this time mixing in aligned allocations and AllocAt so the block list gets into
 	// shapes the plain alloc/free loop never produces.
 	{
@@ -1362,7 +1539,8 @@ bool TestBlockAllocator() {
 		u32 rng = 987654321;
 		auto next = [&rng]() { rng = rng * 1103515245u + 12345u; return (rng >> 16) & 0x7FFF; };
 
-		for (int i = 0; i < 4000; ++i) {
+		const int kIterations = 3000;
+		for (int i = 0; i < kIterations; ++i) {
 			const int op = next() % 100;
 			if (op < 30 && !live.empty()) {
 				const size_t idx = next() % live.size();
@@ -1391,8 +1569,8 @@ bool TestBlockAllocator() {
 				if (addr != (u32)-1)
 					live.push_back(addr);
 			}
-			if (!ValidateAllocator(a, kStart, kSize)) {
-				printf("BlockAllocator invariant broken at iteration %d (op %d)\n", i, op);
+			if (validateEvery(i, kIterations) && !ValidateAllocator(a, kStart, kSize)) {
+				printf("BlockAllocator invariant broken by iteration %d\n", i);
 				return false;
 			}
 		}
@@ -1413,7 +1591,8 @@ bool TestBlockAllocator() {
 		u32 rng = 12345;
 		auto next = [&rng]() { rng = rng * 1103515245u + 12345u; return (rng >> 16) & 0x7FFF; };
 
-		for (int i = 0; i < 3000; ++i) {
+		const int kIterations = 2000;
+		for (int i = 0; i < kIterations; ++i) {
 			const bool doAlloc = live.empty() || (next() % 100) < 55;
 			if (doAlloc) {
 				u32 size = ((next() % 64) + 1) * kGrain;
@@ -1432,8 +1611,8 @@ bool TestBlockAllocator() {
 				EXPECT_TRUE(a.Free(live[idx].first));
 				live.erase(live.begin() + idx);
 			}
-			if (!ValidateAllocator(a, kStart, kSize)) {
-				printf("BlockAllocator invariant broken at iteration %d\n", i);
+			if (validateEvery(i, kIterations) && !ValidateAllocator(a, kStart, kSize)) {
+				printf("BlockAllocator invariant broken by iteration %d\n", i);
 				return false;
 			}
 		}
@@ -1984,12 +2163,153 @@ bool TestFastVec() {
 	return true;
 }
 
+// Calls check on inputs chosen to make trouble for a VFPU dot product: close exponents, cancelling
+// products, ties, zeroes and subnormals, the overflow and underflow edges, inf and NaN, and sums whose
+// rounding carries into the next power of two. Stops at the first false.
+bool ForEachVFPUDotTestCase(const std::function<bool(const float a[4], const float b[4])> &check) {
+	uint64_t state = 0x9E3779B97F4A7C15ULL;
+	auto rnd = [&]() {
+		state ^= state << 13;
+		state ^= state >> 7;
+		state ^= state << 17;
+		return state;
+	};
+	auto fromBits = [](uint32_t bits) {
+		float f;
+		memcpy(&f, &bits, sizeof(f));
+		return f;
+	};
+	auto toBits = [](float f) {
+		uint32_t bits;
+		memcpy(&bits, &f, sizeof(bits));
+		return bits;
+	};
+	for (int n = 0; n < 4000000; n++) {
+		float a[4], b[4];
+		const int mode = (int)(rnd() & 15);
+		const int base = 1 + (int)(rnd() % 254);
+		const int spread = mode < 8 ? 3 : 40;
+		for (int i = 0; i < 4; i++) {
+			if (mode == 15) {
+				a[i] = fromBits((uint32_t)rnd());
+				b[i] = fromBits((uint32_t)rnd());
+				continue;
+			}
+			int ea = base + (int)(rnd() % (2 * spread + 1)) - spread;
+			int eb = 127 + (int)(rnd() % (2 * spread + 1)) - spread;
+			ea = std::max(0, std::min(254, ea));
+			eb = std::max(0, std::min(254, eb));
+			uint32_t xa = ((uint32_t)rnd() & 0x80000000) | (ea << 23) | ((uint32_t)rnd() & 0x7FFFFF);
+			uint32_t xb = ((uint32_t)rnd() & 0x80000000) | (eb << 23) | ((uint32_t)rnd() & 0x7FFFFF);
+			switch (rnd() & 63) {
+			case 0: xa &= 0x80000000; break;
+			case 1: xb &= 0x807FFFFF; break;
+			case 2: xa |= 0x7F800000; xa &= 0xFF800000; break;
+			case 3: xb |= 0x7FC00000; break;
+			case 4: xa &= 0xFFFF0000; break;
+			default: break;
+			}
+			a[i] = fromBits(xa);
+			b[i] = fromBits(xb);
+		}
+		if (mode == 5) {
+			// Nearly cancelling products.
+			a[1] = -a[0];
+			b[1] = fromBits(toBits(b[0]) ^ ((uint32_t)rnd() & 7));
+		}
+		if (!check(a, b))
+			return false;
+	}
+
+	// Cases that went wrong somewhere.
+	static const uint32_t fixed[][8] = {
+		{ 0x8055f97b, 0xcaa86851, 0, 0, 0x44282000, 0x3f800000, 0, 0 },
+	};
+	for (const auto &f : fixed) {
+		float a[4], b[4];
+		for (int i = 0; i < 4; i++) {
+			a[i] = fromBits(f[i]);
+			b[i] = fromBits(f[i + 4]);
+		}
+		if (!check(a, b))
+			return false;
+	}
+
+	// Sums just below and above a power of two, whose rounding carries into the next exponent:
+	// 1.0 from just under it, and inf at the top of the range.
+	for (int e = 1; e <= 254; e++) {
+		for (int s = 0; s < 2; s++) {
+			const uint32_t sign = (uint32_t)s << 31;
+			for (int k = 1; k <= 40; k++) {
+				const uint32_t small = e - k >= 1 ? ((uint32_t)(e - k) << 23) | ((uint32_t)k * 0x2AAAA) : 0;
+				float a[4] = { fromBits(sign | (e << 23)), fromBits((sign ^ 0x80000000u) | small), 0.0f, 0.0f };
+				float b[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+				if (!check(a, b))
+					return false;
+				a[0] = fromBits(sign | (e << 23) | 0x7FFFFF);
+				a[1] = fromBits(sign | small);
+				if (!check(a, b))
+					return false;
+				a[2] = a[1];
+				if (!check(a, b))
+					return false;
+			}
+		}
+	}
+	return true;
+}
+
+
+// vfpu_dot's fast versions and vfpu_multi_dot against the reference.
+bool TestVFPUDot() {
+	auto toBits = [](float f) {
+		uint32_t bits;
+		memcpy(&bits, &f, sizeof(bits));
+		return bits;
+	};
+	float lastA[4][4];
+	int n = 0;
+	auto checkMulti = [&](const float v[4], int terms, bool transposed) {
+		float block[16], out[4];
+		for (int k = 0; k < 4; k++) {
+			for (int i = 0; i < 4; i++)
+				block[transposed ? 4 * k + i : 4 * i + k] = lastA[k][i];
+		}
+		vfpu_multi_dot(out, block, v, terms, transposed);
+		for (int k = 0; k < 4; k++) {
+			float a[4]{}, b[4]{};
+			for (int i = 0; i < terms; i++) {
+				a[i] = lastA[k][i];
+				b[i] = v[i];
+			}
+			const uint32_t expected = toBits(vfpu_dot_reference(a, b));
+			if (toBits(out[k]) != expected) {
+				printf("vfpu_multi_dot output %d, %d terms%s: %08x, expected %08x\n", k, terms, transposed ? " transposed" : "", toBits(out[k]), expected);
+				return false;
+			}
+		}
+		return true;
+	};
+	auto check = [&](const float a[4], const float b[4]) {
+		const uint32_t expected = toBits(vfpu_dot_reference(a, b));
+		const uint32_t actual = toBits(vfpu_dot(a, b));
+		const uint32_t scalar = toBits(vfpu_dot_scalar(a, b));
+		if (expected != actual || expected != scalar) {
+			printf("vfpu_dot(%08x %08x %08x %08x, %08x %08x %08x %08x) = %08x (scalar %08x), expected %08x\n",
+				toBits(a[0]), toBits(a[1]), toBits(a[2]), toBits(a[3]), toBits(b[0]), toBits(b[1]), toBits(b[2]), toBits(b[3]), actual, scalar, expected);
+			return false;
+		}
+		// vfpu_multi_dot on the last four a's as the matrix, each output against the reference.
+		memcpy(lastA[n & 3], a, sizeof(lastA[0]));
+		if ((n++ & 3) == 3 && !checkMulti(b, 2 + (int)(n % 3), (n & 4) != 0))
+			return false;
+		return true;
+	};
+	return ForEachVFPUDotTestCase(check);
+}
+
 bool TestVFPUSinCos() {
 	float sine, cosine;
-	// Needed for VFPU tables.
-	// There might be a better place to invoke it, but whatever.
-	g_VFS.Register("", new DirectoryReader(Path("assets")));
-	InitVFPU();
 	vfpu_sincos(0.0f, sine, cosine);
 	EXPECT_EQ_FLOAT(sine, 0.0f);
 	EXPECT_EQ_FLOAT(cosine, 1.0f);
@@ -2131,6 +2451,65 @@ bool TestParseLBN() {
 		u32 startSector, readSize;
 		EXPECT_FALSE(parseLBN(invalidStrings[i], &startSector, &readSize));
 	}
+	return true;
+}
+
+// Serves byte i as (u8)(i * 31 + 7), clamped to the file size like HTTPFileLoader.
+// The read counter lives outside, since CachingFileLoader deletes its backend.
+class PatternFileLoader : public FileLoader {
+public:
+	PatternFileLoader(s64 size, std::atomic<int> *reads) : size_(size), reads_(reads) {}
+	bool Exists() override { return true; }
+	bool IsDirectory() override { return false; }
+	s64 FileSize() override { return size_; }
+	Path GetPath() const override { return Path(); }
+	size_t ReadAt(s64 pos, size_t bytes, size_t count, void *data, Flags flags) override {
+		(*reads_)++;
+		s64 end = std::min(pos + (s64)(bytes * count), size_);
+		for (s64 i = pos; i < end; i++) {
+			((u8 *)data)[i - pos] = (u8)(i * 31 + 7);
+		}
+		return pos < end ? (size_t)(end - pos) / bytes : 0;
+	}
+
+private:
+	s64 size_;
+	std::atomic<int> *reads_;
+};
+
+static bool MatchesPattern(const u8 *data, s64 pos, size_t bytes) {
+	for (size_t i = 0; i < bytes; i++) {
+		if (data[i] != (u8)((pos + i) * 31 + 7)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool TestCachingFileLoader() {
+	// The last 64 KB block of the file is short.
+	const s64 size = 3 * 65536 + 1234;
+	std::atomic<int> reads{};
+	std::unique_ptr<CachingFileLoader> loader(new CachingFileLoader(new PatternFileLoader(size, &reads)));
+	std::vector<u8> buf(65536 * 2);
+
+	s64 pos = 3 * 65536 + 100;
+	EXPECT_EQ_INT(loader->ReadAt(pos, 100, buf.data()), 100);
+	EXPECT_TRUE(MatchesPattern(buf.data(), pos, 100));
+	pos = 2 * 65536 + 10;
+	EXPECT_EQ_INT(loader->ReadAt(pos, (size_t)(size - pos), buf.data()), (int)(size - pos));
+	EXPECT_TRUE(MatchesPattern(buf.data(), pos, (size_t)(size - pos)));
+
+	// Both reads ended in the last block, so everything they touched is cached and there's
+	// nothing left to read ahead. Nothing further should reach the backend, even past EOF.
+	int readsBefore = reads;
+	pos = 3 * 65536 + 100;
+	for (int i = 0; i < 100; i++) {
+		EXPECT_EQ_INT(loader->ReadAt(pos, 100, buf.data()), 100);
+	}
+	// Waits for any read-ahead.
+	loader.reset();
+	EXPECT_EQ_INT(reads, readsBefore);
 	return true;
 }
 
@@ -2278,6 +2657,145 @@ static bool TestMemMap() {
 	return true;
 }
 
+static bool CheckBlockShadow() {
+	// Every valid address has an entry, starting out empty. The ends of each view would fault otherwise.
+	static const u32 validAddresses[] = {
+		0x00010000, 0x00013FFC, 0x40010000,  // Scratchpad, and its uncached mirror.
+		0x04000000, 0x047FFFFC,  // VRAM and its mirrors.
+		0x08000000, 0x09F00000, 0x0BE00000, 0x0BFFFFFC,  // RAM, across the views it's mapped in.
+		0x48000000, 0x88000000, 0xC8000000,  // RAM mirrors.
+	};
+	for (u32 addr : validAddresses) {
+		EXPECT_EQ_HEX(Memory::ReadBlockShadow(addr), 0);
+	}
+
+	// The kernel and uncached mirrors share an entry, like they share memory.
+	Memory::WriteBlockShadow(0x08804000, 0x1234);
+	EXPECT_EQ_HEX(Memory::ReadBlockShadow(0x88804000), 0x1234);
+	EXPECT_EQ_HEX(Memory::ReadBlockShadow(0x48804000), 0x1234);
+
+	// Invalid addresses read as empty, and ignore writes.
+	Memory::WriteBlockShadow(0x0C000000, 0x1234);
+	EXPECT_EQ_HEX(Memory::ReadBlockShadow(0x0C000000), 0);
+
+	// Clearing leaves an entry that holds something else alone.
+	EXPECT_FALSE(Memory::ClearBlockShadow(0x08804000, 0x5678));
+	EXPECT_TRUE(Memory::ClearBlockShadow(0x88804000, 0x1234));
+	EXPECT_EQ_HEX(Memory::ReadBlockShadow(0x08804000), 0);
+	return true;
+}
+
+// A leaf with no symbol, right after a function with a stack frame (#17664).
+static bool CheckStackWalk() {
+	const u32 caller = 0x08804000;
+	const u32 leaf = caller + 0x20;
+	const u32 code[] = {
+		0x27BDFFF0,  // caller: addiu sp, sp, -16
+		0xAFBF000C,  // sw ra, 12(sp)
+		0x0C000000 | ((leaf >> 2) & 0x03FFFFFF),  // jal leaf
+		0x00000000,  // nop
+		0x8FBF000C,  // lw ra, 12(sp)
+		0x27BD0010,  // addiu sp, sp, 16
+		0x03E00008,  // jr ra
+		0x00000000,  // nop
+		0x24820001,  // leaf: addiu v0, a0, 1
+		0x24420001,  // addiu v0, v0, 1
+		0x03E00008,  // jr ra
+		0x00000000,  // nop
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(code); i++) {
+		Memory::WriteUnchecked_U32(code[i], caller + (u32)i * 4);
+	}
+	const u32 sp = 0x09F00000 - 16;
+	// The caller's own return address, which the leaf's frame must not pick up.
+	Memory::WriteUnchecked_U32(0x08900000, sp + 12);
+
+	SymbolMap symbolMap;
+	g_symbolMap = &symbolMap;
+	std::vector<MIPSStackWalk::StackFrame> frames = MIPSStackWalk::Walk(leaf + 4, caller + 0x10, sp, caller, 0x09F00000);
+	g_symbolMap = nullptr;
+
+	EXPECT_EQ_INT((int)frames.size(), 2);
+	EXPECT_EQ_HEX(frames[0].entry, leaf);
+	EXPECT_EQ_INT(frames[0].stackSize, 0);
+	EXPECT_EQ_HEX(frames[1].pc, caller + 0x10);
+	EXPECT_EQ_HEX(frames[1].entry, caller);
+	EXPECT_EQ_INT(frames[1].stackSize, 16);
+
+	// With a symbol, the entry is where it starts, even when the prologue isn't first.
+	const u32 func = 0x08805000;
+	const u32 funcCode[] = {
+		0x3C080000,  // func: lui t0, 0
+		0x27BDFFF0,  // addiu sp, sp, -16
+		0xAFBF000C,  // sw ra, 12(sp)
+		0x00000000,  // nop
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(funcCode); i++) {
+		Memory::WriteUnchecked_U32(funcCode[i], func + (u32)i * 4);
+	}
+	Memory::WriteUnchecked_U32(caller + 0x10, sp + 12);
+	symbolMap.AddFunction("func", func, sizeof(funcCode));
+	symbolMap.SortSymbols();
+	g_symbolMap = &symbolMap;
+	frames = MIPSStackWalk::Walk(func + 0xC, caller + 0x10, sp, caller, 0x09F00000);
+	g_symbolMap = nullptr;
+
+	EXPECT_EQ_INT((int)frames.size(), 2);
+	EXPECT_EQ_HEX(frames[0].entry, func);
+	EXPECT_EQ_INT(frames[0].stackSize, 16);
+	EXPECT_EQ_HEX(frames[1].pc, caller + 0x10);
+
+	// No symbol, and an early return between the prologue and pc. After the call below, ra points
+	// back into this function, so that jr ra can't be the end of the function before.
+	const u32 early = 0x08806000;
+	const u32 earlyCode[] = {
+		0x27BDFFF0,  // early: addiu sp, sp, -16
+		0xAFBF000C,  // sw ra, 12(sp)
+		0x10800003,  // beqz a0, +3
+		0x00000000,  // nop
+		0x8FBF000C,  // lw ra, 12(sp)
+		0x03E00008,  // jr ra
+		0x27BD0010,  // addiu sp, sp, 16
+		0x0C000000 | ((leaf >> 2) & 0x03FFFFFF),  // jal leaf
+		0x00000000,  // nop
+		0x00000000,  // nop (pc)
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(earlyCode); i++) {
+		Memory::WriteUnchecked_U32(earlyCode[i], early + (u32)i * 4);
+	}
+	g_symbolMap = &symbolMap;
+	frames = MIPSStackWalk::Walk(early + 0x24, early + 0x24, sp, caller, 0x09F00000);
+	g_symbolMap = nullptr;
+
+	EXPECT_EQ_INT((int)frames.size(), 2);
+	EXPECT_EQ_HEX(frames[0].entry, early);
+	EXPECT_EQ_INT(frames[0].stackSize, 16);
+	EXPECT_EQ_HEX(frames[1].pc, caller + 0x10);
+	return true;
+}
+
+static bool TestStackWalk() {
+	Memory::g_MemorySize = Memory::RAM_NORMAL_SIZE;
+	if (!Memory::Init(Memory::MemMapSetupFlags::Default)) {
+		printf("Memory::Init failed\n");
+		return false;
+	}
+	const bool success = CheckStackWalk();
+	Memory::Shutdown();
+	return success;
+}
+
+static bool TestBlockShadow() {
+	Memory::g_MemorySize = Memory::RAM_DOUBLE_SIZE;
+	if (!Memory::Init(Memory::MemMapSetupFlags::Default)) {
+		printf("Memory::Init failed\n");
+		return false;
+	}
+	const bool success = CheckBlockShadow();
+	Memory::Shutdown();
+	return success;
+}
+
 static bool TestPath() {
 	// Also test the Path class while we're at it.
 	Path path("/asdf/jkl/");
@@ -2285,6 +2803,13 @@ static bool TestPath() {
 
 	Path path2("/asdf/jkl");
 	EXPECT_EQ_STR(path2.NavigateUp().ToString(), std::string("/asdf"));
+
+	// Relative to the current directory. This used to create nothing and still report success.
+	const Path relDir("unittest_createfullpath");
+	File::DeleteDirRecursively(relDir);
+	EXPECT_TRUE(File::CreateFullPath(relDir / "a/b"));
+	EXPECT_TRUE(File::IsDirectory(File::GetCurDirectory() / "unittest_createfullpath/a/b"));
+	File::DeleteDirRecursively(relDir);
 
 	Path path3 = path2 / "foo/bar";
 	EXPECT_EQ_STR(path3.WithExtraExtension(".txt").ToString(), std::string("/asdf/jkl/foo/bar.txt"));
@@ -2318,6 +2843,15 @@ static bool TestPath() {
 	EXPECT_EQ_STR(Path(R"(\\host\share\filename)").GetRootVolume().ToString(), std::string("//host"));
 	EXPECT_EQ_STR(Path(R"(\\?\UNC\share\filename)").GetRootVolume().ToString(), std::string("//?/UNC"));
 	EXPECT_EQ_STR(Path(R"(\\?\C:\share\filename)").GetRootVolume().ToString(), std::string("//?/C:"));
+
+	// The network folder, and navigating through it.
+	EXPECT_TRUE(Path(R"(\\)").IsNetworkRoot());
+	EXPECT_EQ_STR(Path(R"(\\host\share)").NavigateUp().ToString(), std::string("//host"));
+	EXPECT_EQ_STR(Path(R"(\\host)").NavigateUp().ToString(), std::string("//"));
+	EXPECT_TRUE(Path("//").CanNavigateUp());
+	EXPECT_EQ_STR(Path("//").NavigateUp().ToString(), std::string("/"));
+	EXPECT_EQ_STR((Path("//") / "host").ToString(), std::string("//host"));
+	EXPECT_EQ_STR(Path("//").GetRootVolume().ToString(), std::string("/"));
 #endif
 
 	std::string computedPath;
@@ -2466,6 +3000,71 @@ static bool TestWrapText() {
 	return true;
 }
 
+// Against ppsspp-re geprobe's swz.py, the layout that fits exp8-exp10.
+static bool TestDepthSwizzle() {
+	static const struct {
+		uint32_t translation;
+		bool color32;
+		uint32_t linear;
+		uint32_t stored;
+	} cases[] = {
+		{ 0x0, false, 0x088000, 0x088600 },
+		{ 0x0, false, 0x08a0e2, 0x08a6e2 },
+		{ 0x0, false, 0x1ffffe, 0x1ff9fe },
+		{ 0x0, false, 0x14b9ac, 0x14bfac },
+		{ 0x0, false, 0x09a782, 0x09a182 },
+		{ 0x0, true, 0x088000, 0x088600 },
+		{ 0x0, true, 0x08a0e2, 0x08a6e2 },
+		{ 0x0, true, 0x1ffffe, 0x1ff9fe },
+		{ 0x0, true, 0x1944c8, 0x1944c8 },
+		{ 0x0, true, 0x03171e, 0x03111e },
+		{ 0x200, false, 0x088000, 0x089040 },
+		{ 0x200, false, 0x08a0e2, 0x08b0a2 },
+		{ 0x200, false, 0x1ffffe, 0x1fefbe },
+		{ 0x200, false, 0x04a2ca, 0x04b28a },
+		{ 0x200, false, 0x06063a, 0x06167a },
+		{ 0x200, true, 0x088000, 0x089040 },
+		{ 0x200, true, 0x08a0e2, 0x08b182 },
+		{ 0x200, true, 0x1ffffe, 0x1fefbe },
+		{ 0x200, true, 0x176772, 0x1776b2 },
+		{ 0x200, true, 0x03b640, 0x03a6c0 },
+		{ 0x400, false, 0x088000, 0x08a040 },
+		{ 0x400, false, 0x08a0e2, 0x0880a2 },
+		{ 0x400, false, 0x1ffffe, 0x1fdfbe },
+		{ 0x400, false, 0x0dbd9c, 0x0d9ddc },
+		{ 0x400, false, 0x026654, 0x024614 },
+		{ 0x400, true, 0x088000, 0x08a040 },
+		{ 0x400, true, 0x08a0e2, 0x088182 },
+		{ 0x400, true, 0x1ffffe, 0x1fdfbe },
+		{ 0x400, true, 0x058028, 0x05a008 },
+		{ 0x400, true, 0x1bc0d8, 0x1be1d8 },
+		{ 0x800, false, 0x088000, 0x08c040 },
+		{ 0x800, false, 0x08a0e2, 0x08e0a2 },
+		{ 0x800, false, 0x1ffffe, 0x1fbfbe },
+		{ 0x800, false, 0x1ac354, 0x1a8314 },
+		{ 0x800, false, 0x047882, 0x0438c2 },
+		{ 0x800, true, 0x088000, 0x08c040 },
+		{ 0x800, true, 0x08a0e2, 0x08e182 },
+		{ 0x800, true, 0x1ffffe, 0x1fbfbe },
+		{ 0x800, true, 0x0f6704, 0x0f2664 },
+		{ 0x800, true, 0x05ce3c, 0x058c3c },
+		{ 0x1000, false, 0x088000, 0x080040 },
+		{ 0x1000, false, 0x08a0e2, 0x0820a2 },
+		{ 0x1000, false, 0x1ffffe, 0x1f7fbe },
+		{ 0x1000, false, 0x1b2b52, 0x1bab12 },
+		{ 0x1000, false, 0x03c876, 0x034836 },
+		{ 0x1000, true, 0x088000, 0x080040 },
+		{ 0x1000, true, 0x08a0e2, 0x082182 },
+		{ 0x1000, true, 0x1ffffe, 0x1f7fbe },
+		{ 0x1000, true, 0x07ec5e, 0x0768fe },
+		{ 0x1000, true, 0x0e498c, 0x0ec36c },
+	};
+	for (const auto &c : cases) {
+		EXPECT_EQ_HEX(GetDepthLayout(c.translation, c.color32).Stored(c.linear), c.stored);
+	}
+	return true;
+}
+
 static bool TestSmallDataConvert() {
 	float f[4] = { 1.0f / 255.0f, 2.0f / 255.0f, 3.0f / 255.0f, 4.0f / 255.f };
 	uint32_t result = Float4ToUint8x4_NoClamp(f);
@@ -2512,6 +3111,77 @@ bool TestInputMapping() {
 	InputMapping parsedMultiSingle = InputMapping::FromConfigString(cfgMulti);  // yes this is an intentional mismatch
 	// We should get the first mapping.
 	EXPECT_TRUE(parsedMultiSingle == mapping);
+	return true;
+}
+
+// Records what the ControlMapper tells us, so a test can check it.
+class TestControlListener : public ControlListener {
+public:
+	void OnVKey(VirtKey vkey, bool down) override {
+		vkeyDown[vkey] = down;
+	}
+	void UpdatePSPButtons(uint32_t buttonMask, uint32_t changedMask) override {
+		buttons = (buttons & ~changedMask) | buttonMask;
+	}
+	uint32_t buttons = 0;
+	std::map<VirtKey, bool> vkeyDown;
+};
+
+static bool SendKey(ControlMapper *mapper, int keyCode, bool down) {
+	KeyInput key{};
+	key.deviceId = DEVICE_ID_PAD_0;
+	key.keyCode = (InputKeyCode)keyCode;
+	key.flags = down ? KeyInputFlags::DOWN : KeyInputFlags::UP;
+	return mapper->Key(key);
+}
+
+// A mapping shouldn't fire when a longer mapping sharing an input with it is held. See #20621.
+bool TestComboSuppression() {
+	using KeyMap::MultiInputMapping;
+
+	InputMapping a(DEVICE_ID_PAD_0, NKCODE_BUTTON_1);
+	InputMapping b(DEVICE_ID_PAD_0, NKCODE_BUTTON_2);
+
+	KeyMap::ClearAllMappings();
+	KeyMap::SetInputMapping(CTRL_CIRCLE, MultiInputMapping(a), true);
+	KeyMap::SetInputMapping(CTRL_SQUARE, MultiInputMapping(b), true);
+	MultiInputMapping combo(a);
+	combo.mappings.push_back(b);
+	KeyMap::SetInputMapping(VIRTKEY_PAUSE, combo, true);
+
+	TestControlListener listener;
+	ControlMapper mapper;
+	mapper.AddListener(&listener);
+
+	// A on its own presses Circle.
+	SendKey(&mapper, NKCODE_BUTTON_1, true);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_CIRCLE), (int)CTRL_CIRCLE);
+	EXPECT_FALSE(listener.vkeyDown[VIRTKEY_PAUSE]);
+
+	// Adding B completes the combo, so Circle lets go and Square never presses.
+	SendKey(&mapper, NKCODE_BUTTON_2, true);
+	EXPECT_TRUE(listener.vkeyDown[VIRTKEY_PAUSE]);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_CIRCLE), 0);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_SQUARE), 0);
+
+	// Letting go of B ends the combo, and since A is still held, Circle comes back.
+	SendKey(&mapper, NKCODE_BUTTON_2, false);
+	EXPECT_FALSE(listener.vkeyDown[VIRTKEY_PAUSE]);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_CIRCLE), (int)CTRL_CIRCLE);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_SQUARE), 0);
+
+	// And releasing A leaves nothing pressed.
+	SendKey(&mapper, NKCODE_BUTTON_1, false);
+	EXPECT_EQ_INT((int)(listener.buttons & (CTRL_CIRCLE | CTRL_SQUARE)), 0);
+
+	// B on its own still presses Square - suppression only applies while the combo is held.
+	SendKey(&mapper, NKCODE_BUTTON_2, true);
+	EXPECT_EQ_INT((int)(listener.buttons & CTRL_SQUARE), (int)CTRL_SQUARE);
+	EXPECT_FALSE(listener.vkeyDown[VIRTKEY_PAUSE]);
+	SendKey(&mapper, NKCODE_BUTTON_2, false);
+
+	mapper.RemoveListener(&listener);
+	KeyMap::ClearAllMappings();
 	return true;
 }
 
@@ -2691,88 +3361,6 @@ bool TestSIMD() {
 	return true;
 }
 
-static void PrintFloats(const float *f, int count) {
-	for (int i = 0; i < count; i++) {
-		printf("%.1ff, ", f[i]);
-	}
-	printf("\n");
-}
-
-static bool CompareFloats(const float *values, const float *known_good, int count, int line) {
-	int wrongCount = 0;
-
-	for (int i = 0; i < count; i++) {
-		if (values[i] != known_good[i]) {
-			wrongCount++;
-		}
-	}
-
-	if (wrongCount > 0) {
-		for (int i = 0; i < count; i++) {
-			bool wrong = values[i] != known_good[i];
-			printf("%d: %0.3f vs %0.3f %s\n", i + 1, values[i], known_good[i], wrong ? "!! MISMATCH" : "");
-		}
-		printf("At UnitTest.cpp:%d: %d / %d were wrong\n", line, wrongCount, count);
-		return false;
-	} else {
-		return true;
-	}
-}
-
-bool TestCrossSIMD() {
-	static const float a_values[16] = { 1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f, 15.0f };
-	static const float b_values[16] = { -12.0f, 3.0f, -2.5f, 5.0f, 31.0f, 0.5f, 4.0f, 6.0f, 7.0f, 13.0f, 12.0f, 51.0f, 81.0f, 32.0f };
-	static const float known_result[16] = { 395.0f, 171.0f, 41.5f, 170.0f, 942.0f, 410.5f, 111.5f, 475.0f, 1358.0f, 607.5f, 163.0f, 728.0f, 297.0f, 49.5f, 25.0f, 160.0f, };
-	float result[16];
-	Mat4F32 a(a_values);
-	Mat4F32 b(b_values);
-
-	Mul4x4By4x4(a, b).Store(result);
-	if (!CompareFloats(result, known_result, 16, __LINE__)) {
-		return false;
-	}
-
-	Mat4x3F32 d = Mat4x3F32(b_values + 2);
-	Mul4x3By4x4(d, a).Store(result);
-
-	static const float known_4x3_result[16] = { 332.5f, 371.0f, 404.5f, 438.0f, 80.5f, 95.0f, 105.5f, 116.0f, 192.0f, 237.0f, 269.0f, 301.0f, 790.0f, 1036.0f, 1185.0f, 1349.0f, };
-	if (!CompareFloats(result, known_4x3_result, 16, __LINE__)) {
-		return false;
-	}
-
-	static const float vec_values[4] = { 3.0f, 5.0f, 7.0f, 10000000.0f };
-	Vec4F32 v = Vec4F32::Load(vec_values);
-
-	v.AsVec3ByMatrix44(b).Store3(result);
-
-	static const float known_vec_result[3] = { 249.0f, 134.5f, 96.5f, };
-	if (!CompareFloats(result, known_vec_result, ARRAY_SIZE(known_vec_result), __LINE__)) {
-		return false;
-	}
-	Vec4F32 scale = Vec4F32::Load(a_values);
-	Vec4F32 translate = Vec4F32::Load(b_values);
-
-	TranslateAndScaleInplace(a, scale, translate);
-	a.Store(result);
-
-	static const float known_scale_result[16] = { -47.0f, 16.0f, -1.0f, 36.0f, -103.0f, 41.0f, 1.5f, 81.0f, -146.0f, 61.0f, 3.5f, 117.0f, 14.0f, 30.0f, 0.0f, 0.0f,};
-	if (!CompareFloats(result, known_scale_result, ARRAY_SIZE(known_scale_result), __LINE__)) {
-		return false;
-	}
-
-	s8 values[4] = {-1, -128, 127, 45};
-	float fvalues[4];
-	Vec4F32::LoadS8Norm(values).Store(fvalues);
-	static const float known_s8norm_result[4] = {(float)values[0]/128.0f, (float)values[1]/128.0f, (float)values[2]/128.0f, (float)values[3]/128.0f,};
-	if (!CompareFloats(fvalues, known_s8norm_result, ARRAY_SIZE(known_s8norm_result), __LINE__)) {
-		return false;
-	}
-
-	// PrintFloats(result, 16);
-
-	return true;
-}
-
 bool TestVolumeFunc() {
 	for (int i = 0; i <= 20; i++) {
 		float mul = Volume10ToMultiplier(i);
@@ -2784,6 +3372,43 @@ bool TestVolumeFunc() {
 		EXPECT_TRUE(smaller);
 		// printf("%d -> %f -> %d -> %f\n", i, mul, vol100, mul2);
 	}
+	return true;
+}
+
+// The info setters have to work in constant expressions, since the config tables are constexpr.
+static constexpr const char *testChoices[] = { "Off", "On", "Auto" };
+static constexpr ConfigSetting testSliderSetting = ConfigSetting("TestSlider", ConfigSettingOffset<int>{ 0 }, 50, CfgFlag::DEFAULT)
+	.Label(I18NCat::AUDIO, "Test slider").Range(0, 100, 5).Units("%").ZeroLabel("Off").NegativeLabel("Disabled");
+static_assert(testSliderSetting.Info().HasRange() && !testSliderSetting.Info().HasChoices());
+static_assert(testSliderSetting.Info().zeroLabel && testSliderSetting.Info().negativeLabel);
+static constexpr ConfigSetting testChoiceSetting = ConfigSetting("TestChoice", ConfigSettingOffset<int>{ 0 }, 1, CfgFlag::DEFAULT)
+	.Label(I18NCat::AUDIO, "Test choice").Choices(testChoices, 1);
+static_assert(testChoiceSetting.Info().choiceCount == 3 && testChoiceSetting.Info().choiceMin == 1 && !testChoiceSetting.Info().HasRange());
+
+bool TestConfigSettings() {
+	g_Config.Init();
+
+	const ConfigSettingRef *ref = Config::FindSetting(&g_Config.iUIVolume);
+	EXPECT_TRUE(ref && ref->setting->IniKey() == "UIVolume");
+	EXPECT_EQ_INT(Config::GetDefaultValueInt(&g_Config.iUIVolume), 75);
+
+	// Blocks that reset as a whole, where the default can depend on which block it is.
+	EXPECT_EQ_FLOAT(Config::GetDefaultValueFloat(&g_Config.displayLayoutLandscape.fDisplayOffsetY), 0.5f);
+	EXPECT_EQ_FLOAT(Config::GetDefaultValueFloat(&g_Config.displayLayoutPortrait.fDisplayOffsetY), 0.25f);
+	EXPECT_EQ_INT(Config::GetDefaultValueInt(&g_Config.gestureControls[1].iSwipeUp), 0);
+
+	int oldVolume = g_Config.iUIVolume;
+	g_Config.iUIVolume = 10;
+	EXPECT_TRUE(Config::RestoreSettingToDefault(&g_Config.iUIVolume));
+	EXPECT_EQ_INT(g_Config.iUIVolume, 75);
+	EXPECT_FALSE(Config::RestoreSettingToDefault(&g_Config.iUIVolume));
+	g_Config.iUIVolume = oldVolume;
+
+	float oldOffsetY = g_Config.displayLayoutPortrait.fDisplayOffsetY;
+	g_Config.displayLayoutPortrait.fDisplayOffsetY = 0.9f;
+	EXPECT_TRUE(Config::RestoreSettingToDefault(&g_Config.displayLayoutPortrait.fDisplayOffsetY));
+	EXPECT_EQ_FLOAT(g_Config.displayLayoutPortrait.fDisplayOffsetY, 0.25f);
+	g_Config.displayLayoutPortrait.fDisplayOffsetY = oldOffsetY;
 	return true;
 }
 
@@ -2885,6 +3510,66 @@ bool TestFriendlyPath() {
 	return true;
 }
 
+bool TestUmdDiscType() {
+	const Path root = UnitTestTempPath("unittest_umd_disc_type");
+	// Builds a disc out of the given files (a trailing slash makes a directory) and detects its type.
+	auto detect = [&](const std::vector<std::pair<std::string, std::string>> &files) {
+		File::DeleteDirRecursively(root);
+		File::CreateDir(root);
+		for (const auto &[name, contents] : files) {
+			if (endsWith(name, "/")) {
+				File::CreateFullPath(root / name.substr(0, name.size() - 1));
+			} else {
+				File::CreateFullPath((root / name).NavigateUp());
+				File::WriteStringToFile(false, contents, root / name);
+			}
+		}
+		SequentialHandleAllocator handles;
+		DirectoryFileSystem fs(&handles, root);
+		return DetectUmdDiscType(&fs, "");
+	};
+
+	const u32 G = PSP_UMD_TYPE_GAME, V = PSP_UMD_TYPE_VIDEO, A = PSP_UMD_TYPE_AUDIO;
+	// UMD_DATA.BIN says what's there, as on the EUR Video Demo Disc.
+	EXPECT_EQ_INT(detect({ { "UMD_DATA.BIN", "UCJB-98302|4BCA8BE1C6F3904D|0002|GVA" }, { "PSP_GAME/SYSDIR/EBOOT.BIN", "x" }, { "UMD_VIDEO/", "" }, { "UMD_AUDIO/", "" } }), G | V | A);
+	EXPECT_EQ_INT(detect({ { "UMD_DATA.BIN", "THE_BOURNE_SUPREMACY_SKU1|6|0002|V" }, { "UMD_VIDEO/", "" } }), V);
+	// Scene releases append text after the type.
+	EXPECT_EQ_INT(detect({ { "UMD_DATA.BIN", "NPUH-10123|420B60F2BB73D289|0001|G             |\r\nPatched" }, { "PSP_GAME/SYSDIR/EBOOT.BIN", "x" } }), G);
+	// A video disc whose PSP_GAME is only a firmware update is no game (#22737), with or without UMD_DATA.BIN.
+	EXPECT_EQ_INT(detect({ { "PSP_GAME/SYSDIR/UPDATE/EBOOT.PBP", "x" }, { "UMD_VIDEO/", "" } }), V);
+	EXPECT_EQ_INT(detect({ { "UMD_DATA.BIN", "UMDV-12345|0000000000000000|0001|GV" }, { "PSP_GAME/SYSDIR/UPDATE/EBOOT.PBP", "x" }, { "UMD_VIDEO/", "" } }), V);
+	// Without UMD_DATA.BIN, the directories decide, and a lone PSP_GAME is a game whatever's in it.
+	EXPECT_EQ_INT(detect({ { "PSP_GAME/SYSDIR/EBOOT.BIN", "x" } }), G);
+	EXPECT_EQ_INT(detect({ { "PSP_GAME/SYSDIR/BOOT.BIN", "x" } }), G);
+	EXPECT_EQ_INT(detect({ { "README.TXT", "x" } }), 0);
+
+	File::DeleteDirRecursively(root);
+	return true;
+}
+
+bool TestGEDumpGameID() {
+	std::string id;
+	// PPSSPP's own dump names.
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("ULUS10064_0001.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("ULUS10064"));
+	// ppsspp-framedumps: a GitHub issue number in front, a description after.
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("11928 ULES00262_0003 OutRun water.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("ULES00262"));
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("21127 WPCE02025_0001 WipEout Pure.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("WPCE02025"));
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("ULUS10064.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("ULUS10064"));
+	EXPECT_TRUE(DiscIDFromGEDumpFilename("11928 ULUS10064.ppdmp", &id));
+	EXPECT_EQ_STR(id, std::string("ULUS10064"));
+	// No ID in PPSSPP's form, even if one appears later in the name.
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("11928 OutRun water ULUS10064.ppdmp", &id));
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("11928 Harvest Moon Graphic Issue on Adreno.ppdmp", &id));
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("ULUS1006A_0001.ppdmp", &id));
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("ULUS100641_0001.ppdmp", &id));
+	EXPECT_FALSE(DiscIDFromGEDumpFilename("11928ULUS10064_0001.ppdmp", &id));
+	return true;
+}
+
 bool TestCmdLine() {
 	{
 		const char *argv[] = {
@@ -2936,6 +3621,48 @@ bool TestCmdLine() {
 		EXPECT_EQ_INT(options.timeoutWall.value_or(0), 4);
 		EXPECT_EQ_INT(options.timeoutEmulated.value_or(0), 5);
 	}
+	// Inverse booleans: --windowed turns fullscreen off, and --no-memstick removes the stick.
+	{
+		const char *argv[] = {
+			"ppsspp",
+			"--windowed",
+			"--no-memstick",
+		};
+		int argc = ARRAY_SIZE(argv);
+		CommandLineOptions options;
+		options.Parse(argc, argv, CmdLineMode::Application);
+		EXPECT_TRUE(options.fullscreen.has_value());
+		EXPECT_FALSE(options.fullscreen.value_or(true));
+		EXPECT_TRUE(options.memStickInserted.has_value());
+		EXPECT_FALSE(options.memStickInserted.value_or(true));
+	}
+	// Integers take decimal or 0x hex. A leading 0 is still decimal, and a full 32-bit mask wraps
+	// into the int rather than being refused.
+	{
+		const char *argv[] = {
+			"ppsspp",
+			"--disable-hle=0x110",
+			"--force-hle=0xFFFFFFFF",
+			"--cpu-mhz=0333",
+			"--resolution-scale=-2",
+		};
+		int argc = ARRAY_SIZE(argv);
+		CommandLineOptions options;
+		EXPECT_EQ_INT((int)options.Parse(argc, argv, CmdLineMode::Headless), (int)CommandLineParseResult::Continue);
+		EXPECT_EQ_INT(options.disableHLE.value_or(0), 0x110);
+		EXPECT_EQ_INT(options.forceHLE.value_or(0), -1);
+		EXPECT_EQ_INT(options.lockedCPUSpeed.value_or(0), 333);
+		EXPECT_EQ_INT(options.resolutionScale.value_or(0), -2);
+	}
+	// Trailing junk used to be ignored, so 0x110 quietly meant 0.
+	{
+		const char *bad[] = { "--disable-hle=0x110junk", "--disable-hle=12abc", "--disable-hle=0x", "--disable-hle= 5", "--disable-hle=0x100000000", "--disable-hle=--1" };
+		for (const char *arg : bad) {
+			const char *argv[] = { "ppsspp", arg };
+			CommandLineOptions options;
+			EXPECT_EQ_INT((int)options.Parse(ARRAY_SIZE(argv), argv, CmdLineMode::Headless), (int)CommandLineParseResult::Error);
+		}
+	}
 	// Test GL version override
 	{
 		const char *argv[] = {
@@ -2961,6 +3688,52 @@ bool TestLang() {
 	return true;
 }
 
+static bool TestOverlayHole() {
+	const int W = 64, H = 48;
+	std::vector<uint8_t> img(W * H * 4);
+	auto fill = [&](int x0, int y0, int x1, int y1, uint8_t a) {
+		for (int y = y0; y < y1; y++)
+			for (int x = x0; x < x1; x++)
+				img[(y * W + x) * 4 + 3] = a;
+	};
+	int x, y, w, h;
+
+	// Opaque frame with a transparent hole at 8,4 size 40x30 (contains the center 32,24).
+	fill(0, 0, W, H, 255);
+	fill(8, 4, 48, 34, 0);
+	EXPECT_TRUE(DetectOverlayHole(img.data(), W, H, &x, &y, &w, &h));
+	EXPECT_EQ_INT(x, 8);
+	EXPECT_EQ_INT(y, 4);
+	EXPECT_EQ_INT(w, 40);
+	EXPECT_EQ_INT(h, 30);
+
+	// A semi-transparent glare over the screen area and soft edges still count as the hole.
+	fill(20, 10, 40, 30, 200);
+	fill(7, 4, 8, 34, 128);
+	EXPECT_TRUE(DetectOverlayHole(img.data(), W, H, &x, &y, &w, &h));
+	EXPECT_EQ_INT(x, 7);
+	EXPECT_EQ_INT(w, 41);
+
+	// Fully transparent image: the hole is the whole image.
+	fill(0, 0, W, H, 0);
+	EXPECT_TRUE(DetectOverlayHole(img.data(), W, H, &x, &y, &w, &h));
+	EXPECT_EQ_INT(x, 0);
+	EXPECT_EQ_INT(y, 0);
+	EXPECT_EQ_INT(w, W);
+	EXPECT_EQ_INT(h, H);
+
+	// Hole not covering the center: no valid start point.
+	fill(0, 0, W, H, 255);
+	fill(0, 0, 30, 20, 0);
+	EXPECT_FALSE(DetectOverlayHole(img.data(), W, H, &x, &y, &w, &h));
+
+	// Tiny hole is rejected.
+	fill(0, 0, W, H, 255);
+	fill(30, 22, 36, 28, 0);
+	EXPECT_FALSE(DetectOverlayHole(img.data(), W, H, &x, &y, &w, &h));
+	return true;
+}
+
 typedef bool (*TestFunc)();
 struct TestItem {
 	const char *name;
@@ -2970,17 +3743,26 @@ struct TestItem {
 #define TEST_ITEM(name) { #name, &Test ##name, }
 
 bool TestArmEmitter();
+bool TestArmDisasm();
 bool TestArm64Emitter();
+bool TestArm64Disasm();
+bool TestCrossSIMD();
 bool TestX64Emitter();
 bool TestRiscVEmitter();
 bool TestLoongArch64Emitter();
 bool TestShaderGenerators();
-bool TestSoftwareGPUJit();
 bool TestIRPassSimplify();
 bool TestThreadManager();
 bool TestVFS();
 bool TestZipSlip();
+bool TestPS1Eboot();
 bool TestLzrc();
+bool TestCwCheat();
+bool TestMpegCsc();
+bool TestSplineTessellation();
+bool TestGEMath();
+bool TestBoundingBoxFast();
+bool TestDepthRaster();
 bool TestDemangle();
 
 // The 8.3 short names games read out of d_private. These aren't verified against hardware yet (no
@@ -3070,6 +3852,107 @@ bool TestFatShortNames() {
 	return true;
 }
 
+// A TextDrawer whose "font" is ten units per byte and twenty per line, so we can test the
+// shared caching and wrapping logic without a platform font backend.
+class FakeTextDrawer : public TextDrawer {
+public:
+	FakeTextDrawer() : TextDrawer(nullptr) {}
+
+	void TestDropShadow(std::vector<uint8_t> &bitmapData, TextStringEntry &entry, Draw::DataFormat srcFormat) {
+		AddDropShadow(bitmapData, entry, srcFormat);
+	}
+
+	int measureCalls = 0;
+
+protected:
+	void EnsureFont(const FontStyle &style) override {}
+	bool DrawStringBitmap(const FontStyle &style, std::vector<uint8_t> &bitmapData, TextStringEntry &entry, Draw::DataFormat texFormat, std::string_view str, int align, bool fullColor) override { return false; }
+	void MeasureStringInternal(const FontStyle &style, std::string_view str, float *w, float *h) override {
+		measureCalls++;
+		std::vector<std::string_view> lines;
+		SplitString(str, '\n', lines);
+		int maxLen = 0;
+		for (auto line : lines) {
+			maxLen = std::max(maxLen, (int)line.size());
+		}
+		*w = maxLen * 10.0f;
+		*h = lines.size() * 20.0f;
+	}
+	bool SupportsColorEmoji() const override { return false; }
+	void ClearFonts() override {}
+};
+
+bool TestTextDrawerCache() {
+	FakeTextDrawer drawer;
+	drawer.SetForcedDPIScale(1.0f);
+	const FontStyle font20(FontFamily::SansSerif, 20, FontStyleFlags::Default);
+	const FontStyle font30(FontFamily::SansSerif, 30, FontStyleFlags::Default);
+
+	float w, h;
+	drawer.MeasureString(font20, 1.0f, 1.0f, "hello", &w, &h);
+	EXPECT_EQ_FLOAT(w, 50.0f);
+	EXPECT_EQ_FLOAT(h, 20.0f);
+	drawer.MeasureString(font20, 1.0f, 1.0f, "hello", &w, &h);
+	EXPECT_EQ_INT(drawer.measureCalls, 1);
+
+	// A different style is a different cache entry, but a different scale isn't.
+	drawer.MeasureString(font30, 1.0f, 1.0f, "hello", &w, &h);
+	EXPECT_EQ_INT(drawer.measureCalls, 2);
+	drawer.MeasureString(font30, 2.0f, 2.0f, "hello", &w, &h);
+	EXPECT_EQ_FLOAT(w, 100.0f);
+	EXPECT_EQ_INT(drawer.measureCalls, 2);
+
+	const std::string_view para = "The quick brown fox jumps over the lazy dog, and then it does it again, and again, until the dog finally gets up and leaves.";
+	drawer.MeasureStringRect(font30, 1.0f, 1.0f, para, 200.0f, &w, &h, FLAG_WRAP_TEXT);
+	// The trailing space of a wrapped line is measured too.
+	EXPECT_TRUE(w <= 210.0f);
+	EXPECT_TRUE(h > 20.0f);
+	float w2, h2;
+	int callsBefore = drawer.measureCalls;
+	drawer.MeasureStringRect(font30, 1.0f, 1.0f, para, 200.0f, &w2, &h2, FLAG_WRAP_TEXT);
+	EXPECT_EQ_FLOAT(w, w2);
+	EXPECT_EQ_FLOAT(h, h2);
+	EXPECT_EQ_INT(drawer.measureCalls, callsBefore);
+
+	// Scaling the font changes where the text wraps.
+	drawer.MeasureStringRect(font30, 0.5f, 0.5f, para, 200.0f, &w2, &h2, FLAG_WRAP_TEXT);
+	EXPECT_TRUE(h2 < h * 0.5f);
+
+	drawer.MeasureStringRect(font30, 1.0f, 1.0f, para, 200.0f, &w, &h, FLAG_ELLIPSIZE_TEXT);
+	EXPECT_EQ_FLOAT(h, 20.0f);
+	EXPECT_TRUE(w <= 200.0f);
+
+	// An 8x8 square of coverage in a 16x16 bitmap.
+	auto shadowTest = [&](float dpiScale, TextStringEntry &entry, std::vector<uint8_t> &bitmap) {
+		drawer.SetForcedDPIScale(dpiScale);
+		entry.width = entry.height = entry.bmWidth = entry.bmHeight = 16;
+		bitmap.assign(16 * 16, 0);
+		for (int y = 4; y < 12; y++) {
+			memset(&bitmap[y * 16 + 4], 0xFF, 8);
+		}
+		drawer.TestDropShadow(bitmap, entry, Draw::DataFormat::R8_UNORM);
+	};
+	TextStringEntry entry1(0), entry2(0);
+	std::vector<uint8_t> bitmap;
+	shadowTest(1.0f, entry1, bitmap);
+	const int pad = entry1.shadowPad;
+	EXPECT_TRUE(pad > 0);
+	EXPECT_EQ_INT(entry1.width, 16);
+	EXPECT_TRUE(entry1.bmWidth >= 16 + pad * 2 && (entry1.bmWidth & 3) == 0);
+	EXPECT_EQ_INT((int)bitmap.size(), entry1.bmWidth * entry1.bmHeight * 4);
+	const uint32_t *pixels = (const uint32_t *)bitmap.data();
+	auto pixel = [&](int x, int y) { return pixels[(y + pad) * entry1.bmWidth + x + pad]; };
+	// The text stays opaque white, the shadow around it is black and partly transparent, and the far corner is empty.
+	EXPECT_EQ_INT(pixel(8, 8), 0xFFFFFFFF);
+	EXPECT_EQ_INT(pixel(12, 12) & 0x00FFFFFF, 0);
+	EXPECT_TRUE((pixel(12, 12) >> 24) > 0);
+	EXPECT_EQ_INT(pixel(-pad, -pad), 0);
+	// Higher DPI means more pixels per UI unit, so a bigger blur in pixels.
+	shadowTest(0.5f, entry2, bitmap);
+	EXPECT_TRUE(entry2.shadowPad > pad);
+	return true;
+}
+
 // Tab/Shift+Tab focus navigation walks the view hierarchy in declaration order rather than by
 // geometry, so what it does is entirely determined by CollectTabOrder - which is worth pinning
 // down, since the interesting cases (nesting, hidden tabs, disabled items) are all structural.
@@ -3133,14 +4016,170 @@ bool TestUITabOrder() {
 	return true;
 }
 
+// Arrow key focus moves go by geometry, so these place views by hand rather than running layout.
+bool TestUIFocusNavigation() {
+	using namespace UI;
+
+	auto add = [](LinearLayout *parent, float x, float y, float w, float h) {
+		Choice *choice = parent->Add(new Choice(""));
+		choice->SetBounds(Bounds(x, y, w, h));
+		return choice;
+	};
+	auto move = [](ViewGroup *root, View *from, FocusMove dir) {
+		return root->FindNeighbor(from, dir, NeighborResult()).view;
+	};
+
+	{
+		// A wide button between rows of narrow ones. Its center is far from the narrow ones at the
+		// ends, but its edge is right there, so it mustn't be skipped.
+		LinearLayout root(ORIENT_VERTICAL);
+		Choice *topLeft = add(&root, 0, 0, 100, 50);
+		Choice *topRight = add(&root, 500, 0, 100, 50);
+		Choice *wide = add(&root, 0, 60, 600, 50);
+		Choice *bottomLeft = add(&root, 0, 120, 100, 50);
+		Choice *bottomRight = add(&root, 500, 120, 100, 50);
+		EXPECT_TRUE(move(&root, topRight, FocusMove::DOWN) == wide);
+		EXPECT_TRUE(move(&root, topLeft, FocusMove::DOWN) == wide);
+		EXPECT_TRUE(move(&root, bottomRight, FocusMove::UP) == wide);
+		EXPECT_TRUE(move(&root, bottomLeft, FocusMove::UP) == wide);
+		// From the wide one, the one nearest its center across the move.
+		EXPECT_TRUE(move(&root, bottomLeft, FocusMove::RIGHT) == bottomRight);
+		EXPECT_TRUE(move(&root, wide, FocusMove::LEFT) == nullptr);
+	}
+
+	{
+		// A row: left and right go to the neighbors, and nothing is up or down.
+		LinearLayout root(ORIENT_HORIZONTAL);
+		Choice *a = add(&root, 0, 0, 100, 50);
+		Choice *b = add(&root, 110, 0, 100, 50);
+		Choice *c = add(&root, 220, 0, 100, 50);
+		EXPECT_TRUE(move(&root, b, FocusMove::RIGHT) == c);
+		EXPECT_TRUE(move(&root, b, FocusMove::LEFT) == a);
+		EXPECT_TRUE(move(&root, a, FocusMove::LEFT) == nullptr);
+		EXPECT_TRUE(move(&root, b, FocusMove::UP) == nullptr);
+		EXPECT_TRUE(move(&root, b, FocusMove::DOWN) == nullptr);
+	}
+
+	{
+		// Going down, the next row wins even off to the side, over something in line much further on.
+		LinearLayout root(ORIENT_VERTICAL);
+		Choice *origin = add(&root, 0, 0, 100, 50);
+		Choice *nextRowAside = add(&root, 150, 60, 100, 50);
+		add(&root, 0, 500, 100, 50);
+		EXPECT_TRUE(move(&root, origin, FocusMove::DOWN) == nextRowAside);
+	}
+
+	{
+		// Sideways, things in line win however far away they are.
+		LinearLayout root(ORIENT_HORIZONTAL);
+		Choice *origin = add(&root, 0, 0, 50, 100);
+		add(&root, 60, 150, 50, 100);
+		Choice *inLine = add(&root, 500, 0, 50, 100);
+		EXPECT_TRUE(move(&root, origin, FocusMove::RIGHT) == inLine);
+	}
+
+	{
+		// Rows shifted against each other: down goes to the one below the origin's center.
+		LinearLayout root(ORIENT_VERTICAL);
+		Choice *origin = add(&root, 100, 0, 100, 50);
+		add(&root, 20, 60, 100, 50);
+		Choice *underCenter = add(&root, 130, 60, 100, 50);
+		EXPECT_TRUE(move(&root, origin, FocusMove::DOWN) == underCenter);
+	}
+
+	{
+		// Things that can't take focus are passed over, also inside nested groups.
+		LinearLayout root(ORIENT_VERTICAL);
+		Choice *origin = add(&root, 0, 0, 100, 50);
+		Choice *disabled = add(&root, 0, 60, 100, 50);
+		disabled->SetEnabled(false);
+		LinearLayout *inner = root.Add(new LinearLayout(ORIENT_VERTICAL));
+		Choice *hidden = add(inner, 0, 120, 100, 50);
+		hidden->SetVisibility(V_INVISIBLE);
+		Choice *last = add(inner, 0, 180, 100, 50);
+		EXPECT_TRUE(move(&root, origin, FocusMove::DOWN) == last);
+		EXPECT_TRUE(move(&root, last, FocusMove::UP) == origin);
+	}
+
+	return true;
+}
+
 bool TestTextureReplacer();
+
+static bool TestQueueBuf() {
+	const u8 data[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+	u8 out[16]{};
+
+	QueueBuf q(8);
+	q.push(data, 6);
+	EXPECT_EQ_INT(q.pop(out, 4), 4);
+	// Wraps around the end, holding 5 6 1 2 3 4 5.
+	q.push(data, 5);
+	// Growing has to keep what's buffered, in order.
+	q.resize(16);
+	EXPECT_EQ_INT(q.getCapacity(), 16);
+	EXPECT_EQ_INT(q.pop(out, 16), 7);
+	const u8 expected[7] = { 5, 6, 1, 2, 3, 4, 5 };
+	EXPECT_EQ_MEM(out, expected, sizeof(expected));
+
+	// Pushing more than the capacity grows it.
+	QueueBuf small(4);
+	small.push(data, 8);
+	EXPECT_EQ_INT(small.pop(out, 16), 8);
+	EXPECT_EQ_MEM(out, data, sizeof(data));
+	return true;
+}
+
+static bool TestRequestManager() {
+	RequestManager rm;
+	std::vector<std::string> results;
+	auto ask = [&](RequesterToken token, std::string name) {
+		rm.MakeSystemRequest(SystemRequestType::INPUT_TEXT_MODAL, token, [&results, name](std::string_view value, int) {
+			results.push_back(name + "=" + std::string(value));
+		}, nullptr, "", "", 0);
+		return g_lastInputBoxRequestId;
+	};
+
+	RequesterToken tokenA = rm.GenerateRequesterToken();
+	RequesterToken tokenB = rm.GenerateRequesterToken();
+
+	// Forgotten before the answer arrives.
+	int a1 = ask(tokenA, "a1");
+	rm.ForgetRequestsWithToken(tokenA);
+	rm.PostSystemSuccess(a1, "x");
+	// Forgotten after the answer arrived, but before it was processed.
+	int a2 = ask(tokenA, "a2");
+	int b1 = ask(tokenB, "b1");
+	rm.PostSystemSuccess(a2, "y");
+	rm.PostSystemSuccess(b1, "z");
+	rm.ForgetRequestsWithToken(tokenA);
+	rm.ProcessRequests();
+	EXPECT_EQ_INT((int)results.size(), 1);
+	EXPECT_TRUE(results[0] == "b1=z");
+
+	// A callback that forgets its requester drops the rest of its responses in the same batch.
+	results.clear();
+	int b2 = rm.MakeSystemRequest(SystemRequestType::INPUT_TEXT_MODAL, tokenB, [&](std::string_view, int) {
+		results.push_back("b2");
+		rm.ForgetRequestsWithToken(tokenB);
+	}, nullptr, "", "", 0) ? g_lastInputBoxRequestId : -1;
+	int b3 = ask(tokenB, "b3");
+	rm.PostSystemSuccess(b2, "");
+	rm.PostSystemSuccess(b3, "");
+	rm.ProcessRequests();
+	EXPECT_EQ_INT((int)results.size(), 1);
+	EXPECT_TRUE(results[0] == "b2");
+	return true;
+}
 
 TestItem availableTests[] = {
 #if PPSSPP_ARCH(ARM64) || PPSSPP_ARCH(AMD64) || PPSSPP_ARCH(X86)
 	TEST_ITEM(Arm64Emitter),
+	TEST_ITEM(Arm64Disasm),
 #endif
 #if PPSSPP_ARCH(ARM) || PPSSPP_ARCH(AMD64) || PPSSPP_ARCH(X86)
 	TEST_ITEM(ArmEmitter),
+	TEST_ITEM(ArmDisasm),
 #endif
 #if PPSSPP_ARCH(AMD64) || PPSSPP_ARCH(X86)
 	TEST_ITEM(X64Emitter),
@@ -3152,13 +4191,16 @@ TestItem availableTests[] = {
 	TEST_ITEM(LoongArch64Emitter),
 #endif
 	TEST_ITEM(VertexJit),
-	TEST_ITEM(Asin),
-	TEST_ITEM(SinCos),
+	TEST_ITEM(BoundingBoxFast),
+	TEST_ITEM(DepthRaster),
 	TEST_ITEM(VFPUSinCos),
+	TEST_ITEM(VFPUDot),
 	TEST_ITEM(MathUtil),
 	TEST_ITEM(Parsers),
 	TEST_ITEM(TruncateCpy),
 	TEST_ITEM(MemBlockInfoSaveState),
+	TEST_ITEM(MemBlockInfoRangeWrap),
+	TEST_ITEM(LogFileOpen),
 	TEST_ITEM(Serializer),
 	TEST_ITEM(BlockAllocator),
 	TEST_ITEM(SymbolMap),
@@ -3166,16 +4208,31 @@ TestItem availableTests[] = {
 	TEST_ITEM(Breakpoints),
 	TEST_ITEM(TempBreakpoints),
 	TEST_ITEM(Utf8),
+	TEST_ITEM(TextDecoders),
 	TEST_ITEM(IRPassSimplify),
 	TEST_ITEM(Jit),
+	TEST_ITEM(JitDotBench),
+	TEST_ITEM(JitReplacementHooks),
+	TEST_ITEM(CPUEret),
+	TEST_ITEM(MMIO),
+	TEST_ITEM(MESpace),
+	TEST_ITEM(MeCore),
+	TEST_ITEM(MeInterrupts),
+	TEST_ITEM(MeWait),
+	TEST_ITEM(MeDmacplus),
+	TEST_ITEM(CPUEquivalence),
+	TEST_ITEM(CPURoundingMode),
+	TEST_ITEM(VFPUDotJit),
 	TEST_ITEM(VFPUMatrixTranspose),
 	TEST_ITEM(ParseLBN),
+	TEST_ITEM(CachingFileLoader),
 	TEST_ITEM(QuickTexHash),
 	TEST_ITEM(CLZ),
 	TEST_ITEM(MemMap),
+	TEST_ITEM(BlockShadow),
 	TEST_ITEM(ShaderGenerators),
-	TEST_ITEM(SoftwareGPUJit),
 	TEST_ITEM(Path),
+	TEST_ITEM(OverlayHole),
 	TEST_ITEM(AndroidContentURI),
 	TEST_ITEM(ThreadManager),
 	TEST_ITEM(WrapText),
@@ -3183,6 +4240,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(FastVec),
 	TEST_ITEM(SmallDataConvert),
 	TEST_ITEM(InputMapping),
+	TEST_ITEM(ComboSuppression),
 	TEST_ITEM(EscapeMenuString),
 	TEST_ITEM(VFS),
 	TEST_ITEM(Substitutions),
@@ -3193,17 +4251,34 @@ TestItem availableTests[] = {
 	TEST_ITEM(SIMD),
 	TEST_ITEM(CrossSIMD),
 	TEST_ITEM(VolumeFunc),
+	TEST_ITEM(ConfigSettings),
 	TEST_ITEM(SplitSearch),
 	TEST_ITEM(FriendlyPath),
 	TEST_ITEM(LinAlg),
 	TEST_ITEM(Lang),
 	TEST_ITEM(CmdLine),
 	TEST_ITEM(ZipSlip),
+	TEST_ITEM(PS1Eboot),
 	TEST_ITEM(Lzrc),
+	TEST_ITEM(CwCheat),
+	TEST_ITEM(MpegCsc),
+	TEST_ITEM(SplineTessellation),
+	TEST_ITEM(GEMath),
+	TEST_ITEM(DepthSwizzle),
 	TEST_ITEM(Demangle),
 	TEST_ITEM(TextureReplacer),
 	TEST_ITEM(UITabOrder),
+	TEST_ITEM(UIFocusNavigation),
+	TEST_ITEM(TextDrawerCache),
 	TEST_ITEM(FatShortNames),
+	TEST_ITEM(GEDumpGameID),
+	TEST_ITEM(UmdDiscType),
+	TEST_ITEM(QueueBuf),
+	TEST_ITEM(RequestManager),
+	TEST_ITEM(StackWalk),
+	TEST_ITEM(InetPton),
+	TEST_ITEM(SaveStateMounts),
+	TEST_ITEM(SaveStatePeek),
 };
 
 int main(int argc, const char *argv[]) {

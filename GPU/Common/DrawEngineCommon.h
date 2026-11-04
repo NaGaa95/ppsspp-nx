@@ -33,11 +33,17 @@
 
 class VertexDecoder;
 struct DepthDraw;
+class DepthRasterWorker;
 
 enum {
 	VERTEX_BUFFER_MAX = 65536,
 	DECODED_VERTEX_BUFFER_SIZE = VERTEX_BUFFER_MAX * 2 * 36,  // 36 == sizeof(SimpleVertex)
 	DECODED_INDEX_BUFFER_SIZE = VERTEX_BUFFER_MAX * 6 * 6 * 2,   // * 6 for spline tessellation, then * 6 again for converting into points/lines, and * 2 for 2 bytes per index
+	// TestBoundingBox handles up to 1025 vertices: corners (SimpleVertex), then positions, then decoded vertices.
+	BBOX_SCRATCH_CORNERS_OFFSET = 0,
+	BBOX_SCRATCH_VERTS_OFFSET = 64 * 1024,
+	BBOX_SCRATCH_TEMP_OFFSET = 128 * 1024,
+	BBOX_SCRATCH_SIZE = 256 * 1024,
 };
 
 enum {
@@ -45,9 +51,6 @@ enum {
 	TEX_SLOT_SHADERBLEND_SRC = 1,
 	TEX_SLOT_ALPHATEST = 2,
 	TEX_SLOT_CLUT = 3,
-	TEX_SLOT_SPLINE_POINTS = 4,
-	TEX_SLOT_SPLINE_WEIGHTS_U = 5,
-	TEX_SLOT_SPLINE_WEIGHTS_V = 6,
 };
 
 enum FBOTexState {
@@ -68,6 +71,8 @@ struct alignas(16) Plane8 {
 
 class DrawEngineCommon {
 public:
+	DrawEngineCommon(const DrawEngineCommon &) = delete;
+	DrawEngineCommon &operator=(const DrawEngineCommon &) = delete;
 	DrawEngineCommon();
 	virtual ~DrawEngineCommon();
 
@@ -98,9 +103,11 @@ public:
 	bool TestBoundingBox(const void *control_points, const void *inds, int vertexCount, const VertexDecoder *dec, u32 vertType);
 
 	// This is a less accurate version of TestBoundingBox, but faster. Can have more false positives.
-	// Doesn't support indexing.
-	bool TestBoundingBoxFast(const float *cullMatrix, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, ClipInfoFlags *clipInfoFlags);
+	static bool TestBoundingBoxFast(const float *cullMatrix, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, ClipInfoFlags *clipInfoFlags);
 	bool TestBoundingBoxThrough(GEPrimitiveType prim, const void *vdata, const void *idata, int vertexCount, const VertexDecoder *dec, u32 vertType, int *bytesRead, ClipInfoFlags *flags);
+	// For a draw too big or complex for TestBoundingBoxFast: the fallbacks it would need on a GPU that lacks
+	// depth clamp or clip distances, assuming the worst, or nothing (not Valid) if none are needed.
+	static ClipInfoFlags UncheckedClipInfoFlags();
 	bool EstimateThroughPrimSafeSize(const void *verts, const void *inds, GEPrimitiveType prim, int vertexCount, const VertexDecoder *dec, u32 vertType, int *safeWidth, int *safeHeight);
 
 	void FlushPartialDecode() {
@@ -113,7 +120,8 @@ public:
 		}
 	}
 
-	int ExtendNonIndexedPrim(const uint32_t *cmd, const uint32_t *stall, const VertexDecoder *dec, u32 vertTypeID, bool clockwise, int *bytesRead, bool isTriangle, ClipInfoFlags clipInfoFlags);
+	// maxVerts: how many vertices fit in valid memory from the current vertex address.
+	int ExtendNonIndexedPrim(const uint32_t *cmd, const uint32_t *stall, const VertexDecoder *dec, u32 vertTypeID, bool clockwise, int *bytesRead, bool isTriangle, ClipInfoFlags clipInfoFlags, int maxVerts);
 	bool SubmitPrim(const void *verts, const void *inds, GEPrimitiveType prim, int vertexCount, const VertexDecoder *dec, u32 vertTypeID, bool clockwise, int *bytesRead, ClipInfoFlags clipInfoFlags);
 	void SkipPrim(GEPrimitiveType prim, int vertexCount, const VertexDecoder *dec, int *bytesRead);
 
@@ -153,7 +161,14 @@ public:
 		return decoded_ + 12 * 65536;
 	}
 
+	// Rasterizes the queued depth draws, and waits for them.
 	void FlushQueuedDepth();
+	// Starts rasterizing the queued depth draws, without waiting.
+	void SubmitQueuedDepth();
+	// Waits for the depth draws already submitted, leaving the queued ones queued.
+	void WaitForSubmittedDepth();
+	// Waits if depth rasterization in progress may write to these bytes.
+	void WaitForDepthWrites(u32 addr, u32 size);
 
 protected:
 	bool CheckClipFlags(bool useHwTransform) const;
@@ -161,15 +176,34 @@ protected:
 	void DecodeVerts(const VertexDecoder *dec, u8 *dest);
 	int DecodeInds();
 
+	// How many vertices software transform turns a prim into, for the prims it expands to quads.
+	static int ExpandedVertexCount(GEPrimitiveType prim, int vertexCount) {
+		switch (prim) {
+		case GE_PRIM_POINTS: return vertexCount * 4;
+		case GE_PRIM_LINES: return (vertexCount / 2) * 4;
+		case GE_PRIM_LINE_STRIP: return vertexCount > 1 ? (vertexCount - 1) * 4 : 0;
+		case GE_PRIM_RECTANGLES: return (vertexCount / 2) * 4;
+		default: return 0;
+		}
+	}
+
+	// Whether an indexed draw can share the previous draw's vertex decode, by widening its index range.
+	bool CanExtendDecode(const void *verts, const void *inds, const VertexDecoder *dec) const {
+		return inds && numDrawVerts_ > decodeVertsCounter_ && drawVerts_[numDrawVerts_ - 1].verts == verts && !dec->skinInDecode;
+	}
+
 	int ComputeNumVertsToDecode() const;
 
 	void ApplyFramebufferRead(FBOTexState *fboTexState);
+	// For BindFramebufferAsColorTexture, when the draw reads the target for shader blending.
+	int ShaderReadBindFlags() const;
 
 	void InitDepthRaster();
 	void ShutdownDepthRaster();
 	void DepthRasterSubmitRaw(GEPrimitiveType prim, const VertexDecoder *dec, uint32_t vertTypeID, int vertexCount);
 	void DepthRasterPredecoded(GEPrimitiveType prim, const void *inVerts, int numDecoded, const VertexDecoder *dec, int vertexCount);
 	bool CalculateDepthDraw(DepthDraw *draw, GEPrimitiveType prim, int vertexCount, int numDecoded);
+	void CommitDepthDraw(const DepthDraw &draw, int vertexCount, int numDecoded);
 
 	static inline int IndexSize(u32 vtype) {
 		const u32 indexType = (vtype & GE_VTYPE_IDX_MASK);
@@ -211,6 +245,8 @@ protected:
 		numDrawVerts_ = 0;
 		numDrawInds_ = 0;
 		vertexCountInDrawCalls_ = 0;
+		expandedVertsInDrawCalls_ = 0;
+		numVertsToDecode_ = 0;
 		decodeIndsCounter_ = 0;
 		decodeVertsCounter_ = 0;
 		seenPrims_ = 0;
@@ -265,14 +301,22 @@ protected:
 	bool useHWTransform_ = false;
 	// Used to prevent unnecessary flushing in softgpu.
 	bool flushOnParams_ = true;
+	// Whether SubmitCurve may queue its output as predecoded, rather than through DispatchSubmitPrim.
+	bool curvesPredecoded_ = true;
 
 	// Set once a equal depth test is encountered.
 	bool everUsedEqualDepth_ = false;
 	bool everUsedExactEqualDepth_ = false;
 
+	// The draw context's invalidation callback is installed from BeginFrame, on the emu thread. The draw
+	// engine is created on the loader thread, while the UI thread may already be rendering and calling it.
+	bool invalidationCallbackInstalled_ = false;
+
 	// Vertex collector buffers
 	u8 *decoded_ = nullptr;
 	u16 *decIndex_ = nullptr;
+	// Separate from decoded_, which can hold decoded vertices that haven't been flushed yet.
+	u8 *bboxScratch_ = nullptr;
 
 	// Cached vertex decoders
 	DenseHashMap<u32, VertexDecoder *> decoderMap_;
@@ -289,6 +333,7 @@ protected:
 		u32 vertexCount;
 		u16 indexLowerBound;
 		u16 indexUpperBound;
+		bool predecoded;  // Already in decoded form (a tessellated curve), so DecodeVerts only copies it, if even that.
 	};
 
 	struct DeferredInds {
@@ -305,6 +350,9 @@ protected:
 	enum { MAX_DEFERRED_DRAW_INDS = 512 };  // Monster Hunter spams indexed calls that we end up merging.
 	DeferredVerts drawVerts_[MAX_DEFERRED_DRAW_VERTS];
 	uint32_t drawVertexOffsets_[MAX_DEFERRED_DRAW_VERTS];
+	// A cull mode change flushes, so all draws in a batch share this.
+	bool BatchTrianglesReversed() const { return numDrawInds_ > 0 && !drawInds_[0].clockwise; }
+
 	DeferredInds drawInds_[MAX_DEFERRED_DRAW_INDS];
 
 	const VertexDecoder *dec_ = nullptr;
@@ -312,6 +360,11 @@ protected:
 	int numDrawVerts_ = 0;
 	int numDrawInds_ = 0;
 	int vertexCountInDrawCalls_ = 0;
+	// How many vertices software transform expands the queued points, lines and rectangles to (4 per
+	// point, line or rectangle). Must stay <= VERTEX_BUFFER_MAX, or the expansion drops the whole draw.
+	int expandedVertsInDrawCalls_ = 0;
+	// How many vertices DecodeVerts will produce for the queued draws. Must stay <= VERTEX_BUFFER_MAX.
+	int numVertsToDecode_ = 0;
 
 	int decodeVertsCounter_ = 0;
 	int decodeIndsCounter_ = 0;
@@ -338,18 +391,11 @@ protected:
 	// Software depth raster
 	bool useDepthRaster_ = false;
 
-	float *depthTransformed_ = nullptr;
-	int *depthScreenVerts_ = nullptr;
-	uint16_t *depthIndices_ = nullptr;
+	DepthRasterWorker *depthWorker_ = nullptr;
 
 	// Depth tracking
 	ClipInfoFlags clipInfoFlags_{};
 	ClipInfoFlags lastClipInfoFlags_{};  // Flags at the last flush. For dirtying.
-
-	// Queue
-	int depthVertexCount_ = 0;
-	int depthIndexCount_ = 0;
-	std::vector<DepthDraw> depthDraws_;
 
 	double rasterTimeStart_ = 0.0;
 

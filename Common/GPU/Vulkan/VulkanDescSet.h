@@ -9,7 +9,6 @@ enum class BindingType {
 	COMBINED_IMAGE_SAMPLER,
 	UNIFORM_BUFFER_DYNAMIC_VERTEX,
 	UNIFORM_BUFFER_DYNAMIC_ALL,
-	STORAGE_BUFFER_VERTEX,
 	STORAGE_BUFFER_COMPUTE,
 	STORAGE_IMAGE_COMPUTE,
 	UNIFORM_BUFFER_COMPUTE,
@@ -18,6 +17,8 @@ enum class BindingType {
 // Only appropriate for use in a per-frame pool.
 class VulkanDescSetPool {
 public:
+	VulkanDescSetPool(const VulkanDescSetPool &) = delete;
+	VulkanDescSetPool &operator=(const VulkanDescSetPool &) = delete;
 	VulkanDescSetPool(const char *tag, bool grow = true) : tag_(tag), grow_(grow) {}
 	~VulkanDescSetPool();
 

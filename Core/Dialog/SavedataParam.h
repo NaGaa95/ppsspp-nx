@@ -311,13 +311,13 @@ public:
 	std::string GetSaveDirName(const SceUtilitySavedataParam *param, int saveId = -1) const;
 	std::string GetSaveDir(const SceUtilitySavedataParam *param, int saveId = -1) const;
 	std::string GetSaveDir(const SceUtilitySavedataParam *param, const std::string &saveDirName) const;
-	bool Delete(SceUtilitySavedataParam* param, int saveId = -1);
+	bool Delete(SceUtilitySavedataParam* param, const std::string &saveDir);
 	int DeleteData(SceUtilitySavedataParam* param);
 	int Save(SceUtilitySavedataParam* param, const std::string &saveDirName, bool secureMode = true);
 	int Load(SceUtilitySavedataParam* param, const std::string &saveDirName, int saveId = -1, bool secureMode = true);
 	int GetSizes(SceUtilitySavedataParam* param);
 	bool GetList(SceUtilitySavedataParam* param);
-	int GetFilesList(SceUtilitySavedataParam* param, u32 requestAddr);
+	int GetFilesList(SceUtilitySavedataParam* param, u32 requestAddr, const std::string &saveDirName);
 	bool GetSize(SceUtilitySavedataParam* param);
 	int GetSaveCryptMode(const SceUtilitySavedataParam *param, const std::string &saveDirName);
 	bool IsInSaveDataList(const std::string &saveName, int count);
@@ -363,6 +363,7 @@ public:
 
 private:
 	void Clear();
+	void ShareLoadedIcons();
 	void SetFileInfo(int idx, PSPFileInfo &info, const std::string &saveName, const std::string &saveDir = "");
 	void SetFileInfo(SaveFileInfo &saveInfo, PSPFileInfo &info, const std::string &saveName, const std::string &saveDir = "");
 	void ClearFileInfo(SaveFileInfo &saveInfo, const std::string &saveName);
@@ -381,6 +382,8 @@ private:
 	// data must be zero-padded from len to alignedLen (which should be the next multiply of 16)!
 	int BuildHash(uint8_t *output, const uint8_t *data, unsigned int len, unsigned int alignedLen, int mode, const uint8_t *cryptkey);
 	int DetermineCryptMode(const SceUtilitySavedataParam *param) const;
+	bool UsesSecureVersion(const SceUtilitySavedataParam *param) const;
+	bool MissingRequiredKey(const SceUtilitySavedataParam *param) const;
 
 	std::vector<SaveSFOFileListEntry> GetSFOEntries(const std::string &dirPath);
 	std::set<std::string> GetSecureFileNames(const std::string &dirPath);

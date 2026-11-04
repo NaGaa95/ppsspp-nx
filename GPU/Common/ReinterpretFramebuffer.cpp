@@ -14,11 +14,19 @@ static const SamplerDef samplers[1] = {
 	{ 0, "tex", SamplerFlags::ARRAY_ON_VULKAN }
 };
 
+const char *const g_stencilExportExtension = "#extension GL_ARB_shader_stencil_export : require";
+
 // Requires full size integer math. It would be possible to make a floating point-only version with lots of
 // modulo and stuff, might do it one day.
-Draw2DPipelineInfo GenerateReinterpretFragmentShader(ShaderWriter &writer, GEBufferFormat from, GEBufferFormat to) {
+Draw2DPipelineInfo GenerateReinterpretFragmentShader(ShaderWriter &writer, GEBufferFormat from, GEBufferFormat to, ReinterpretOutput output, bool discardNeedsDepthWrite) {
+	const bool stencil = output != ReinterpretOutput::COLOR;
+
 	writer.HighPrecisionFloat();
 	writer.DeclareSamplers(samplers);
+
+	if (output == ReinterpretOutput::STENCIL_BITS && discardNeedsDepthWrite) {
+		writer.C("layout (depth_unchanged) out float gl_FragDepth;\n");
+	}
 
 	if (writer.Lang().bitwiseOps) {
 		switch (from) {
@@ -157,7 +165,11 @@ Draw2DPipelineInfo GenerateReinterpretFragmentShader(ShaderWriter &writer, GEBuf
 		}
 	}
 
-	writer.BeginFSMain(g_draw2Duniforms, varyings);
+	if (stencil) {
+		writer.BeginFSMain(g_draw2DStencilUniforms, varyings);
+	} else {
+		writer.BeginFSMain(g_draw2Duniforms, varyings);
+	}
 
 	if (IsBufferFormat16Bit(from) && IsBufferFormat16Bit(to)) {
 		writer.C("  vec4 val = ").SampleTexture2D("tex", "v_texcoord.xy").C(";\n");
@@ -165,25 +177,54 @@ Draw2DPipelineInfo GenerateReinterpretFragmentShader(ShaderWriter &writer, GEBuf
 	} else if (IsBufferFormat16Bit(from) && !IsBufferFormat16Bit(to)) {
 		// 16-to-32-bit (two pixels, draw size is halved)
 
-		writer.C("  vec4 valLeft = ").SampleTexture2D("tex", "v_texcoord.xy + vec2(-0.25 / texSize.x, 0.0)").C(";\n");
-		writer.C("  vec4 valRight = ").SampleTexture2D("tex", "v_texcoord.xy + vec2(0.25 / texSize.x, 0.0)").C(";\n");
+		// A 32-bit PSP pixel is two 16-bit ones side by side. At a higher render scale, this render pixel is k pixels
+		// into its PSP pixel, and takes its halves from the render pixels k into each of the two 16-bit PSP pixels,
+		// which keeps the detail within a PSP pixel.
+		writer.C("  float d = floor(v_texcoord.x * texSize.x * 0.5);\n");
+		writer.C("  float pspX = floor(d / scaleFactor);\n");
+		writer.C("  float k = d - pspX * scaleFactor;\n");
+		writer.C("  vec4 valLeft = ").SampleTexture2D("tex", "vec2((2.0 * pspX * scaleFactor + k + 0.5) / texSize.x, v_texcoord.y)").C(";\n");
+		writer.C("  vec4 valRight = ").SampleTexture2D("tex", "vec2(((2.0 * pspX + 1.0) * scaleFactor + k + 0.5) / texSize.x, v_texcoord.y)").C(";\n");
 		writer.C("  vec4 outColor = unpackColor(packColor(valLeft), packColor(valRight));\n");
 
 		_assert_("not yet implemented");
 	} else if (!IsBufferFormat16Bit(from) && IsBufferFormat16Bit(to)) {
 		// 32-to-16-bit (half of the pixel, draw size is doubled).
 
-		writer.C("  vec4 val = ").SampleTexture2D("tex", "v_texcoord.xy").C(";\n");
-		writer.C("  float u = mod(floor(v_texcoord.x * texSize.x * 2.0), 2.0);\n");
+		// The 16-bit PSP pixel this render pixel is k pixels into is a half of 32-bit PSP pixel pspX / 2, so read the
+		// render pixel k into that one, and pick the half by the PSP pixel (not the render pixel).
+		writer.C("  float d = floor(v_texcoord.x * texSize.x * 2.0);\n");
+		writer.C("  float pspX = floor(d / scaleFactor);\n");
+		writer.C("  float k = d - pspX * scaleFactor;\n");
+		writer.C("  vec4 val = ").SampleTexture2D("tex", "vec2((floor(pspX * 0.5) * scaleFactor + k + 0.5) / texSize.x, v_texcoord.y)").C(";\n");
+		writer.C("  float u = mod(pspX, 2.0);\n");
 		writer.C("  vec4 outColor = unpackColor(u == 0.0 ? packColor(val.rg) : packColor(val.ba));\n");
+	}
+
+	if (stencil) {
+		// The same rounding as the stencil upload shader.
+		writer.C("  float alpha = floor(outColor.a * 255.99);\n");
+		if (output == ReinterpretOutput::STENCIL_EXPORT) {
+			writer.C("  gl_FragStencilRefARB = int(alpha);\n");
+		} else {
+			writer.C("  if (stencilValue > 0.0) {\n");
+			writer.C("    float shifted = alpha / floor(stencilValue * 255.99);\n");
+			writer.C("    if (mod(floor(shifted), 2.0) < 0.99) DISCARD;\n");
+			writer.C("  }\n");
+			if (discardNeedsDepthWrite) {
+				writer.C("  gl_FragDepth = gl_FragCoord.z;\n");
+			}
+		}
 	}
 
 	writer.EndFSMain("outColor");
 
-	return Draw2DPipelineInfo{
-		"reinterpret",
+	Draw2DPipelineInfo info{
+		stencil ? "reinterpret_stencil" : "reinterpret",
 		RASTER_COLOR,
 		RASTER_COLOR,
 	};
+	info.writeStencil = stencil;
+	return info;
 }
 

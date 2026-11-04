@@ -16,6 +16,7 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <ctime>
+#include <mutex>
 
 #include "Common/System/System.h"
 #include "Common/System/Request.h"
@@ -39,20 +40,35 @@ GpsStatus gpsStatus = GPS_STATE_OFF;
 GpsData gpsData;
 SatData satData;
 time_t lastGPSTime;
+// The platform's location callbacks set these from their own thread.
+static std::recursive_mutex gpsLock;
 
 void __UsbGpsInit() {
 	gpsStatus = GPS_STATE_OFF;
 }
 
 void __UsbGpsDoState(PointerWrap &p) {
+	const bool wasOn = gpsStatus == GPS_STATE_ON;
 	auto s = p.Section("sceUsbGps", 0, 1);
-	if (!s)
+	if (!s) {
+		// Older states didn't save it, so leave it off.
+		if (p.mode == p.MODE_READ) {
+			if (wasOn) {
+				System_GPSCommand("close");
+			}
+			gpsStatus = GPS_STATE_OFF;
+		}
 		return;
+	}
 
 	Do(p, gpsStatus);
-	if (gpsStatus == GPS_STATE_ON) {
-		GPS::init();
-		System_GPSCommand("open");
+	if (p.mode == p.MODE_READ) {
+		if (gpsStatus == GPS_STATE_ON) {
+			GPS::init();
+			System_GPSCommand("open");
+		} else if (wasOn) {
+			System_GPSCommand("close");
+		}
 	}
 }
 
@@ -86,6 +102,7 @@ static int sceUsbGpsClose() {
 }
 
 static int sceUsbGpsGetData(u32 gpsDataAddr, u32 satDataAddr) {
+	std::lock_guard<std::recursive_mutex> guard(gpsLock);
 	time_t currentTime;
 	time(&currentTime);
 	if (difftime(currentTime, lastGPSTime) > AUTO_UPDATE_GPSTIME)
@@ -103,7 +120,7 @@ static int sceUsbGpsGetData(u32 gpsDataAddr, u32 satDataAddr) {
 	auto satData = PSPPointer<SatData>::Create(satDataAddr);
 	if (satData.IsValid()) {
 		*satData = *GPS::getSatData();
-		gpsData.NotifyWrite("UsbGpsGetData");
+		satData.NotifyWrite("UsbGpsGetData");
 	}
 	return 0;
 }
@@ -154,6 +171,7 @@ void GPS::init() {
 }
 
 void GPS::setGpsTime(time_t *time) {
+	std::lock_guard<std::recursive_mutex> guard(gpsLock);
 	struct tm *gpsTime;
 	gpsTime = gmtime(time);
 
@@ -166,8 +184,9 @@ void GPS::setGpsTime(time_t *time) {
 }
 
 void GPS::setGpsData(long long gpsTime, float hdop, float latitude, float longitude, float altitude, float speed, float bearing) {
-	lastGPSTime = gpsTime;
-	setGpsTime((time_t*)&gpsTime);
+	std::lock_guard<std::recursive_mutex> guard(gpsLock);
+	lastGPSTime = (time_t)gpsTime;
+	setGpsTime(&lastGPSTime);
 
 	gpsData.hdop      = hdop;
 	gpsData.latitude  = latitude;
@@ -178,6 +197,9 @@ void GPS::setGpsData(long long gpsTime, float hdop, float latitude, float longit
 }
 
 void GPS::setSatInfo(short index, unsigned char id, unsigned char elevation, short azimuth, unsigned char snr, unsigned char good) {
+	if (index < 0 || index >= (short)ARRAY_SIZE(satData.satInfo))
+		return;
+	std::lock_guard<std::recursive_mutex> guard(gpsLock);
 	satData.satInfo[index].id = id;
 	satData.satInfo[index].elevation = elevation;
 	satData.satInfo[index].azimuth = azimuth;

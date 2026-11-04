@@ -20,7 +20,6 @@
 
 #include "Core/Core.h"
 #include "Core/MemMap.h"
-#include "Core/Config.h"
 #include "Core/ConfigValues.h"
 
 #include "Core/MIPS/MIPS.h"
@@ -134,7 +133,7 @@ u8 ReadOrException_U8(const u32 address) {
 
 u16 ReadOrException_U16(const u32 address) {
 	u16_le value = 0;
-	ReadMemoryOrException<u16_le>(value, address);
+	ReadMemoryOrException<u16_le>(value, DepthMirrored16(address));
 	return (u16)value;
 }
 
@@ -155,7 +154,7 @@ void WriteOrException_U8(const u8 _Data, const u32 address) {
 }
 
 void WriteOrException_U16(const u16 _Data, const u32 address) {
-	WriteMemoryOrException<u16_le>(address, _Data);
+	WriteMemoryOrException<u16_le>(DepthMirrored16(address), _Data);
 }
 
 void WriteOrException_U32(const u32 _Data, const u32 address) {

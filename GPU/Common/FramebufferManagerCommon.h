@@ -24,6 +24,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <vector>
 #include <unordered_map>
 
@@ -110,6 +111,8 @@ struct VirtualFramebuffer {
 
 	// The scale factor at which we are rendering (to achieve higher resolution).
 	u8 renderScaleFactor;
+	// Whether it gets MSAA, if it's on.
+	bool multisampled;
 
 	u16 usageFlags;
 
@@ -127,8 +130,11 @@ struct VirtualFramebuffer {
 	// Tracking for downloads-to-CLUT.
 	u16 clutUpdatedBytes;
 
-	// Means that the whole image has already been read back to memory - used when combining small readbacks (gameUsesSequentialCopies_).
+	// Means that the whole image has already been read back to memory.
 	bool memoryUpdated;
+	// The whole color image is in readbackShadows_, for partial readbacks to copy from. Like memoryUpdated,
+	// it holds until the next render to the buffer.
+	bool readbackShadowValid;
 
 	// TODO: Fold into usageFlags?
 	bool dirtyAfterDisplay;
@@ -208,6 +214,8 @@ enum BindFramebufferColorFlags {
 	// Used when rendering to a temporary surface (e.g. not the current render target.)
 	BINDFBCOLOR_FORCE_SELF = 8,
 	BINDFBCOLOR_UNCACHED = 16,
+	// The draw reads only the bits its write mask keeps. See maskCopy_.
+	BINDFBCOLOR_MASK_READ = 32,
 };
 
 enum DrawTextureFlags {
@@ -231,6 +239,12 @@ enum class TempFBO {
 	Z_COPY,
 	// Used to copy stencil data, means we need a stencil backing.
 	STENCIL,
+	// Depth moved within one framebuffer, for rendering at an X offset.
+	DEPTH_SHIFT,
+	// The first samples of a multisampled framebuffer.
+	SAMPLE0,
+	// A copy for draws that read only the bits outside their write mask.
+	MASK_COPY,
 };
 
 inline Draw::DataFormat GEFormatToThin3D(GEBufferFormat geFormat) {
@@ -285,12 +299,15 @@ struct DrawPixelsEntry {
 struct GPUDebugBuffer;
 class DrawEngineCommon;
 class PresentationCommon;
+struct OutputParams;
 class ShaderManagerCommon;
 class TextureCacheCommon;
 struct DisplayLayoutConfig;
 
 class FramebufferManagerCommon {
 public:
+	FramebufferManagerCommon(const FramebufferManagerCommon &) = delete;
+	FramebufferManagerCommon &operator=(const FramebufferManagerCommon &) = delete;
 	FramebufferManagerCommon(Draw::DrawContext *draw);
 	virtual ~FramebufferManagerCommon();
 
@@ -302,6 +319,9 @@ public:
 	}
 	void SetDrawEngine(DrawEngineCommon *td) {
 		drawEngine_ = td;
+	}
+	DrawEngineCommon *GetDrawEngine() const {
+		return drawEngine_;
 	}
 
 	void Init(int msaaLevel);
@@ -340,10 +360,13 @@ public:
 	void CopyDisplayToOutput(const DisplayLayoutConfig &config);
 
 	bool NotifyFramebufferCopy(u32 src, u32 dest, int size, GPUCopyFlag flags, u32 skipDrawReason);
-	void PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat fmt);
+	void PerformWriteFormattedFromMemory(u32 addr, int size, int width, GEBufferFormat fmt, int rectWidth);
+	void WriteRectFromMemory(u32 addr, int size, int stride, GEBufferFormat fmt, int rectWidth);
 	void UpdateFromMemory(u32 addr, int size);
 	void ApplyClearToMemory(int x1, int y1, int x2, int y2, u32 clearColor);
 	bool PerformWriteStencilFromMemory(u32 addr, int size, WriteStencil flags);
+	bool ReadbackStencilToMemory(u32 addr, int size);
+	void WriteStencilFromReinterpret(VirtualFramebuffer *src, VirtualFramebuffer *dst, float srcX2, float srcY2, float dstX1, float dstY1, float dstX2, float dstY2);
 
 	// We changed our depth mode, gotta start over.
 	// Ideally, we should convert depth buffers here, not just clear them.
@@ -454,10 +477,16 @@ public:
 	virtual void DeviceLost();
 	virtual void DeviceRestore(Draw::DrawContext *draw);
 
-	Draw::Framebuffer *GetTempFBO(TempFBO reason, u16 w, u16 h);
+	// msaaLevel is only used for DEPTH_SHIFT, which needs the samples of the framebuffer it shifts.
+	Draw::Framebuffer *GetTempFBO(TempFBO reason, u16 w, u16 h, int msaaLevel = 0);
+	// A single-sampled copy of the first sample of each pixel of a multisampled framebuffer, or null if it isn't
+	// multisampled or the backend can't. For reading colors as values, which averaging the samples would corrupt.
+	Draw::Framebuffer *CopyColorSample0(VirtualFramebuffer *vfb);
 
 	// Debug features
 	virtual bool GetFramebuffer(u32 fb_address, int fb_stride, GEBufferFormat format, GPUDebugBuffer &buffer, int maxRes);
+	// The 480x272 the display shows, wherever in a framebuffer it is.
+	bool GetDisplayFramebuffer(GPUDebugBuffer &buffer, int maxRes);
 	virtual bool GetDepthbuffer(u32 fb_address, int fb_stride, u32 z_address, int z_stride, GPUDebugBuffer &buffer);
 	virtual bool GetStencilbuffer(u32 fb_address, int fb_stride, GPUDebugBuffer &buffer);
 	virtual bool GetOutputFramebuffer(GPUDebugBuffer &buffer);
@@ -479,6 +508,7 @@ public:
 
 	// If from==to, returns a copy pipeline.
 	Draw2DPipeline *GetReinterpretPipeline(GEBufferFormat from, GEBufferFormat to, float *scaleFactorX);
+	Draw2DPipeline *GetReinterpretStencilPipeline(GEBufferFormat from, GEBufferFormat to, bool useExport);
 
 	// Public to be used from the texture cache's depal shenanigans.
 	void BlitUsingRaster(
@@ -496,9 +526,23 @@ public:
 
 	void DiscardFramebufferCopy() {
 		currentFramebufferCopy_ = nullptr;
+		maskCopy_ = nullptr;
 	}
+	// The target hasn't changed, but texturing from it should see the latest drawing.
+	void DiscardSelfTextureCopy() {
+		currentFramebufferCopy_ = nullptr;
+	}
+	// Call before a draw to the current render target.
+	void CheckMaskCopy(const VirtualFramebuffer *vfb) {
+		if (maskCopy_) {
+			CheckMaskCopyStillValid(vfb);
+		}
+	}
+	void CheckMaskCopyStillValid(const VirtualFramebuffer *vfb);
 
 	bool PresentedThisFrame() const;
+	void SetPresentationOutput(const OutputParams *output);
+	bool PresentsToOtherOutput() const;
 
 	const std::vector<VirtualFramebuffer *> &GetVFBs() const {
 		return vfbs_;
@@ -513,7 +557,12 @@ public:
 	inline int PeekBindSeqCount() const { return fbBindSeqCount_; }
 
 protected:
-	virtual void ReadbackFramebuffer(VirtualFramebuffer *vfb, int x, int y, int w, int h, RasterChannel channel, Draw::ReadbackMode mode);
+	// With shadow, writes there instead of to PSP memory, at the same offsets from the buffer's address.
+	virtual void ReadbackFramebuffer(VirtualFramebuffer *vfb, int x, int y, int w, int h, RasterChannel channel, Draw::ReadbackMode mode, u8 *shadow = nullptr);
+	bool ReadFromShadow(VirtualFramebuffer *vfb, int x, int y, int w, int h);
+	static int ShadowWidth(const VirtualFramebuffer *vfb) {
+		return std::min((int)vfb->bufferWidth, (int)vfb->fb_stride);
+	}
 	// Used for when a shader is required, such as GLES.
 	virtual bool ReadbackDepthbuffer(Draw::Framebuffer *fbo, int x, int y, int w, int h, uint16_t *pixels, int pixelsStride, int destW, int destH, Draw::ReadbackMode mode);
 	virtual bool ReadbackStencilbuffer(Draw::Framebuffer *fbo, int x, int y, int w, int h, uint8_t *pixels, int pixelsStride, Draw::ReadbackMode mode);
@@ -525,6 +574,7 @@ protected:
 	void CopyToDepthFromOverlappingFramebuffers(VirtualFramebuffer *dest);
 
 	bool UpdateRenderSize(int msaaLevel);
+	bool ShouldMultisample(const VirtualFramebuffer *vfb) const;
 
 	void FlushBeforeCopy();
 	virtual void DecimateFBOs();  // keeping it virtual to let D3D do a little extra
@@ -541,12 +591,18 @@ protected:
 	void NotifyRenderFramebufferSwitched(VirtualFramebuffer *prevVfb, VirtualFramebuffer *vfb, bool isClearingDepth);
 
 	void BlitFramebufferDepth(VirtualFramebuffer *src, VirtualFramebuffer *dst, bool allowSizeMismatch = false);
+	void CopyDepthRect(Draw::Framebuffer *src, int srcX, int srcY, Draw::Framebuffer *dst, int dstX, int dstY, int w, int h, int scaleFactor, const char *tag);
+	void ShiftDepthForOffsetRendering(VirtualFramebuffer *vfb, int xOffset);
+	void EnsureStencilWritePipeline(bool useExportShader);
+	void DrawStencilWritePasses(GEBufferFormat format, int values, u8 usedBits, bool useExportShader);
 
 	void ResizeFramebufFBO(VirtualFramebuffer *vfb, int w, int h, bool force = false, bool skipCopy = false);
 
 	static bool ShouldDownloadFramebufferColor(const VirtualFramebuffer *vfb);
 	static bool ShouldDownloadFramebufferDepth(const VirtualFramebuffer *vfb);
 	void DownloadFramebufferOnSwitch(VirtualFramebuffer *vfb);
+	VirtualFramebuffer *FindDisplayVFB(u32 fbaddr, u32 *offsetX, u32 *offsetY);
+	bool ReadFramebufferForDebug(VirtualFramebuffer *vfb, int x, int y, int w, int h, GPUDebugBuffer &buffer, int maxScaleFactor);
 
 	bool FindTransferFramebuffer(u32 basePtr, int stride, int x, int y, int w, int h, int bpp, bool destination, BlockTransferRect *rect);
 
@@ -561,6 +617,7 @@ protected:
 
 	static void SetColorUpdated(VirtualFramebuffer *dstBuffer, int skipDrawReason) {
 		dstBuffer->memoryUpdated = false;
+		dstBuffer->readbackShadowValid = false;
 		dstBuffer->clutUpdatedBytes = 0;
 		dstBuffer->dirtyAfterDisplay = true;
 		dstBuffer->drawnWidth = dstBuffer->width;
@@ -599,6 +656,12 @@ protected:
 	VirtualFramebuffer *currentRenderVfb_ = nullptr;
 
 	Draw::Framebuffer *currentFramebufferCopy_ = nullptr;
+	// A draw with a write mask only reads the bits the mask keeps, and doesn't change them. So while the same
+	// mask draws on, without blending or a logic op, one copy serves every draw: DBZ Tenkaichi Tag Team draws
+	// its shadows one bit at a time, which took a copy per flush.
+	Draw::Framebuffer *maskCopy_ = nullptr;
+	const VirtualFramebuffer *maskCopyVfb_ = nullptr;
+	u32 maskCopyMask_ = 0;
 
 	// The range of PSP memory that may contain FBOs.  So we can skip iterating.
 	u32 framebufColorRangeEnd_ = 0;
@@ -612,7 +675,8 @@ protected:
 
 	std::vector<DrawPixelsEntry> drawPixelsCache_;
 
-	bool gameUsesSequentialCopies_ = false;
+	// Whole color buffers, read back for partial readbacks to copy from (see ReadFramebufferToMemory).
+	std::unordered_map<const VirtualFramebuffer *, std::vector<u8>> readbackShadows_;
 
 	// Sampled in BeginFrame/UpdateSize for safety.
 	float renderWidth_ = 0.0f;
@@ -631,6 +695,9 @@ protected:
 	};
 
 	std::unordered_map<u64, TempFBOInfo> tempFBOs_;
+	// The render target address the depth was last shifted for (see ShiftDepthForOffsetRendering).
+	u32 depthShiftedFor_ = 0;
+	u32 lastRenderAddress_ = 0;
 
 	std::vector<Draw::Framebuffer *> fbosToDelete_;
 
@@ -644,6 +711,7 @@ protected:
 	// Safe, not optimal - there might be input attachment tricks, etc, but we can't use them
 	// since we don't want N different implementations.
 	Draw2DPipeline *reinterpretFromTo_[4][4]{};
+	Draw2DPipeline *reinterpretStencilFromTo_[4][4]{};
 
 	// Common implementation of stencil buffer upload. Also not 100% optimal, but not performance
 	// critical either.
@@ -659,6 +727,7 @@ protected:
 	// Draw2D pipelines
 	Draw2DPipeline *draw2DPipelineCopyColor_ = nullptr;
 	Draw2DPipeline *draw2DPipelineColorRect2Lin_ = nullptr;
+	Draw2DPipeline *draw2DPipelineColorSample0_ = nullptr;
 	Draw2DPipeline *draw2DPipelineCopyDepth_ = nullptr;
 	Draw2DPipeline *draw2DPipelineEncodeDepth_ = nullptr;
 	Draw2DPipeline *draw2DPipeline565ToDepth_ = nullptr;

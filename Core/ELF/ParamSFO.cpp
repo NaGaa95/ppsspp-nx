@@ -26,6 +26,7 @@
 #include "Common/File/Path.h"
 #include "Core/ELF/ParamSFO.h"
 #include "Core/System.h"
+#include "Core/Util/PathUtil.h"
 
 struct Header
 {
@@ -218,6 +219,14 @@ bool ParamSFOData::ReadSFO(const u8 *paramsfo, size_t size) {
 		default:
 			break;
 		}
+	}
+
+	// The disc ID names host files and directories (configs, cheats, textures, savestates, updates),
+	// so one that could escape them is treated as missing.
+	const std::string discID(StripSpaces(GetValueString("DISC_ID")));
+	if (!discID.empty() && !IsSafePathComponent(discID)) {
+		WARN_LOG(Log::Loader, "Ignoring unsafe DISC_ID in PARAM.SFO: '%s'", discID.c_str());
+		values.erase("DISC_ID");
 	}
 
 	return true;
@@ -464,6 +473,16 @@ GameRegion DetectGameRegionFromID(std::string_view id_full) {
 			 *   'X' -> first-party Minis
 			 *   'Z' -> third-party Minis
 			 */
+		} else if (id_letters[0] == 'S' && (id_letters[1] == 'L' || id_letters[1] == 'C' || id_letters[1] == 'I')) {
+			// PS1 discs: (S)ony, then (L)icensed, (C)opyrighted or (I)nternational, then the region.
+			switch (id_letters[2]) {
+			case 'U': return GameRegion::USA;
+			case 'E': return GameRegion::EUROPE;
+			case 'P': return GameRegion::JAPAN;
+			case 'K': return GameRegion::KOREA;
+			case 'A': return GameRegion::ASIA;
+			default: break;
+			}
 		// Misc patterns
 		} else if (id_letters == "UTST") {
 			return GameRegion::TEST;

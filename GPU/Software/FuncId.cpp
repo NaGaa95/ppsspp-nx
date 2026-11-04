@@ -22,6 +22,7 @@
 #include "GPU/Common/TextureDecoder.h"
 #include "GPU/GPUState.h"
 #include "GPU/Software/FuncId.h"
+#include "GPU/Software/SoftGpu.h"
 
 static_assert(sizeof(SamplerID) == sizeof(SamplerID::fullKey) + sizeof(SamplerID::cached) + sizeof(SamplerID::pad), "Bad sampler ID size");
 static_assert(sizeof(PixelFuncID) == sizeof(PixelFuncID::fullKey) + sizeof(PixelFuncID::cached), "Bad pixel func ID size");
@@ -37,6 +38,19 @@ static inline GEComparison OptimizeRefByteCompare(GEComparison func, u8 ref) {
 	if (ref == 0 && func == GE_COMP_GEQUAL)
 		return GE_COMP_ALWAYS;
 	if (ref == 0xFF && func == GE_COMP_LEQUAL)
+		return GE_COMP_ALWAYS;
+	return func;
+}
+
+// The stencil test compares the other way around, ref against the buffer's value.
+static inline GEComparison OptimizeStencilRefCompare(GEComparison func, u8 ref) {
+	if (ref == 0 && func == GE_COMP_GREATER)
+		return GE_COMP_NEVER;
+	if (ref == 0xFF && func == GE_COMP_LESS)
+		return GE_COMP_NEVER;
+	if (ref == 0 && func == GE_COMP_LEQUAL)
+		return GE_COMP_ALWAYS;
+	if (ref == 0xFF && func == GE_COMP_GEQUAL)
 		return GE_COMP_ALWAYS;
 	return func;
 }
@@ -84,7 +98,7 @@ void ComputePixelFuncID(PixelFuncID *id) {
 
 		if (id->stencilTest) {
 			id->stencilTestRef = gstate.getStencilTestRef() & gstate.getStencilTestMask();
-			id->stencilTestFunc = OptimizeRefByteCompare(gstate.getStencilTestFunction(), id->stencilTestRef);
+			id->stencilTestFunc = OptimizeStencilRefCompare(gstate.getStencilTestFunction(), id->stencilTestRef);
 			id->hasStencilTestMask = gstate.getStencilTestMask() != 0xFF && gstate.FrameBufFormat() != GE_FORMAT_565;
 
 			// Stencil can't be written on 565, and any invalid op acts like KEEP, which is 0.
@@ -169,16 +183,18 @@ void ComputePixelFuncID(PixelFuncID *id) {
 				id->alphaBlendDst = (uint8_t)OptimizeAlphaFactor(gstate.getFixB());
 		}
 
+		id->applyLogicOp = gstate.isLogicOpEnabled() && gstate.getLogicOp() != GE_LOGIC_COPY;
+		id->applyFog = gstate.isFogEnabled() && !gstate.isModeThrough();
+
 		if (id->colorTest && gstate.getColorTestFunction() == GE_COMP_NOTEQUAL && gstate.getColorTestRef() == 0 && gstate.getColorTestMask() == 0xFFFFFF) {
 			if (!id->depthWrite && !id->stencilTest && id->alphaBlend && id->AlphaBlendEq() == GE_BLENDMODE_MUL_AND_ADD) {
-				// Might be a pointless color test (seen in Ridge Racer, for example.)
-				if (id->AlphaBlendDst() == PixelBlendFactor::ONE)
+				// Rejecting black then only skips adding nothing to the destination, unless dithering, fog
+				// or a logic op would still change it: Ridge Racer 2 (UCES00422) adds a glow with dithering,
+				// and its black pixels must not get the dither.
+				if (id->AlphaBlendDst() == PixelBlendFactor::ONE && !id->dithering && !id->applyFog && !id->applyLogicOp)
 					id->colorTest = false;
 			}
 		}
-
-		id->applyLogicOp = gstate.isLogicOpEnabled() && gstate.getLogicOp() != GE_LOGIC_COPY;
-		id->applyFog = gstate.isFogEnabled() && !gstate.isModeThrough();
 
 		id->earlyZChecks = id->DepthTestFunc() != GE_COMP_ALWAYS;
 		if (id->stencilTest && id->earlyZChecks) {
@@ -188,6 +204,8 @@ void ComputePixelFuncID(PixelFuncID *id) {
 		}
 	}
 
+	if (id->depthTestFunc != GE_COMP_ALWAYS || id->depthWrite)
+		id->depthLayout = DepthTranslationIndex(depthbuf.translation);
 	if (id->useStandardStride && (id->depthTestFunc != GE_COMP_ALWAYS || id->depthWrite))
 		id->useStandardStride = gstate.DepthBufStride() == 512;
 
@@ -250,195 +268,6 @@ void ComputePixelFuncID(PixelFuncID *id) {
 		id->cached.alphaBlendDst = gstate.getFixB();
 }
 
-std::string DescribePixelFuncID(const PixelFuncID &id) {
-	std::string desc;
-	if (id.clearMode) {
-		desc = "Clear";
-		if (id.ColorClear())
-			desc += "C";
-		if (id.StencilClear())
-			desc += "S";
-		if (id.DepthClear())
-			desc += "D";
-		desc += ":";
-	}
-	if (id.applyDepthRange)
-		desc += "DepthR:";
-	if (id.useStandardStride)
-		desc += "Str512:";
-	if (id.dithering)
-		desc += "Dith:";
-	if (id.applyColorWriteMask)
-		desc += "Msk:";
-
-	switch (id.fbFormat) {
-	case GE_FORMAT_565: desc += "5650:"; break;
-	case GE_FORMAT_5551: desc += "5551:"; break;
-	case GE_FORMAT_4444: desc += "4444:"; break;
-	case GE_FORMAT_8888: desc += "8888:"; break;
-	}
-
-	if (id.AlphaTestFunc() != GE_COMP_ALWAYS) {
-		if (id.clearMode)
-			desc = "INVALID:" + desc;
-		switch (id.AlphaTestFunc()) {
-		case GE_COMP_NEVER: desc += "ANever"; break;
-		case GE_COMP_ALWAYS: break;
-		case GE_COMP_EQUAL: desc += "AEQ"; break;
-		case GE_COMP_NOTEQUAL: desc += "ANE"; break;
-		case GE_COMP_LESS: desc += "ALT"; break;
-		case GE_COMP_LEQUAL: desc += "ALE"; break;
-		case GE_COMP_GREATER: desc += "AGT"; break;
-		case GE_COMP_GEQUAL: desc += "AGE"; break;
-		}
-		if (id.hasAlphaTestMask)
-			desc += "Msk";
-		desc += StringFromFormat("%02X:", id.alphaTestRef);
-	} else if (id.hasAlphaTestMask || id.alphaTestRef != 0) {
-		desc = "INVALID:" + desc;
-	}
-
-	if (id.earlyZChecks)
-		desc += "ZEarly:";
-	if (id.DepthTestFunc() != GE_COMP_ALWAYS) {
-		if (id.clearMode)
-			desc = "INVALID:" + desc;
-		switch (id.DepthTestFunc()) {
-		case GE_COMP_NEVER: desc += "ZNever:"; break;
-		case GE_COMP_ALWAYS: break;
-		case GE_COMP_EQUAL: desc += "ZEQ:"; break;
-		case GE_COMP_NOTEQUAL: desc += "ZNE:"; break;
-		case GE_COMP_LESS: desc += "ZLT:"; break;
-		case GE_COMP_LEQUAL: desc += "ZLE:"; break;
-		case GE_COMP_GREATER: desc += "ZGT:"; break;
-		case GE_COMP_GEQUAL: desc += "ZGE:"; break;
-		}
-	}
-	if (id.depthWrite && !id.clearMode)
-		desc += "ZWr:";
-
-	if (id.colorTest && !id.clearMode)
-		desc += "CTest:";
-
-	if (id.stencilTest && !id.clearMode) {
-		switch (id.StencilTestFunc()) {
-		case GE_COMP_NEVER: desc += "SNever"; break;
-		case GE_COMP_ALWAYS: desc += "SAlways";  break;
-		case GE_COMP_EQUAL: desc += "SEQ"; break;
-		case GE_COMP_NOTEQUAL: desc += "SNE"; break;
-		case GE_COMP_LESS: desc += "SLT"; break;
-		case GE_COMP_LEQUAL: desc += "SLE"; break;
-		case GE_COMP_GREATER: desc += "SGT"; break;
-		case GE_COMP_GEQUAL: desc += "SGE"; break;
-		}
-		if (id.hasStencilTestMask)
-			desc += "Msk";
-		if (id.StencilTestFunc() != GE_COMP_ALWAYS || id.DepthTestFunc() != GE_COMP_ALWAYS)
-			desc += StringFromFormat("%02X:", id.stencilTestRef);
-	} else if (id.hasStencilTestMask || id.stencilTestRef != 0 || id.stencilTestFunc != 0) {
-		desc = "INVALID:" + desc;
-	}
-
-	switch (id.SFail()) {
-	case GE_STENCILOP_KEEP: break;
-	case GE_STENCILOP_ZERO: desc += "STstF0:"; break;
-	case GE_STENCILOP_REPLACE: desc += "STstFRpl:"; break;
-	case GE_STENCILOP_INVERT: desc += "STstFXor:"; break;
-	case GE_STENCILOP_INCR: desc += "STstFInc:"; break;
-	case GE_STENCILOP_DECR: desc += "STstFDec:"; break;
-	}
-	switch (id.ZFail()) {
-	case GE_STENCILOP_KEEP: break;
-	case GE_STENCILOP_ZERO: desc += "ZTstF0:"; break;
-	case GE_STENCILOP_REPLACE: desc += "ZTstFRpl:"; break;
-	case GE_STENCILOP_INVERT: desc += "ZTstFXor:"; break;
-	case GE_STENCILOP_INCR: desc += "ZTstFInc:"; break;
-	case GE_STENCILOP_DECR: desc += "ZTstFDec:"; break;
-	}
-	if (id.StencilTestFunc() == GE_COMP_ALWAYS && id.DepthTestFunc() == GE_COMP_ALWAYS) {
-		switch (id.ZPass()) {
-		case GE_STENCILOP_KEEP: break;
-		case GE_STENCILOP_ZERO: desc += "Zero:"; break;
-		case GE_STENCILOP_REPLACE: desc += StringFromFormat("Rpl%02X:", id.stencilTestRef); break;
-		case GE_STENCILOP_INVERT: desc += "Xor:"; break;
-		case GE_STENCILOP_INCR: desc += "Inc:"; break;
-		case GE_STENCILOP_DECR: desc += "Dec:"; break;
-		}
-	} else {
-		switch (id.ZPass()) {
-		case GE_STENCILOP_KEEP: break;
-		case GE_STENCILOP_ZERO: desc += "ZTstT0:"; break;
-		case GE_STENCILOP_REPLACE: desc += "ZTstTRpl:"; break;
-		case GE_STENCILOP_INVERT: desc += "ZTstTXor:"; break;
-		case GE_STENCILOP_INCR: desc += "ZTstTInc:"; break;
-		case GE_STENCILOP_DECR: desc += "ZTstTDec:"; break;
-		}
-	}
-	if (!id.stencilTest || id.clearMode) {
-		if (id.sFail != 0 || id.zFail != 0 || id.zPass != 0)
-			desc = "INVALID:" + desc;
-	}
-
-	if (id.alphaBlend) {
-		if (id.clearMode)
-			desc = "INVALID:" + desc;
-		switch (id.AlphaBlendEq()) {
-		case GE_BLENDMODE_MUL_AND_ADD: desc += "BlendAdd<"; break;
-		case GE_BLENDMODE_MUL_AND_SUBTRACT: desc += "BlendSub<"; break;
-		case GE_BLENDMODE_MUL_AND_SUBTRACT_REVERSE: desc += "BlendRSub<"; break;
-		case GE_BLENDMODE_MIN: desc += "BlendMin<"; break;
-		case GE_BLENDMODE_MAX: desc += "BlendMax<"; break;
-		case GE_BLENDMODE_ABSDIFF: desc += "BlendDiff<"; break;
-		}
-		switch (id.AlphaBlendSrc()) {
-		case PixelBlendFactor::OTHERCOLOR: desc += "DstRGB,"; break;
-		case PixelBlendFactor::INVOTHERCOLOR: desc += "1-DstRGB,"; break;
-		case PixelBlendFactor::SRCALPHA: desc += "SrcA,"; break;
-		case PixelBlendFactor::INVSRCALPHA: desc += "1-SrcA,"; break;
-		case PixelBlendFactor::DSTALPHA: desc += "DstA,"; break;
-		case PixelBlendFactor::INVDSTALPHA: desc += "1-DstA,"; break;
-		case PixelBlendFactor::DOUBLESRCALPHA: desc += "2*SrcA,"; break;
-		case PixelBlendFactor::DOUBLEINVSRCALPHA: desc += "1-2*SrcA,"; break;
-		case PixelBlendFactor::DOUBLEDSTALPHA: desc += "2*DstA,"; break;
-		case PixelBlendFactor::DOUBLEINVDSTALPHA: desc += "1-2*DstA,"; break;
-		case PixelBlendFactor::FIX: desc += "Fix,"; break;
-		case PixelBlendFactor::ZERO: desc += "0,"; break;
-		case PixelBlendFactor::ONE: desc += "1,"; break;
-		}
-		switch (id.AlphaBlendDst()) {
-		case PixelBlendFactor::OTHERCOLOR: desc += "SrcRGB>:"; break;
-		case PixelBlendFactor::INVOTHERCOLOR: desc += "1-SrcRGB>:"; break;
-		case PixelBlendFactor::SRCALPHA: desc += "SrcA>:"; break;
-		case PixelBlendFactor::INVSRCALPHA: desc += "1-SrcA>:"; break;
-		case PixelBlendFactor::DSTALPHA: desc += "DstA>:"; break;
-		case PixelBlendFactor::INVDSTALPHA: desc += "1-DstA>:"; break;
-		case PixelBlendFactor::DOUBLESRCALPHA: desc += "2*SrcA>:"; break;
-		case PixelBlendFactor::DOUBLEINVSRCALPHA: desc += "1-2*SrcA>:"; break;
-		case PixelBlendFactor::DOUBLEDSTALPHA: desc += "2*DstA>:"; break;
-		case PixelBlendFactor::DOUBLEINVDSTALPHA: desc += "1-2*DstA>:"; break;
-		case PixelBlendFactor::FIX: desc += "Fix>:"; break;
-		case PixelBlendFactor::ZERO: desc += "0>:"; break;
-		case PixelBlendFactor::ONE: desc += "1>:"; break;
-		}
-	} else if (id.alphaBlendEq != 0 || id.alphaBlendSrc != 0 || id.alphaBlendDst != 0) {
-		desc = "INVALID:" + desc;
-	}
-
-	if (id.applyLogicOp)
-		desc += "Logic:";
-	else if (id.clearMode)
-		desc = "INVALID:" + desc;
-	if (id.applyFog)
-		desc += "Fog:";
-	else if (id.clearMode)
-		desc = "INVALID:" + desc;
-
-	if (desc.empty())
-		return "INVALID";
-	desc.resize(desc.size() - 1);
-	return desc;
-}
-
 void ComputeSamplerID(SamplerID *id_out) {
 	SamplerID id{};
 
@@ -476,8 +305,10 @@ void ComputeSamplerID(SamplerID *id_out) {
 
 	id.texfmt = fmt;
 	id.swizzle = gstate.isTextureSwizzled();
-	// Only CLUT4 can use separate CLUTs per mimap.
-	id.useSharedClut = fmt != GE_TFMT_CLUT4 || maxLevel == 0 || !gstate.isMipmapEnabled() || gstate.isClutSharedForMipmaps();
+	// With separate CLUTs, level n puts n above the index bits, wrapped to the CLUT: CLUT4 adds n * 16,
+	// CLUT8 with a 16-bit palette (512 entries) adds (n & 1) * 256, and the rest wrap back to 0 (gpu/probe exp90).
+	const bool clutPerLevel = fmt == GE_TFMT_CLUT4 || (fmt == GE_TFMT_CLUT8 && gstate.getClutPaletteFormat() != GE_CMODE_32BIT_ABGR8888);
+	id.useSharedClut = !clutPerLevel || maxLevel == 0 || !gstate.isMipmapEnabled() || gstate.isClutSharedForMipmaps();
 	if (gstate.isTextureFormatIndexed()) {
 		id.clutfmt = gstate.getClutPaletteFormat();
 		id.hasClutMask = gstate.getClutIndexMask() != 0xFF;
@@ -499,105 +330,4 @@ void ComputeSamplerID(SamplerID *id_out) {
 		id.cached.texBlendColor = gstate.getTextureEnvColRGB();
 
 	*id_out = id;
-}
-
-std::string DescribeSamplerID(const SamplerID &id) {
-	std::string name;
-	switch (id.TexFmt()) {
-	case GE_TFMT_5650: name = "5650"; break;
-	case GE_TFMT_5551: name = "5551"; break;
-	case GE_TFMT_4444: name = "4444"; break;
-	case GE_TFMT_8888: name = "8888"; break;
-	case GE_TFMT_CLUT4: name = "CLUT4"; break;
-	case GE_TFMT_CLUT8: name = "CLUT8"; break;
-	case GE_TFMT_CLUT16: name = "CLUT16"; break;
-	case GE_TFMT_CLUT32: name = "CLUT32"; break;
-	case GE_TFMT_DXT1: name = "DXT1"; break;
-	case GE_TFMT_DXT3: name = "DXT3"; break;
-	case GE_TFMT_DXT5: name = "DXT5"; break;
-	default: name = "INVALID"; break;
-	}
-	switch (id.ClutFmt()) {
-	case GE_CMODE_16BIT_BGR5650:
-		switch (id.TexFmt()) {
-		case GE_TFMT_CLUT4:
-		case GE_TFMT_CLUT8:
-		case GE_TFMT_CLUT16:
-		case GE_TFMT_CLUT32:
-			name += ":C5650";
-			break;
-		default:
-			// Ignore 0 clutfmt when no clut.
-			break;
-		}
-		break;
-	case GE_CMODE_16BIT_ABGR5551: name += ":C5551"; break;
-	case GE_CMODE_16BIT_ABGR4444: name += ":C4444"; break;
-	case GE_CMODE_32BIT_ABGR8888: name += ":C8888"; break;
-	}
-	if (id.swizzle) {
-		name += ":SWZ";
-	}
-	if (!id.useSharedClut) {
-		name += ":CMIP";
-	}
-	if (id.hasInvalidPtr) {
-		name += ":INV";
-	}
-	if (id.hasClutMask) {
-		name += ":CMASK";
-	}
-	if (id.hasClutShift) {
-		name += ":CSHF";
-	}
-	if (id.hasClutOffset) {
-		name += ":COFF";
-	}
-	if (id.clampS || id.clampT) {
-		name += std::string(":CL") + (id.clampS ? "S" : "") + (id.clampT ? "T" : "");
-	}
-	if (!id.useStandardBufw) {
-		name += ":BUFW";
-	}
-	if (!id.overReadSafe) {
-		name += ":XRD";
-	}
-	if (id.hasAnyMips) {
-		name += ":MIP";
-	}
-	if (id.linear) {
-		name += ":LERP";
-	}
-	if (id.fetch) {
-		name += ":FETCH";
-	}
-	if (id.useTextureAlpha) {
-		name += ":A";
-	}
-	if (id.useColorDoubling) {
-		name += ":DBL";
-	}
-	switch (id.texFunc) {
-	case GE_TEXFUNC_MODULATE:
-		name += ":MOD";
-		break;
-	case GE_TEXFUNC_DECAL:
-		name += ":DECAL";
-		break;
-	case GE_TEXFUNC_BLEND:
-		name += ":BLEND";
-		break;
-	case GE_TEXFUNC_REPLACE:
-		break;
-	case GE_TEXFUNC_ADD:
-		name += ":ADD";
-		break;
-	default:
-		break;
-	}
-	name += StringFromFormat(":W%dH%d", 1 << id.width0Shift, 1 << id.height0Shift);
-	if (id.width0Shift > 10 || id.height0Shift > 10)
-		name = "INVALID:" + name;
-
-	return name;
 }

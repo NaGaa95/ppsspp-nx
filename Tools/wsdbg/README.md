@@ -28,7 +28,7 @@ For headless scripting, `--launch` removes all of that. It starts PPSSPP, learns
 from its output, connects once the socket accepts, and kills it again on the way out:
 
 ```bash
-wsdbg --sync --compact --quiet --launch ./PPSSPPHeadless.exe --vsh -i --graphics=vulkan < script.txt
+wsdbg --sync --compact --quiet --launch ./PPSSPPHeadless.exe --vsh --cpu=interpreter --graphics=vulkan < script.txt
 ```
 
 `--launch` takes the executable and all of its arguments, so it has to come last - everything after
@@ -74,6 +74,9 @@ to "print everything that arrives for `--wait` seconds", which is what you want
 when watching broadcasts (log lines, `gpu.stats.feed`) rather than asking a
 question.
 
+An `error` reply carrying the request's ticket makes it exit non-zero too (with `--wait-all`,
+once the interval is up).
+
 Type `:help` in the REPL for a quick reminder, `:quit` to disconnect.
 
 ## Scripting a multi-step sequence
@@ -89,9 +92,13 @@ prints as it arrives; this only changes when the *next* line gets sent. A breakp
 trips would otherwise hang the script forever, so it gives up after `--sync-timeout` seconds
 (default 30), reports it, and makes the run exit non-zero.
 
+An `error` reply to a line doesn't stop the script, but makes the run exit non-zero at the end.
+
 Matching is by ticket, always - `--sync` never waits for "whatever message arrives next", which is
-what used to quietly desynchronise a script. A raw JSON line (the only way to send nested
-parameters) is sent exactly as written, so it's waited for only if *you* gave it a `ticket`;
+what used to quietly desynchronise a script. So prefer the `key=value` form for nested parameters
+too: values are parsed as JSON, and single quotes keep the inner double quotes intact, as in
+`input.buttons.send buttons='{"cross":true}'`. A raw JSON line is sent exactly as written, so it's
+waited for only if *you* gave it a `ticket`;
 without one there is nothing to match and `--sync` moves straight on to the next line. Raw lines
 are rejected up front, rather than sent and left to fail somewhere downstream, if they aren't valid
 JSON, aren't an object, have no string `event`, or carry a `ticket` that isn't an integer.
@@ -115,6 +122,8 @@ way took minutes per run. These run inside the one session instead:
 |---|---|
 | `:sleep <seconds>` | Wall-clock pause. Keeps draining and printing messages while it waits. |
 | `:wait <event> [timeout]` | Blocks until a message with that event name arrives. Exits non-zero if it never does. |
+| `:screenshot <file.png>` | Saves `gpu.buffer.screenshot` as a PNG, without printing the image data. Needs the CPU stopped. Use a native path (`C:/...`) on Windows. Works in headless with `--graphics=vulkan`. |
+| `:nowait <command>` | Sends the command and moves straight on, even under `--sync`; its reply prints whenever it arrives. For requests that only answer once the CPU has run, like `input.buttons.press`. |
 | `:echo <text>` | Prints text, for marking up a script's output. |
 | `# comment` | Ignored. |
 

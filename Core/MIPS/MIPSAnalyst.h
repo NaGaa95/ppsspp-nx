@@ -18,6 +18,7 @@
 #pragma once
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "Common/CommonTypes.h"
@@ -82,15 +83,15 @@ namespace MIPSAnalyst {
 	bool IsRegisterClobbered(MIPSGPReg reg, u32 addr, int instrs);
 
 	struct AnalyzedFunction {
-		u32 start;
-		u32 end;
-		u64 hash;
-		u32 size;
-		bool isStraightLeaf;
-		bool hasHash;
-		bool usesVFPU;
-		bool foundInSymbolMap;
-		char name[64];
+		u32 start = 0;
+		u32 end = 0;
+		u64 hash = 0;
+		u32 size = 0;
+		bool isStraightLeaf = false;
+		bool hasHash = false;
+		bool usesVFPU = false;
+		bool foundInSymbolMap = false;
+		char name[64] = {};
 	};
 
 	struct ReplacementTableEntry;
@@ -109,12 +110,18 @@ namespace MIPSAnalyst {
 	void ForgetFunctions(u32 startAddr, u32 endAddr);
 
 	bool GetAnalyzedFunctionAt(u32 addr, AnalyzedFunction *out);
+	// endAddr is exclusive.
+	bool HasFunctionsInRange(u32 startAddr, u32 endAddr);
 
 	void LoadBuiltinHashMap();
 	void LoadHashMap(const Path &filename);
 	void StoreHashMap(Path filename = Path());
 
 	const char *LookupHash(u64 hash, u32 funcSize);
+	// Hashes the known functions again, from what memory holds now (after a savestate load.)
+	// Functions that already have a hash and lie entirely in one of the (address, size) ranges in
+	// unchanged keep it: their code is what it was hashed from.
+	void RehashFunctions(const std::vector<std::pair<u32, u32>> &unchanged = {});
 	void ReplaceFunctions();
 
 	void UpdateHashMap();

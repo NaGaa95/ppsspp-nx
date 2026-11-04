@@ -38,8 +38,6 @@ class IRWriter;
 class MIPSState;
 
 namespace MIPSComp {
-class IRBlock;
-class IRBlockCache;
 struct JitOptions;
 }
 
@@ -49,6 +47,9 @@ public:
 	IRImmRegCache(IRWriter *ir);
 
 	void SetImm(IRReg r, u32 immVal) {
+		// Setting the value it already holds doesn't need writing again.
+		if (!isImm_[r] || immVal_[r] != immVal)
+			isWritten_[r] = false;
 		isImm_[r] = true;
 		immVal_[r] = immVal;
 	}
@@ -56,8 +57,12 @@ public:
 	bool IsImm(IRReg r) const { return isImm_[r]; }
 	u32 GetImm(IRReg r) const { return immVal_[r]; }
 
-	void FlushAll();
+	// Writes out all pending values. With keepKnown, the values stay known afterward (for a
+	// conditional exit), otherwise they're forgotten (anything may change them after a barrier).
+	void FlushAll(bool keepKnown = false);
 
+	// The Map functions write out the values of the regs read, which stay known. A dirty reg
+	// is forgotten after its inputs are written.
 	void MapDirty(IRReg rd);
 	void MapIn(IRReg rd);
 	void MapInIn(IRReg rs, IRReg rt);
@@ -70,6 +75,8 @@ private:
 	void Discard(IRReg rd);
 
 	bool isImm_[TOTAL_MAPPABLE_IRREGS];
+	// Whether the known value has been written to the reg.
+	bool isWritten_[TOTAL_MAPPABLE_IRREGS];
 	uint32_t immVal_[TOTAL_MAPPABLE_IRREGS];
 	IRWriter *ir_;
 };
@@ -155,7 +162,11 @@ public:
 	IRNativeRegCacheBase(MIPSComp::JitOptions *jo);
 	virtual ~IRNativeRegCacheBase() {}
 
-	virtual void Start(MIPSComp::IRBlockCache *irBlockCache, int blockNum);
+	virtual void Start(u32 startPC, const IRInst *instructions, int count);
+	// The guest memory base of the CPU the code is for, where pointerified registers point.
+	void SetMemoryBase(const u8 *base) {
+		membase_ = base;
+	}
 	void SetIRIndex(int index) {
 		irIndex_ = index;
 	}
@@ -242,6 +253,8 @@ protected:
 	int GetMipsRegOffset(IRReg r);
 
 	bool IsRegClobbered(MIPSLoc type, IRReg r) const;
+	// At an exit, drops the temps nothing later in the block reads, so FlushAll doesn't store them.
+	void DiscardDeadTempsAtExit();
 	bool IsRegRead(MIPSLoc type, IRReg r) const;
 	IRUsage GetNextRegUsage(const IRSituation &info, MIPSLoc type, IRReg r) const;
 
@@ -250,9 +263,11 @@ protected:
 	bool IsValidFPR(IRReg r) const;
 
 	MIPSComp::JitOptions *jo_;
-	int irBlockNum_ = 0;
-	const MIPSComp::IRBlock *irBlock_ = nullptr;
-	const MIPSComp::IRBlockCache *irBlockCache_ = nullptr;
+	const u8 *membase_ = nullptr;
+	// The block being compiled, and its IR.
+	u32 irStartPC_ = 0;
+	const IRInst *irInsts_ = nullptr;
+	int irCount_ = 0;
 	int irIndex_ = 0;
 
 	struct {

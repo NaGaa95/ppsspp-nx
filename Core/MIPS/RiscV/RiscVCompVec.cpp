@@ -19,6 +19,7 @@
 #include "Core/MemMap.h"
 #include "Core/MIPS/RiscV/RiscVJit.h"
 #include "Core/MIPS/RiscV/RiscVRegCache.h"
+#include "Core/MIPS/RiscV/RiscVVfpuDot.h"
 
 // This file contains compilation for vector instructions.
 //
@@ -194,7 +195,7 @@ void RiscVJitBackend::CompIR_VecAssign(IRInst inst) {
 		} else {
 			regs_.Map(inst);
 			for (int i = 0; i < 4; ++i) {
-				int lane = (inst.src2 >> (i * 2)) & 3;
+				int lane = Vec4ShuffleLane(inst.src2, i);
 				FMV(32, regs_.F(inst.dest + i), regs_.F(inst.src1 + lane));
 			}
 		}
@@ -282,6 +283,45 @@ void RiscVJitBackend::CompIR_VecArith(IRInst inst) {
 			FABS(32, regs_.F(inst.dest + i), regs_.F(inst.src1 + i));
 		break;
 
+	case IROp::Vec4Min:
+	case IROp::Vec4Max:
+		// As FMin and FMax, lane by lane. The lanes line up, so overlap doesn't matter.
+		for (int i = 0; i < 4; ++i) {
+			IRInst lane{ inst.op == IROp::Vec4Min ? IROp::FMin : IROp::FMax };
+			lane.dest = inst.dest + i;
+			lane.src1 = inst.src1 + i;
+			lane.src2 = inst.src2 + i;
+			CompIR_FCondAssign(lane);
+		}
+		break;
+
+	case IROp::Vec4Slt:
+	case IROp::Vec4Sge:
+		// FLT and FLE are false for NaN, as both want.
+		regs_.Map(inst);
+		for (int i = 0; i < 4; ++i) {
+			if (inst.op == IROp::Vec4Slt)
+				FLT(32, SCRATCH1, regs_.F(inst.src1 + i), regs_.F(inst.src2 + i));
+			else
+				FLE(32, SCRATCH1, regs_.F(inst.src2 + i), regs_.F(inst.src1 + i));
+			FCVT(FConv::S, FConv::W, regs_.F(inst.dest + i), SCRATCH1);
+		}
+		break;
+
+	case IROp::Vec4CvtScaledSW:
+	{
+		const RiscVReg scaleReg = regs_.MapWithFPRTemp(inst);
+		if ((inst.src2 & 0x1F) != 0)
+			QuickFLI(32, scaleReg, 1.0f / (1UL << (inst.src2 & 0x1F)), SCRATCH1);
+		for (int i = 0; i < 4; ++i) {
+			FMV(FMv::X, FMv::W, SCRATCH1, regs_.F(inst.src1 + i));
+			FCVT(FConv::S, FConv::W, regs_.F(inst.dest + i), SCRATCH1);
+			if ((inst.src2 & 0x1F) != 0)
+				FMUL(32, regs_.F(inst.dest + i), regs_.F(inst.dest + i), scaleReg);
+		}
+		break;
+	}
+
 	default:
 		INVALIDOP;
 		break;
@@ -292,25 +332,31 @@ void RiscVJitBackend::CompIR_VecHoriz(IRInst inst) {
 	CONDITIONAL_DISABLE;
 
 	switch (inst.op) {
-	case IROp::Vec4Dot:
-		regs_.Map(inst);
-		if (Overlap(inst.dest, 1, inst.src1, 4) || Overlap(inst.dest, 1, inst.src2, 4)) {
-			// This means inst.dest overlaps one of src1 or src2.  We have to do that one first.
-			// Technically this may impact -0.0 and such, but dots accurately need to be aligned anyway.
-			for (int i = 0; i < 4; ++i) {
-				if (inst.dest == inst.src1 + i || inst.dest == inst.src2 + i)
-					FMUL(32, regs_.F(inst.dest), regs_.F(inst.src1 + i), regs_.F(inst.src2 + i));
-			}
-			for (int i = 0; i < 4; ++i) {
-				if (inst.dest != inst.src1 + i && inst.dest != inst.src2 + i)
-					FMADD(32, regs_.F(inst.dest), regs_.F(inst.src1 + i), regs_.F(inst.src2 + i), regs_.F(inst.dest));
-			}
-		} else {
-			FMUL(32, regs_.F(inst.dest), regs_.F(inst.src1), regs_.F(inst.src2));
-			for (int i = 1; i < 4; ++i)
-				FMADD(32, regs_.F(inst.dest), regs_.F(inst.src1 + i), regs_.F(inst.src2 + i), regs_.F(inst.dest));
+	case IROp::Vec4VfpuDot:
+	{
+		// The operands go to mips->vfpuDotArgs for the shared routine, and the result comes back in
+		// its ftemp. Whatever guest state is in the registers it clobbers gets flushed after the
+		// stores, in case an operand was mapped into one of them. They come last in the allocation
+		// order, so usually that's nothing.
+		for (int i = 0; i < 4; ++i) {
+			regs_.SpillLockFPR(inst.src1 + i, inst.src2 + i);
+			FS(32, regs_.MapFPR(inst.src1 + i), CTXREG, (s32)offsetof(MIPSState, vfpuDotArgs) + i * 4);
+			FS(32, regs_.MapFPR(inst.src2 + i), CTXREG, (s32)offsetof(MIPSState, vfpuDotArgs) + 16 + i * 4);
 		}
+		for (int i = 0; i < 4; ++i)
+			regs_.ReleaseSpillLockFPR(inst.src1 + i, inst.src2 + i);
+
+		RiscVVfpuDotRegs dotRegs;
+		GetRiscVVfpuDotRegs(CTXREG, &dotRegs);
+		const int clobbered = cpu_info.RiscV_V ? 7 : 11;
+		for (int i = 0; i < clobbered; ++i)
+			regs_.FlushHostRegs({ dotRegs.gpr[i] });
+		regs_.FlushHostRegs({ dotRegs.ftemp });
+		QuickCallFunction(vfpuDot_, SCRATCH2);
+		regs_.MapFPR(inst.dest, MIPSMap::NOINIT);
+		FMV(32, regs_.F(inst.dest), dotRegs.ftemp);
 		break;
+	}
 
 	default:
 		INVALIDOP;
@@ -321,12 +367,62 @@ void RiscVJitBackend::CompIR_VecHoriz(IRInst inst) {
 void RiscVJitBackend::CompIR_VecPack(IRInst inst) {
 	CONDITIONAL_DISABLE;
 
+	// Clamps a sign extended value in reg to zero if negative. Without Zbb, maskReg is a temp.
+	auto clampToZero = [&](RiscVReg reg, RiscVReg maskReg) {
+		if (cpu_info.RiscV_Zbb) {
+			MAX(reg, reg, R_ZERO);
+		} else {
+			SRAI(maskReg, reg, XLEN - 1);
+			NOT(maskReg, maskReg);
+			AND(reg, reg, maskReg);
+		}
+	};
+
 	switch (inst.op) {
 	case IROp::Vec2Unpack16To31:
-	case IROp::Vec4Pack32To8:
-	case IROp::Vec2Pack31To16:
-		CompIR_Generic(inst);
+		// Like Vec2Unpack16To32, shifted down one more.
+		regs_.Map(inst);
+		FMV(FMv::X, FMv::W, SCRATCH2, regs_.F(inst.src1));
+		SLLI(SCRATCH1, SCRATCH2, 16);
+		SRLIW(SCRATCH1, SCRATCH1, 1);
+		FMV(FMv::W, FMv::X, regs_.F(inst.dest), SCRATCH1);
+		SRLIW(SCRATCH1, SCRATCH2, 16);
+		SLLI(SCRATCH1, SCRATCH1, 15);
+		FMV(FMv::W, FMv::X, regs_.F(inst.dest + 1), SCRATCH1);
 		break;
+
+	case IROp::Vec4Pack32To8:
+		// The top byte of each lane. Every lane is read before dest is written.
+		regs_.Map(inst);
+		for (int i = 0; i < 4; ++i) {
+			FMV(FMv::X, FMv::W, SCRATCH1, regs_.F(inst.src1 + i));
+			SRLIW(SCRATCH1, SCRATCH1, 24);
+			if (i == 0) {
+				MV(SCRATCH2, SCRATCH1);
+			} else {
+				SLLI(SCRATCH1, SCRATCH1, 8 * i);
+				OR(SCRATCH2, SCRATCH2, SCRATCH1);
+			}
+		}
+		FMV(FMv::W, FMv::X, regs_.F(inst.dest), SCRATCH2);
+		break;
+
+	case IROp::Vec2Pack31To16:
+	{
+		// Bits 30-15 of each lane, with negative lanes clamped to zero.
+		regs_.Map(inst);
+		RiscVReg maskReg = cpu_info.RiscV_Zbb ? INVALID_REG : regs_.GetAndLockTempGPR();
+		FMV(FMv::X, FMv::W, SCRATCH1, regs_.F(inst.src1));
+		FMV(FMv::X, FMv::W, SCRATCH2, regs_.F(inst.src1 + 1));
+		clampToZero(SCRATCH1, maskReg);
+		clampToZero(SCRATCH2, maskReg);
+		SRLI(SCRATCH1, SCRATCH1, 15);
+		SRLI(SCRATCH2, SCRATCH2, 15);
+		SLLI(SCRATCH2, SCRATCH2, 16);
+		OR(SCRATCH1, SCRATCH1, SCRATCH2);
+		FMV(FMv::W, FMv::X, regs_.F(inst.dest), SCRATCH1);
+		break;
+	}
 
 	case IROp::Vec4Unpack8To32:
 		// TODO: This works for now, but may need to handle aliasing for vectors.
@@ -369,15 +465,19 @@ void RiscVJitBackend::CompIR_VecPack(IRInst inst) {
 		break;
 
 	case IROp::Vec4Pack31To8:
-		// TODO: This works for now, but may need to handle aliasing for vectors.
+	{
+		// Bits 30-23 of each lane, with negative lanes clamped to zero. Every lane is read before
+		// dest is written.
 		regs_.Map(inst);
+		RiscVReg maskReg = cpu_info.RiscV_Zbb ? INVALID_REG : regs_.GetAndLockTempGPR();
 		for (int i = 0; i < 4; ++i) {
 			FMV(FMv::X, FMv::W, SCRATCH1, regs_.F(inst.src1 + i));
+			clampToZero(SCRATCH1, maskReg);
+			// At most 0x7FFFFFFF, so this leaves 0-255.
 			SRLI(SCRATCH1, SCRATCH1, 23);
 			if (i == 0) {
-				ANDI(SCRATCH2, SCRATCH1, 0xFF);
+				MV(SCRATCH2, SCRATCH1);
 			} else {
-				ANDI(SCRATCH1, SCRATCH1, 0xFF);
 				SLLI(SCRATCH1, SCRATCH1, 8 * i);
 				OR(SCRATCH2, SCRATCH2, SCRATCH1);
 			}
@@ -385,6 +485,7 @@ void RiscVJitBackend::CompIR_VecPack(IRInst inst) {
 
 		FMV(FMv::W, FMv::X, regs_.F(inst.dest), SCRATCH2);
 		break;
+	}
 
 	case IROp::Vec2Pack32To16:
 		// TODO: This works for now, but may need to handle aliasing for vectors.
@@ -401,35 +502,6 @@ void RiscVJitBackend::CompIR_VecPack(IRInst inst) {
 		OR(SCRATCH1, SCRATCH1, SCRATCH2);
 		// Okay, to the floating point register.
 		FMV(FMv::W, FMv::X, regs_.F(inst.dest), SCRATCH1);
-		break;
-
-	default:
-		INVALIDOP;
-		break;
-	}
-}
-
-void RiscVJitBackend::CompIR_VecClamp(IRInst inst) {
-	CONDITIONAL_DISABLE;
-
-	switch (inst.op) {
-	case IROp::Vec4ClampToZero:
-		regs_.Map(inst);
-		for (int i = 0; i < 4; i++) {
-			FMV(FMv::X, FMv::W, SCRATCH1, regs_.F(inst.src1 + i));
-			SRAIW(SCRATCH2, SCRATCH1, 31);
-			if (cpu_info.RiscV_Zbb) {
-				ANDN(SCRATCH1, SCRATCH1, SCRATCH2);
-			} else {
-				NOT(SCRATCH2, SCRATCH2);
-				AND(SCRATCH1, SCRATCH1, SCRATCH2);
-			}
-			FMV(FMv::W, FMv::X, regs_.F(inst.dest + i), SCRATCH1);
-		}
-		break;
-
-	case IROp::Vec2ClampToZero:
-		CompIR_Generic(inst);
 		break;
 
 	default:

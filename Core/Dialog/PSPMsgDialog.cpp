@@ -52,30 +52,32 @@ bool PSPMsgDialog::UseAutoStatus() {
 int PSPMsgDialog::Init(unsigned int paramAddr) {
 	// Ignore if already running
 	if (GetStatus() != SCE_UTILITY_STATUS_NONE) {
-		ERROR_LOG_REPORT(Log::sceUtility, "sceUtilityMsgDialogInitStart: invalid status");
+		ERROR_LOG(Log::sceUtility, "sceUtilityMsgDialogInitStart: invalid status");
 		return SCE_ERROR_UTILITY_INVALID_STATUS;
 	}
 
+	const int check = CheckRequest(paramAddr, { SCE_UTILITY_MSGDIALOG_SIZE_V1, SCE_UTILITY_MSGDIALOG_SIZE_V2, SCE_UTILITY_MSGDIALOG_SIZE_V3 });
+	if (check < 0) {
+		return check;
+	}
+	if (!Memory::IsValid4AlignedAddress(paramAddr)) {
+		return SCE_KERNEL_ERROR_BAD_ARGUMENT;  // untested
+	}
 	messageDialogAddr = paramAddr;
 
-	if (!Memory::IsValid4AlignedAddress(paramAddr)) {
-		// What to do?
-		return SCE_KERNEL_ERROR_BAD_ARGUMENT;
-	}
-
-	int size = Memory::ReadUnchecked_U32(paramAddr);
+	const int size = Memory::ReadUnchecked_U32(paramAddr);
 	memset(&messageDialog, 0, sizeof(messageDialog));
 	// Only copy the right size to support different request format
-	Memory::Memcpy(&messageDialog,paramAddr,size);
+	Memory::Memcpy(&messageDialog, paramAddr, size);
 
 	// debug info
-	int optionsNotCoded = messageDialog.options & ~SCE_UTILITY_MSGDIALOG_OPTION_SUPPORTED;
-	if(optionsNotCoded)
-	{
-		ERROR_LOG_REPORT(Log::sceUtility, "PSPMsgDialog options not coded : 0x%08x", optionsNotCoded);
+	const int unsupportedOptionBits = messageDialog.options & ~SCE_UTILITY_MSGDIALOG_OPTION_SUPPORTED;
+	if (unsupportedOptionBits) {
+		ERROR_LOG_REPORT(Log::sceUtility, "PSPMsgDialog options not coded : 0x%08x", unsupportedOptionBits);
 	}
 
 	flag = 0;
+	framesRun_ = 0;
 	scrollPos_ = 0.0f;
 	framesUpHeld_ = 0;
 	framesDownHeld_ = 0;
@@ -157,7 +159,7 @@ int PSPMsgDialog::Init(unsigned int paramAddr) {
 
 
 void PSPMsgDialog::FormatErrorCode(uint32_t code) {
-	auto err = GetI18NCategory(I18NCat::DIALOG);
+	auto err = GetI18NCategory(I18NCat::ERRORS);
 
 	switch (code) {
 	case SCE_UTILITY_SAVEDATA_ERROR_LOAD_DATA_BROKEN:
@@ -169,7 +171,7 @@ void PSPMsgDialog::FormatErrorCode(uint32_t code) {
 	case SCE_UTILITY_SAVEDATA_ERROR_SAVE_NO_MS:
 	case SCE_UTILITY_SAVEDATA_ERROR_DELETE_NO_MS:
 	case SCE_UTILITY_SAVEDATA_ERROR_SIZES_NO_MS:
-		snprintf(msgText, 512, "%s (%08x)", err->T_cstr("MsgErrorSavedataNoMS", "Memory stick not inserted."), code);
+		snprintf(msgText, 512, "%s (%08x)", err->T_cstr("MsgErrorSavedataNoMS", "Memory Stick not inserted."), code);
 		break;
 
 	case SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA:
@@ -181,11 +183,11 @@ void PSPMsgDialog::FormatErrorCode(uint32_t code) {
 
 	case SCE_UTILITY_SAVEDATA_ERROR_RW_MEMSTICK_FULL:
 	case SCE_UTILITY_SAVEDATA_ERROR_SAVE_MS_NOSPACE:
-		snprintf(msgText, 512, "%s (%08x)", err->T_cstr("MsgErrorSavedataMSFull", "Memory stick full.  Check your storage space."), code);
+		snprintf(msgText, 512, "%s (%08x)", err->T_cstr("MsgErrorSavedataMSFull", "Memory Stick full. Check your storage space."), code);
 		break;
 
 	default:
-		snprintf(msgText, 512, "%s %08x", err->T_cstr("MsgErrorCode", "Error code:"), code);
+		snprintf(msgText, 512, "%s %08x", err->T_cstr("MsgErrorCode", "Error code"), code);
 	}
 }
 
@@ -289,7 +291,11 @@ int PSPMsgDialog::Update(int animSpeed) {
 		return SCE_ERROR_UTILITY_INVALID_STATUS;
 	}
 
-	if (flag & (DS_ERROR | DS_ABORT)) {
+	// On a PSP, an Abort only takes effect from the 8th Update, whatever animSpeed is
+	// (utility/dialog/abort). With an Update only every other vblank it took 6, so it isn't purely a
+	// count, but this is right for the usual one per vblank.
+	framesRun_++;
+	if ((flag & DS_ERROR) || ((flag & DS_ABORT) && framesRun_ >= 8)) {
 		ChangeStatus(SCE_UTILITY_STATUS_FINISHED, 0);
 	} else {
 		UpdateButtons();
@@ -308,10 +314,10 @@ int PSPMsgDialog::Update(int animSpeed) {
 			DisplayMessage(msgText, (flag & DS_YESNO) != 0, (flag & DS_OK) != 0);
 
 		if (flag & (DS_OK | DS_VALIDBUTTON)) 
-			DisplayButtons(DS_BUTTON_OK, messageDialog.common.size == SCE_UTILITY_MSGDIALOG_SIZE_V3 ? messageDialog.okayButton : "");
+			DisplayButtons(DS_BUTTON_OK, messageDialog.common.size == SCE_UTILITY_MSGDIALOG_SIZE_V3 ? StringViewFromFixedSizeField(messageDialog.okayButton) : "");
 
 		if (flag & DS_CANCELBUTTON)
-			DisplayButtons(DS_BUTTON_CANCEL, messageDialog.common.size == SCE_UTILITY_MSGDIALOG_SIZE_V3 ? messageDialog.cancelButton : "");
+			DisplayButtons(DS_BUTTON_CANCEL, messageDialog.common.size == SCE_UTILITY_MSGDIALOG_SIZE_V3 ? StringViewFromFixedSizeField(messageDialog.cancelButton) : "");
 
 		if (IsButtonPressed(cancelButtonFlag) && (flag & DS_CANCELBUTTON))
 		{
@@ -372,14 +378,19 @@ void PSPMsgDialog::DoState(PointerWrap &p)
 {
 	PSPDialog::DoState(p);
 
-	auto s = p.Section("PSPMsgDialog", 1);
+	auto s = p.Section("PSPMsgDialog", 1, 2);
 	if (!s)
 		return;
 
 	Do(p, flag);
+	if (s >= 2) {
+		Do(p, framesRun_);
+	} else {
+		framesRun_ = 8;
+	}
 	Do(p, messageDialog);
 	Do(p, messageDialogAddr);
-	DoArray(p, msgText, sizeof(msgText));
+	DoCString(p, msgText);
 	Do(p, yesnoChoice);
 
 	// We don't save state this, you'll just have to scroll down again.

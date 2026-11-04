@@ -784,6 +784,30 @@ public:
 #undef _DEFINE_SWIZZLER3
 };
 
+// Splats in a register: the four value constructor stores the values one by one, which stalls whatever loads
+// the vector next.
+#if defined(_M_SSE)
+template<>
+inline Vec4<int> Vec4<int>::AssignToAll(const int &f) {
+	return Vec4<int>(_mm_set1_epi32(f));
+}
+
+template<>
+inline Vec4<float> Vec4<float>::AssignToAll(const float &f) {
+	return Vec4<float>(_mm_set1_ps(f));
+}
+#elif PPSSPP_ARCH(ARM_NEON)
+template<>
+inline Vec4<int> Vec4<int>::AssignToAll(const int &f) {
+	return Vec4<int>(vdupq_n_s32(f));
+}
+
+template<>
+inline Vec4<float> Vec4<float>::AssignToAll(const float &f) {
+	return Vec4<float>(vdupq_n_f32(f));
+}
+#endif
+
 
 template<typename BaseType>
 class Mat3x3
@@ -1377,15 +1401,20 @@ __forceinline unsigned int Vec4<float>::ToRGBA() const
 	__m128i c = _mm_cvtps_epi32(_mm_mul_ps(SAFE_M128(vec), _mm_set_ps1(255.0f)));
 	__m128i c16 = _mm_packs_epi32(c, c);
 	return _mm_cvtsi128_si32(_mm_packus_epi16(c16, c16));
+#elif PPSSPP_ARCH(ARM64_NEON)
+	// Round to nearest, like SSE.
+	uint16x4_t c16 = vqmovun_s32(vcvtnq_s32_f32(vmulq_f32(vec, vdupq_n_f32(255.0f))));
+	uint8x8_t c8 = vqmovn_u16(vcombine_u16(c16, c16));
+	return vget_lane_u32(vreinterpret_u32_u8(c8), 0);
 #elif PPSSPP_ARCH(ARM_NEON)
-	uint16x4_t c16 = vqmovun_s32(vcvtq_s32_f32(vmulq_f32(vec, vdupq_n_f32(255.0f))));
+	uint16x4_t c16 = vqmovun_s32(vcvtq_s32_f32(vaddq_f32(vmulq_f32(vec, vdupq_n_f32(255.0f)), vdupq_n_f32(0.5f))));
 	uint8x8_t c8 = vqmovn_u16(vcombine_u16(c16, c16));
 	return vget_lane_u32(vreinterpret_u32_u8(c8), 0);
 #else
-	return (clamp_u8((int)(r() * 255.f)) << 0) |
-			(clamp_u8((int)(g() * 255.f)) << 8) |
-			(clamp_u8((int)(b() * 255.f)) << 16) |
-			(clamp_u8((int)(a() * 255.f)) << 24);
+	return (clamp_u8((int)lrintf(r() * 255.f)) << 0) |
+			(clamp_u8((int)lrintf(g() * 255.f)) << 8) |
+			(clamp_u8((int)lrintf(b() * 255.f)) << 16) |
+			(clamp_u8((int)lrintf(a() * 255.f)) << 24);
 #endif
 }
 
@@ -1492,7 +1521,7 @@ inline Vec4<int> Vec4<int>::operator << (const int amount) const {
 
 template<>
 inline Vec4<int> Vec4<int>::operator >> (const int amount) const {
-	return Vec4<int>(_mm_srli_epi32(SAFE_M128I(ivec), amount));
+	return Vec4<int>(_mm_srai_epi32(SAFE_M128I(ivec), amount));
 }
 
 // Vec4<float> operation

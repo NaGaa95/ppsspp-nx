@@ -115,7 +115,7 @@ PSPSaveDialog::~PSPSaveDialog() {
 int PSPSaveDialog::Init(int paramAddr) {
 	// Ignore if already running
 	if (GetStatus() != SCE_UTILITY_STATUS_NONE) {
-		ERROR_LOG_REPORT(Log::sceUtility, "A save request is already running, not starting a new one");
+		ERROR_LOG(Log::sceUtility, "A save request is already running, not starting a new one");
 		return SCE_ERROR_UTILITY_INVALID_STATUS;
 	}
 
@@ -127,6 +127,11 @@ int PSPSaveDialog::Init(int paramAddr) {
 	ioThreadStatus = SAVEIO_NONE;
 
 	requestAddr = 0;
+	const int check = CheckRequest(paramAddr, { SAVEDATA_DIALOG_SIZE_V1, SAVEDATA_DIALOG_SIZE_V2, SAVEDATA_DIALOG_SIZE_V3 });
+	if (check < 0) {
+		ERROR_LOG(Log::sceUtility, "sceUtilitySavedataInitStart: bad request at %08x: %08x", paramAddr, check);
+		return check;
+	}
 	if (!Memory::IsValid4AlignedAddress(paramAddr)) {
 		return SCE_KERNEL_ERROR_BAD_ARGUMENT;  // untested
 	}
@@ -134,11 +139,6 @@ int PSPSaveDialog::Init(int paramAddr) {
 
 	int size = Memory::ReadUnchecked_U32(requestAddr);
 	memset(&request, 0, sizeof(request));
-	// Only copy the right size to support different save request format
-	if (size != SAVEDATA_DIALOG_SIZE_V1 && size != SAVEDATA_DIALOG_SIZE_V2 && size != SAVEDATA_DIALOG_SIZE_V3) {
-		ERROR_LOG_REPORT(Log::sceUtility, "sceUtilitySavedataInitStart: invalid size %d", size);
-		return SCE_ERROR_UTILITY_INVALID_PARAM_SIZE;
-	}
 	Memory::Memcpy(&request, requestAddr, size);
 	Memory::Memcpy(&originalRequest, requestAddr, size);
 
@@ -448,6 +448,8 @@ void PSPSaveDialog::DisplaySaveList(bool canMove) {
 			pad = (w - scaledW) / 2;
 			w = scaledW;
 
+			// The PSP draws save icons over black, so their transparent parts come out black (#22280).
+			PPGeDrawRect(x + pad, y, x + pad + w, y + h, CalcFadedColor(0xFF000000));
 			PPGeDrawImage(x + pad, y, w, h, 0, 0, 1, 1, tw, th, imageStyle);
 		} else {
 			PPGeDrawRect(x, y, x + w, y + h, 0x88666666);
@@ -472,8 +474,7 @@ void PSPSaveDialog::DisplaySaveList(bool canMove) {
 	}
 }
 
-void PSPSaveDialog::DisplaySaveIcon(bool checkExists)
-{
+void PSPSaveDialog::DisplaySaveIcon(bool checkExists) {
 	std::lock_guard<std::mutex> guard(paramLock);
 	PPGeImageStyle imageStyle = FadedImageStyle();
 	auto curSave = param.GetFileInfo(currentSelectedSave);
@@ -497,6 +498,8 @@ void PSPSaveDialog::DisplaySaveIcon(bool checkExists)
 		int scaledW = (int)(tw * scale);
 		x += (w - scaledW) / 2;
 		w = scaledW;
+		// Over black, as in DisplaySaveList.
+		PPGeDrawRect(x, y, x + w, y + h, CalcFadedColor(0xFF000000));
 	} else {
 		PPGeDisableTexture();
 	}
@@ -768,11 +771,8 @@ int PSPSaveDialog::Update(int animSpeed) {
 			EndDraw();
 		break;
 		case DS_SAVE_SAVING:
-			if (ioThreadStatus != SAVEIO_PENDING) {
-				if (ioThread.joinable()) {
-					ioThread.join();
-				}
-			}
+			// The dialog keeps drawing while the IO runs, and takes the results once it's done.
+			FinishIO(false);
 
 			StartDraw();
 
@@ -786,9 +786,6 @@ int PSPSaveDialog::Update(int animSpeed) {
 			EndDraw();
 		break;
 		case DS_SAVE_FAILED:
-			if (ioThread.joinable()) {
-				ioThread.join();
-			}
 			StartDraw();
 
 			DisplaySaveIcon(true);
@@ -812,10 +809,6 @@ int PSPSaveDialog::Update(int animSpeed) {
 			EndDraw();
 		break;
 		case DS_SAVE_DONE:
-			if (ioThread.joinable()) {
-				ioThread.join();
-				param.SetPspParam(param.GetPspParam());
-			}
 			StartDraw();
 
 			DisplaySaveIcon(true);
@@ -877,11 +870,8 @@ int PSPSaveDialog::Update(int animSpeed) {
 			EndDraw();
 		break;
 		case DS_LOAD_LOADING:
-			if (ioThreadStatus != SAVEIO_PENDING) {
-				if (ioThread.joinable()) {
-					ioThread.join();
-				}
-			}
+			// The dialog keeps drawing while the IO runs, and takes the results once it's done.
+			FinishIO(false);
 
 			StartDraw();
 
@@ -895,9 +885,6 @@ int PSPSaveDialog::Update(int animSpeed) {
 			EndDraw();
 		break;
 		case DS_LOAD_FAILED:
-			if (ioThread.joinable()) {
-				ioThread.join();
-			}
 			StartDraw();
 
 			DisplaySaveIcon(true);
@@ -920,9 +907,6 @@ int PSPSaveDialog::Update(int animSpeed) {
 			EndDraw();
 		break;
 		case DS_LOAD_DONE:
-			if (ioThread.joinable()) {
-				ioThread.join();
-			}
 			StartDraw();
 			
 			DisplaySaveIcon(true);
@@ -1008,11 +992,8 @@ int PSPSaveDialog::Update(int animSpeed) {
 			EndDraw();
 		break;
 		case DS_DELETE_DELETING:
-			if (ioThreadStatus != SAVEIO_PENDING) {
-				if (ioThread.joinable()) {
-					ioThread.join();
-				}
-			}
+			// The dialog keeps drawing while the IO runs, and takes the results once it's done.
+			FinishIO(false);
 
 			StartDraw();
 
@@ -1023,9 +1004,6 @@ int PSPSaveDialog::Update(int animSpeed) {
 			EndDraw();
 		break;
 		case DS_DELETE_FAILED:
-			if (ioThread.joinable()) {
-				ioThread.join();
-			}
 			StartDraw();
 
 			DisplayMessage(di->T("DeleteFailed", "Unable to delete data."));
@@ -1043,10 +1021,6 @@ int PSPSaveDialog::Update(int animSpeed) {
 			EndDraw();
 		break;
 		case DS_DELETE_DONE:
-			if (ioThread.joinable()) {
-				ioThread.join();
-				param.SetPspParam(param.GetPspParam());
-			}
 			StartDraw();
 			
 			DisplayMessage(di->T("Delete completed"));
@@ -1086,22 +1060,10 @@ int PSPSaveDialog::Update(int animSpeed) {
 		break;
 
 		case DS_NONE: // For action which display nothing
-			switch (ioThreadStatus) {
-			case SAVEIO_NONE:
+			if (ioThreadStatus == SAVEIO_NONE) {
 				StartIOThread();
-				break;
-			case SAVEIO_PENDING:
-			case SAVEIO_DONE:
-				// To make sure there aren't any timing variations, we sync the next frame.
-				if (g_Config.iIOTimingMethod == IOTIMING_HOST && ioThreadStatus == SAVEIO_PENDING) {
-					// ... except in Host IO timing, where we wait as long as needed.
-					break;
-				}
-				if (ioThread.joinable()) {
-					ioThread.join();
-				}
+			} else if (FinishIO(g_Config.iIOTimingMethod != IOTIMING_HOST)) {
 				ChangeStatus(SCE_UTILITY_STATUS_FINISHED, 0);
-				break;
 			}
 		break;
 
@@ -1117,37 +1079,26 @@ int PSPSaveDialog::Update(int animSpeed) {
 	return 0;
 }
 
-// It's kinda ugly how this uses the "global" 'display'...
+// Runs on the IO thread. Of the dialog, it only touches the io* members (see StartIOThread and FinishIO).
 void PSPSaveDialog::ExecuteIOAction() {
-	param.ClearSFOCache();
-	auto &result = param.GetPspParam()->common.result;
-	std::lock_guard<std::mutex> guard(paramLock);
-	switch (display) {
+	ioParam_.ClearSFOCache();
+	auto &result = ioRequest_.common.result;
+	ioDisplay_ = ioAction_;
+	switch (ioAction_) {
 	case DS_LOAD_LOADING:
-		result = param.Load(param.GetPspParam(), GetSelectedSaveDirName(), currentSelectedSave);
-		if (result == 0) {
-			display = DS_LOAD_DONE;
-			g_lastSaveTime = time_now_d();
-		} else {
-			display = DS_LOAD_FAILED;
-		}
+		result = ioParam_.Load(&ioRequest_, ioSaveDirName_, ioSaveId_);
+		ioDisplay_ = result == 0 ? DS_LOAD_DONE : DS_LOAD_FAILED;
 		break;
 	case DS_SAVE_SAVING:
-		SaveState::NotifySaveData();
-		if (param.Save(param.GetPspParam(), GetSelectedSaveDirName()) == 0) {
-			display = DS_SAVE_DONE;
-			g_lastSaveTime = time_now_d();
-		} else {
-			display = DS_SAVE_FAILED;
-		}
+		ioDisplay_ = ioParam_.Save(&ioRequest_, ioSaveDirName_) == 0 ? DS_SAVE_DONE : DS_SAVE_FAILED;
 		break;
 	case DS_DELETE_DELETING:
-		if (param.Delete(param.GetPspParam(), currentSelectedSave)) {
+		if (ioParam_.Delete(&ioRequest_, ioDeleteDir_)) {
 			result = 0;
-			display = DS_DELETE_DONE;
+			ioDisplay_ = DS_DELETE_DONE;
 		} else {
 			//result = SCE_UTILITY_SAVEDATA_ERROR_DELETE_NO_DATA;// What the result should be?
-			display = DS_DELETE_FAILED;
+			ioDisplay_ = DS_DELETE_FAILED;
 		}
 		break;
 	case DS_NONE:
@@ -1159,55 +1110,81 @@ void PSPSaveDialog::ExecuteIOAction() {
 		break;
 	}
 
-	ioThreadStatus = SAVEIO_DONE;
-	param.ClearSFOCache();
+	ioParam_.ClearSFOCache();
+	ioThreadStatus = SAVEIO_READY;
+}
+
+// What a mode that shows no dialog returns without a memory stick, or 0 for one not tested on
+// hardware. They all start fine and fail when they run (pspautotests utility/savedata/nomemstick).
+static u32 NoMemstickResult(SceUtilitySavedataType mode) {
+	switch (mode) {
+	case SCE_UTILITY_SAVEDATA_TYPE_AUTOLOAD:
+		return SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_MS;
+	case SCE_UTILITY_SAVEDATA_TYPE_AUTOSAVE:
+		return SCE_UTILITY_SAVEDATA_ERROR_SAVE_NO_MS;
+	case SCE_UTILITY_SAVEDATA_TYPE_AUTODELETE:
+		return SCE_UTILITY_SAVEDATA_ERROR_DELETE_NO_MS;
+	case SCE_UTILITY_SAVEDATA_TYPE_SIZES:
+		return SCE_UTILITY_SAVEDATA_ERROR_SIZES_NO_MS;
+	case SCE_UTILITY_SAVEDATA_TYPE_LIST:
+	case SCE_UTILITY_SAVEDATA_TYPE_FILES:
+	case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATASECURE:
+	case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_READDATASECURE:
+	case SCE_UTILITY_SAVEDATA_TYPE_READDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATASECURE:
+	case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_ERASESECURE:
+	case SCE_UTILITY_SAVEDATA_TYPE_ERASE:
+	case SCE_UTILITY_SAVEDATA_TYPE_DELETEDATA:
+	case SCE_UTILITY_SAVEDATA_TYPE_GETSIZE:
+		return SCE_UTILITY_SAVEDATA_ERROR_RW_NO_MEMSTICK;
+	default:
+		return 0;
+	}
 }
 
 void PSPSaveDialog::ExecuteNotVisibleIOAction() {
-	param.ClearSFOCache();
-	auto &result = param.GetPspParam()->common.result;
+	auto &result = ioRequest_.common.result;
 
-	SceUtilitySavedataType utilityMode = (SceUtilitySavedataType)(u32)param.GetPspParam()->mode;
+	SceUtilitySavedataType utilityMode = (SceUtilitySavedataType)(u32)ioRequest_.mode;
+	if (MemoryStick_State() != PSP_MEMORYSTICK_STATE_INSERTED) {
+		const u32 noMemstickResult = NoMemstickResult(utilityMode);
+		if (noMemstickResult != 0) {
+			result = noMemstickResult;
+			return;
+		}
+	}
+
 	switch (utilityMode) {
 	case SCE_UTILITY_SAVEDATA_TYPE_LOAD: // Only load and exit
 	case SCE_UTILITY_SAVEDATA_TYPE_AUTOLOAD:
-		result = param.Load(param.GetPspParam(), GetSelectedSaveDirName(), currentSelectedSave);
-		ResetSecondsSinceLastGameSave();
-		ShowSaveLoadIndicator(false);
+		result = ioParam_.Load(&ioRequest_, ioSaveDirName_, ioSaveId_);
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_SAVE: // Only save and exit
 	case SCE_UTILITY_SAVEDATA_TYPE_AUTOSAVE:
-		SaveState::NotifySaveData();
-		result = param.Save(param.GetPspParam(), GetSelectedSaveDirName());
-		ResetSecondsSinceLastGameSave();
-		ShowSaveLoadIndicator(true);
+		result = ioParam_.Save(&ioRequest_, ioSaveDirName_);
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_SIZES:
-		result = param.GetSizes(param.GetPspParam());
+		result = ioParam_.GetSizes(&ioRequest_);
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_LIST:
-		param.GetList(param.GetPspParam());
+		ioParam_.GetList(&ioRequest_);
 		result = 0;
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_FILES:
-		result = param.GetFilesList(param.GetPspParam(), requestAddr);
+		result = ioParam_.GetFilesList(&ioRequest_, requestAddr, ioListSaveDirName_);
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_GETSIZE:
-		{
-			bool sizeResult = param.GetSize(param.GetPspParam());
-			// TODO: According to JPCSP, should test/verify this part but seems edge casey.
-			if (MemoryStick_State() != PSP_MEMORYSTICK_STATE_INSERTED) {
-				result = SCE_UTILITY_SAVEDATA_ERROR_RW_NO_MEMSTICK;
-			} else if (sizeResult) {
-				result = 0;
-			} else {
-				result = SCE_UTILITY_SAVEDATA_ERROR_RW_NO_DATA;
-			}
+		if (ioParam_.GetSize(&ioRequest_)) {
+			result = 0;
+		} else {
+			result = SCE_UTILITY_SAVEDATA_ERROR_RW_NO_DATA;
 		}
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_DELETEDATA:
-		DEBUG_LOG(Log::sceUtility, "sceUtilitySavedata DELETEDATA: %s", param.GetPspParam()->saveName);
-		if (param.Delete(param.GetPspParam(), param.GetSelectedSave())) {
+		DEBUG_LOG(Log::sceUtility, "sceUtilitySavedata DELETEDATA: %s", ioRequest_.saveName);
+		if (ioParam_.Delete(&ioRequest_, ioDeleteDir_)) {
 			result = 0;
 		} else {
 			result = SCE_UTILITY_SAVEDATA_ERROR_RW_NO_DATA;
@@ -1215,7 +1192,7 @@ void PSPSaveDialog::ExecuteNotVisibleIOAction() {
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_AUTODELETE:
 	case SCE_UTILITY_SAVEDATA_TYPE_DELETE:
-		if (param.Delete(param.GetPspParam(), param.GetSelectedSave())) {
+		if (ioParam_.Delete(&ioRequest_, ioDeleteDir_)) {
 			result = 0;
 		} else {
 			result = SCE_UTILITY_SAVEDATA_ERROR_DELETE_NO_DATA;
@@ -1224,41 +1201,30 @@ void PSPSaveDialog::ExecuteNotVisibleIOAction() {
 	// TODO: Should reset the directory's other files.
 	case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATA:
 	case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATASECURE:
-		result = param.Save(param.GetPspParam(), GetSelectedSaveDirName(), param.GetPspParam()->mode == SCE_UTILITY_SAVEDATA_TYPE_MAKEDATASECURE);
+		result = ioParam_.Save(&ioRequest_, ioSaveDirName_, ioRequest_.mode == SCE_UTILITY_SAVEDATA_TYPE_MAKEDATASECURE);
 		if (result == SCE_UTILITY_SAVEDATA_ERROR_SAVE_MS_NOSPACE) {
 			result = SCE_UTILITY_SAVEDATA_ERROR_RW_MEMSTICK_FULL;
-		} else {
-			SaveState::NotifySaveData();
-			ResetSecondsSinceLastGameSave();
-			ShowSaveLoadIndicator(true);
 		}
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATA:
 	case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATASECURE:
-		SaveState::NotifySaveData();
-		result = param.Save(param.GetPspParam(), GetSelectedSaveDirName(), param.GetPspParam()->mode == SCE_UTILITY_SAVEDATA_TYPE_WRITEDATASECURE);
-		ResetSecondsSinceLastGameSave();
-		ShowSaveLoadIndicator(true);
+		result = ioParam_.Save(&ioRequest_, ioSaveDirName_, ioRequest_.mode == SCE_UTILITY_SAVEDATA_TYPE_WRITEDATASECURE);
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_READDATA:
 	case SCE_UTILITY_SAVEDATA_TYPE_READDATASECURE:
-		result = param.Load(param.GetPspParam(), GetSelectedSaveDirName(), currentSelectedSave, param.GetPspParam()->mode == SCE_UTILITY_SAVEDATA_TYPE_READDATASECURE);
+		result = ioParam_.Load(&ioRequest_, ioSaveDirName_, ioSaveId_, ioRequest_.mode == SCE_UTILITY_SAVEDATA_TYPE_READDATASECURE);
 		if (result == SCE_UTILITY_SAVEDATA_ERROR_LOAD_DATA_BROKEN)
 			result = SCE_UTILITY_SAVEDATA_ERROR_RW_DATA_BROKEN;
 		if (result == SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA)
 			result = SCE_UTILITY_SAVEDATA_ERROR_RW_NO_DATA;
-		ResetSecondsSinceLastGameSave();
-		ShowSaveLoadIndicator(false);
 		break;
 	case SCE_UTILITY_SAVEDATA_TYPE_ERASE:
 	case SCE_UTILITY_SAVEDATA_TYPE_ERASESECURE:
-		result = param.DeleteData(param.GetPspParam());
+		result = ioParam_.DeleteData(&ioRequest_);
 		break;
 	default:
 		break;
 	}
-
-	param.ClearSFOCache();
 }
 
 void PSPSaveDialog::StartIOThread() {
@@ -1274,6 +1240,24 @@ void PSPSaveDialog::StartIOThread() {
 		ShowSaveLoadIndicator(save);
 	}
 
+	// Everything the IO thread needs from the dialog, taken now: it doesn't look at the dialog's state.
+	const SceUtilitySavedataType mode = (SceUtilitySavedataType)(u32)request.mode;
+	ioAction_ = display;
+	ioRequest_ = request;
+	ioRequestStart_ = request;
+	ioSaveId_ = currentSelectedSave;
+	ioSaveDirName_ = GetSelectedSaveDirName();
+	ioListSaveDirName_.clear();
+	if (display == DS_NONE && mode == SCE_UTILITY_SAVEDATA_TYPE_FILES) {
+		ioListSaveDirName_ = param.GetSaveDirName(&request, 0);
+	}
+	ioDeleteDir_.clear();
+	if (display == DS_DELETE_DELETING) {
+		ioDeleteDir_ = param.GetSaveDir(currentSelectedSave);
+	} else if (display == DS_NONE && (mode == SCE_UTILITY_SAVEDATA_TYPE_DELETEDATA || mode == SCE_UTILITY_SAVEDATA_TYPE_AUTODELETE || mode == SCE_UTILITY_SAVEDATA_TYPE_DELETE)) {
+		ioDeleteDir_ = param.GetSaveDir(param.GetSelectedSave());
+	}
+
 	ioThreadStatus = SAVEIO_PENDING;
 	ioThread = std::thread([this]() {
 		SetCurrentThreadAffinity(ThreadAffinityRole::IO);
@@ -1282,6 +1266,93 @@ void PSPSaveDialog::StartIOThread() {
 		AndroidJNIThreadContext jniContext;
 		this->ExecuteIOAction();
 	});
+}
+
+// Takes the IO thread's results back. Without wait, only if it's done: returns whether it was.
+bool PSPSaveDialog::FinishIO(bool wait) {
+	if (ioThreadStatus == SAVEIO_PENDING && !wait) {
+		return false;
+	}
+	if (ioThread.joinable()) {
+		ioThread.join();
+	}
+	if (ioThreadStatus != SAVEIO_READY) {
+		return true;
+	}
+
+	{
+		// Only what the IO changed: the game may have changed its request meanwhile (Update reloads it).
+		std::lock_guard<std::mutex> guard(paramLock);
+		const u8 *before = (const u8 *)&ioRequestStart_;
+		const u8 *after = (const u8 *)&ioRequest_;
+		u8 *live = (u8 *)&request;
+		for (size_t i = 0; i < sizeof(request); ++i) {
+			if (after[i] != before[i]) {
+				live[i] = after[i];
+			}
+		}
+	}
+
+	switch (ioAction_) {
+	case DS_LOAD_LOADING:
+		if (ioDisplay_ == DS_LOAD_DONE) {
+			g_lastSaveTime = time_now_d();
+		}
+		break;
+	case DS_SAVE_SAVING:
+		SaveState::NotifySaveData();
+		if (ioDisplay_ == DS_SAVE_DONE) {
+			g_lastSaveTime = time_now_d();
+		}
+		break;
+	case DS_NONE:
+		switch ((SceUtilitySavedataType)(u32)request.mode) {
+		case SCE_UTILITY_SAVEDATA_TYPE_LOAD:
+		case SCE_UTILITY_SAVEDATA_TYPE_AUTOLOAD:
+		case SCE_UTILITY_SAVEDATA_TYPE_READDATA:
+		case SCE_UTILITY_SAVEDATA_TYPE_READDATASECURE:
+			ResetSecondsSinceLastGameSave();
+			ShowSaveLoadIndicator(false);
+			break;
+		case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATA:
+		case SCE_UTILITY_SAVEDATA_TYPE_MAKEDATASECURE:
+			if (request.common.result == SCE_UTILITY_SAVEDATA_ERROR_RW_MEMSTICK_FULL) {
+				break;
+			}
+			[[fallthrough]];
+		case SCE_UTILITY_SAVEDATA_TYPE_SAVE:
+		case SCE_UTILITY_SAVEDATA_TYPE_AUTOSAVE:
+		case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATA:
+		case SCE_UTILITY_SAVEDATA_TYPE_WRITEDATASECURE:
+			SaveState::NotifySaveData();
+			ResetSecondsSinceLastGameSave();
+			ShowSaveLoadIndicator(true);
+			break;
+		default:
+			break;
+		}
+		break;
+	default:
+		break;
+	}
+
+	if (ioAction_ != DS_NONE) {
+		display = ioDisplay_;
+		// Show what was saved or deleted in the list.
+		if (display == DS_SAVE_DONE || display == DS_DELETE_DONE) {
+			std::lock_guard<std::mutex> guard(paramLock);
+			param.SetPspParam(param.GetPspParam());
+		}
+	}
+
+	ioThreadStatus = SAVEIO_DONE;
+	return true;
+}
+
+void PSPSaveDialog::WaitForIO() {
+	if (ioThread.joinable()) {
+		ioThread.join();
+	}
 }
 
 int PSPSaveDialog::Shutdown(bool force) {
@@ -1303,6 +1374,28 @@ int PSPSaveDialog::Shutdown(bool force) {
 	return 0;
 }
 
+// Version 4 of the dialog's state (never in a release) kept the IO's writes to PSP memory until the
+// results were taken. Late is better than never.
+static void DoStateOldPendingWrites(PointerWrap &p) {
+	auto s = p.Section("SavedataMemory", 1);
+	if (!s) {
+		return;
+	}
+	u32 count = 0;
+	Do(p, count);
+	for (u32 i = 0; i < count; ++i) {
+		u32 addr = 0;
+		std::string tag;
+		std::vector<u8> data;
+		Do(p, addr);
+		Do(p, tag);
+		Do(p, data);
+		if (p.mode == PointerWrap::MODE_READ && Memory::IsValidRange(addr, (u32)data.size())) {
+			Memory::Memcpy(addr, data.data(), (u32)data.size(), tag.c_str(), tag.size());
+		}
+	}
+}
+
 void PSPSaveDialog::DoState(PointerWrap &p) {
 	if (ioThread.joinable()) {
 		ioThread.join();
@@ -1311,11 +1404,12 @@ void PSPSaveDialog::DoState(PointerWrap &p) {
 
 	// Version 3 activates the s > 2 branch below, so ioThreadStatus survives
 	// a savestate. Safe to restore: the IO thread was joined above, so the
-	// value is only ever SAVEIO_NONE or SAVEIO_DONE, and the operation's
-	// effects are already part of the serialized state. Without this, loading
-	// a state taken while a savedata operation was in flight would restart
-	// the operation instead of resuming from its recorded status.
-	auto s = p.Section("PSPSaveDialog", 1, 3);
+	// value is never SAVEIO_PENDING. Without this, loading a state taken
+	// while a savedata operation was in flight would restart the operation
+	// instead of resuming from its recorded status. Version 4 keeps the
+	// results of a finished operation that haven't been taken yet. Version 6 keeps originalRequest,
+	// or the first Update after a load would reload the request and lose results kept in request.
+	auto s = p.Section("PSPSaveDialog", 1, 6);
 	if (!s) {
 		return;
 	}
@@ -1332,10 +1426,33 @@ void PSPSaveDialog::DoState(PointerWrap &p) {
 	Do(p, requestAddr);
 	Do(p, currentSelectedSave);
 	Do(p, yesnoChoice);
+	SaveIOStatus ioStatus = ioThreadStatus;
 	if (s > 2) {
-		Do(p, ioThreadStatus);
+		Do(p, ioStatus);
 	} else {
-		ioThreadStatus = SAVEIO_NONE;
+		ioStatus = SAVEIO_NONE;
+	}
+	ioThreadStatus = ioStatus;
+	if (s >= 4) {
+		Do(p, ioAction_);
+		Do(p, ioDisplay_);
+		Do(p, ioRequest_);
+		Do(p, ioRequestStart_);
+	}
+	if (s == 4) {
+		DoStateOldPendingWrites(p);
+	}
+	if (s >= 6) {
+		Do(p, originalRequest);
+	} else if (p.mode == p.MODE_READ) {
+		// Best guess: what the game's request holds now, the way Update reads it.
+		memset(&originalRequest, 0, sizeof(originalRequest));
+		if (Memory::IsValidRange(requestAddr, 4)) {
+			const u32 size = std::min((u32)sizeof(originalRequest), Memory::ReadUnchecked_U32(requestAddr));
+			if (Memory::IsValidRange(requestAddr, size)) {
+				Memory::Memcpy(&originalRequest, requestAddr, size);
+			}
+		}
 	}
 }
 

@@ -27,6 +27,7 @@
 #include "Core/HLE/sceKernelMemory.h"
 #include "Core/HLE/sceKernelInterrupt.h"
 #include "Core/HLE/sceGe.h"
+#include "Core/HLE/scePower.h"
 #include "Core/Util/PPGeDraw.h"
 #include "Core/MemMapHelpers.h"
 #include "GPU/Common/DrawEngineCommon.h"
@@ -56,7 +57,9 @@ GPUCommon::GPUCommon(GraphicsContext *gfxCtx, Draw::DrawContext *draw) :
 	Reinitialize();
 	gstate.Reset();
 	gstate_c.Reset();
-	gpuStats.ResetFrame();
+	// Including the flip count, which framebuffer ages are measured in. Otherwise a frame dump replayed after
+	// another in the same process (headless) renders differently from one replayed alone.
+	gpuStats.Reset();
 
 	PPGeSetDrawContext(draw);
 	ResetMatrices();
@@ -73,7 +76,17 @@ void GPUCommon::BeginHostFrame(const DisplayLayoutConfig &config) {
 	UpdateMSAALevel(draw_);
 	CheckConfigChanged(config);
 	CheckDisplayResized();
+	// Skip Buffer Effects only takes effect on a render resize, and not everything that changes it posts one
+	// (turning on Auto FrameSkip clears it).
+	if (framebufferManager_ && framebufferManager_->UseBufferedRendering() == g_Config.bSkipBufferEffects) {
+		renderResized_ = true;
+	}
 	CheckRenderResized(config);
+
+	// After the resizes, which ask for the post shaders to be rebuilt at the new size.
+	if (framebufferManager_) {
+		framebufferManager_->CheckPostShaders(config);
+	}
 }
 
 void GPUCommon::EndHostFrame() {
@@ -89,13 +102,29 @@ void GPUCommon::Reinitialize() {
 		dls[i].state = PSP_GE_DL_STATE_NONE;
 		dls[i].waitUntilTicks = 0;
 	}
+	// This is what sceKernelLoadExec gets, and whatever the old executable still had queued goes with
+	// it.  Left behind, those ids would now be lists with no state and a pc of 0, waiting their turn
+	// behind the first list of the new executable.  Crazy Taxi: Fare Wars starts its games this way, #19894.
+	dlQueue.clear();
+
+	// The GE driver starts over as well, and the first thing it does is run a list that sets every
+	// register to zero, and all the matrices.  So a program started this way finds the GE exactly as
+	// one booted directly does, not as the previous one left it.
+	gstate.Reset();
+	gstate_c.offsetAddr = 0;
+	gstate_c.vertexAddr = 0;
+	gstate_c.indexAddr = 0;
+	ResetMatrices();
+	gstate_c.Dirty(DIRTY_ALL);
 
 	nextListID = 0;
 	currentList = nullptr;
+	interruptRunning = false;
 	isbreak = false;
 	drawCompleteTicks = 0;
 	busyTicks = 0;
 	interruptsEnabled_ = true;
+	videos_.clear();
 
 	if (textureCache_)
 		textureCache_->Clear(true);
@@ -132,6 +161,162 @@ int GPUCommon::EstimatePerVertexCost() {
 	return cost;
 }
 
+// The blit rates were measured with nothing else running. In a game, other threads waking up and
+// SAS mixing on the Media Engine compete with the GE for main RAM, making RAM texture fetches
+// 10-20% slower: Star Wars: Lethal Alliance's movie blit takes 8.65ms alone and 10.3ms in the game
+// (pspautotests gpu/timing/blittiming, video/mpeg/playertiming). We don't model that load, so
+// assume a typical one. Clears and VRAM texture fetches don't touch main RAM and aren't affected.
+static constexpr float ramTextureContention = 1.17f;
+
+// Clears aren't charged yet. They could slow down games that spin hard on an empty screen - flip
+// this to try.
+static constexpr bool chargeClearTime = false;
+
+int GPUCommon::EstimateFillCycles(GEPrimitiveType prim, const void *verts, const void *inds, int count, const VertexDecoder *dec, u32 vertType) const {
+	if (prim != GE_PRIM_RECTANGLES || !gstate.isModeThrough() || (vertType & GE_VTYPE_POS_MASK) != GE_VTYPE_POS_16BIT) {
+		return 0;
+	}
+
+	// All measured on a PSP (pspautotests gpu/timing/blittiming), in nanoseconds per pixel at
+	// 222/111MHz. At 333/166 every case takes 2/3 as long.
+	struct Rate { float narrow, wide; };
+	Rate rate;
+	if (gstate.isModeClear()) {
+		if (!chargeClearTime) {
+			return 0;
+		}
+		// A full-screen clear takes 0.49ms on a 16-bit framebuffer whatever it clears, 0.69ms on
+		// 8888, and 1.02ms on 8888 if depth is cleared too. Stencil is free.
+		const bool is32Bit = gstate.FrameBufFormat() == GE_FORMAT_8888;
+		const float ns = is32Bit ? (gstate.isClearModeDepthMask() ? 7.82f : 5.28f) : 3.77f;
+		rate = { ns, ns };
+	} else {
+		// A draw without texture coordinates doesn't sample the texture even if texturing is still
+		// enabled from an earlier draw.
+		if (!gstate.isTextureMapEnabled() || (vertType & GE_VTYPE_TC_MASK) == 0) {
+			return 0;
+		}
+		const u32 texAddr = gstate.getTextureAddress(0) & 0x3FFFFFFF;
+		if (!IsVideo(texAddr)) {
+			return 0;
+		}
+		// An unswizzled texture drawn 1:1. The texture fetch sets the rate - the framebuffer's format,
+		// filtering and blending make no difference. The texture cache copes with rectangles up to
+		// 128 texels wide and thrashes from 160 (a full-width sprite costs ~7.5x as much as 32-pixel
+		// strips).
+		bool is32Bit;
+		switch (gstate.getTextureFormat()) {
+		case GE_TFMT_8888: is32Bit = true; break;
+		case GE_TFMT_5650:
+		case GE_TFMT_5551:
+		case GE_TFMT_4444: is32Bit = false; break;
+		default: return 0;
+		}
+		static const Rate ramRates[2] = { { 34.9f, 253.0f }, { 66.3f, 503.5f } };
+		static const Rate vramRates[2] = { { 8.3f, 38.3f }, { 13.0f, 76.1f } };
+		if (Memory::IsVRAMAddress(texAddr)) {
+			rate = vramRates[is32Bit ? 1 : 0];
+		} else {
+			rate = ramRates[is32Bit ? 1 : 0];
+			rate.narrow *= ramTextureContention;
+			rate.wide *= ramTextureContention;
+		}
+	}
+
+	const int stride = dec->VertexSize();
+	const int posOffset = dec->posoff;
+	const int left = gstate.getScissorX1();
+	const int top = gstate.getScissorY1();
+	const int right = gstate.getScissorX2() + 1;
+	const int bottom = gstate.getScissorY2() + 1;
+
+	IndexConverter conv(vertType, inds);
+	float ns = 0.0f;
+	for (int i = 0; i + 1 < count; i += 2) {
+		const s16 *p0 = (const s16 *)((const u8 *)verts + stride * conv(i) + posOffset);
+		const s16 *p1 = (const s16 *)((const u8 *)verts + stride * conv(i + 1) + posOffset);
+		const int x0 = std::max(left, (int)std::min(p0[0], p1[0]));
+		const int x1 = std::min(right, (int)std::max(p0[0], p1[0]));
+		const int y0 = std::max(top, (int)std::min(p0[1], p1[1]));
+		const int y1 = std::min(bottom, (int)std::max(p0[1], p1[1]));
+		if (x1 > x0 && y1 > y0) {
+			// The cache sees the part inside the scissor: a full-width sprite drawn once per 64-pixel
+			// scissor strip costs the same as 64-pixel sprites, and pixels outside are free
+			// (blittiming, "sprite480 x8 scissor64"). Tekken 6 draws its movie this way.
+			const int width = x1 - x0;
+			// Measured 144 texels wide falls halfway, so interpolate between 128 and 160.
+			const float wide = std::clamp((width - 128) / 32.0f, 0.0f, 1.0f);
+			ns += (float)((x1 - x0) * (y1 - y0)) * (rate.narrow + wide * (rate.wide - rate.narrow));
+		}
+	}
+	// Measured at the default clocks; the GE speeds up with the rest of the system.
+	return (int)((float)usToCycles(PowerScaleFromDefaultClock(1000)) * ns / 1000000.0f);
+}
+
+// How many flips a video range stays known after the last frame written to it.
+static const int VIDEO_DECIMATE_AGE = 4;
+
+bool GPUCommon::IsVideo(u32 addr) const {
+	addr &= 0x3FFFFFFF;
+	for (const VideoInfo &info : videos_) {
+		if (addr >= info.addr && addr < info.addr + info.size) {
+			return true;
+		}
+	}
+	return false;
+}
+
+u32 GPUCommon::VideoBytesFrom(u32 addr) const {
+	addr &= 0x3FFFFFFF;
+	u32 bytes = 0;
+	for (const VideoInfo &info : videos_) {
+		if (addr >= info.addr && addr < info.addr + info.size) {
+			bytes = std::max(bytes, info.addr + info.size - addr);
+		}
+	}
+	return bytes;
+}
+
+u32 GPUCommon::VideoRowBytesFrom(u32 addr, u32 rowBytes) const {
+	addr &= 0x3FFFFFFF;
+	u32 covered = 0;
+	for (const VideoInfo &info : videos_) {
+		// The frames that start in the first row, which strips converted side by side do.
+		if (info.rowBytes != 0 && info.addr >= addr && info.addr < addr + rowBytes) {
+			covered = std::max(covered, info.addr - addr + info.rowBytes);
+		}
+	}
+	return covered;
+}
+
+void GPUCommon::NoteVideoRange(u32 addr, u32 size, u32 rowBytes) {
+	addr &= 0x3FFFFFFF;
+	// A game blits its video frame every displayed frame while waiting for the next one, so the
+	// same few buffers arrive over and over. Refresh the one we already have rather than stacking
+	// a duplicate per frame - IsVideo() scans this linearly.
+	for (VideoInfo &info : videos_) {
+		if (info.addr == addr) {
+			info.size = size;
+			info.flips = gpuStats.totals.numFlips;
+			info.rowBytes = rowBytes;
+			return;
+		}
+	}
+	videos_.push_back({ addr, size, gpuStats.totals.numFlips, rowBytes });
+}
+
+// So the list doesn't grow unboundedly, and a buffer reused for something else once the movie is
+// over stops being treated as video.
+void GPUCommon::DecimateVideos() {
+	for (auto iter = videos_.begin(); iter != videos_.end(); ) {
+		if (iter->flips + VIDEO_DECIMATE_AGE < gpuStats.totals.numFlips) {
+			iter = videos_.erase(iter);
+		} else {
+			++iter;
+		}
+	}
+}
+
 void GPUCommon::PopDLQueue() {
 	if(!dlQueue.empty()) {
 		dlQueue.pop_front();
@@ -147,6 +332,15 @@ void GPUCommon::PopDLQueue() {
 }
 
 bool GPUCommon::BusyDrawing() {
+	// This is about whether the GE is executing right now, not whether lists are queued.  It's
+	// stopped for the duration of a finish callback, and of a signal callback unless that's a
+	// CONTINUE one, which the GE doesn't wait for.  sceGeSaveContext works fine from those.
+	if (interruptRunning) {
+		const bool continueSignal = gpuState == GPUSTATE_INTERRUPT && currentList && currentList->signal == PSP_GE_SIGNAL_HANDLER_CONTINUE;
+		if (!continueSignal)
+			return false;
+	}
+
 	u32 state = DrawSync(1);
 	if (state == PSP_GE_LIST_DRAWING || state == PSP_GE_LIST_STALLING) {
 		if (currentList && currentList->state != PSP_GE_DL_STATE_PAUSED) {
@@ -209,17 +403,12 @@ u32 GPUCommon::DrawSync(int mode) {
 	if (!top || top->state == PSP_GE_DL_STATE_COMPLETED)
 		return PSP_GE_LIST_COMPLETED;
 
-	if (currentList->pc == currentList->stall)
+	// The firmware compares the stall address against the hardware's pc, which a list that's still
+	// waiting behind a completed one (so, we're in its finish callback) hasn't touched yet.
+	if (top->state != PSP_GE_DL_STATE_QUEUED && top->pc == top->stall)
 		return PSP_GE_LIST_STALLING;
 
 	return PSP_GE_LIST_DRAWING;
-}
-
-void GPUCommon::CheckDrawSync() {
-	if (dlQueue.empty()) {
-		for (int i = 0; i < DisplayListMaxCount; ++i)
-			dls[i].state = PSP_GE_DL_STATE_NONE;
-	}
 }
 
 int GPUCommon::ListSync(int listid, int mode) {
@@ -356,7 +545,7 @@ u32 GPUCommon::EnqueueList(u32 listpc, u32 stall, int subIntrBase, PSPPointer<Ps
 	// Check alignment
 	// TODO Check the context and stack alignement too
 	if (((listpc | stall) & 3) != 0 || !Memory::IsValidAddress(listpc)) {
-		ERROR_LOG_REPORT(Log::G3D, "sceGeListEnqueue: invalid address %08x", listpc);
+		ERROR_LOG(Log::G3D, "sceGeListEnqueue: invalid address %08x", listpc);
 		return SCE_KERNEL_ERROR_INVALID_POINTER;
 	}
 
@@ -369,28 +558,30 @@ u32 GPUCommon::EnqueueList(u32 listpc, u32 stall, int subIntrBase, PSPPointer<Ps
 	int id = -1;
 	u64 currentTicks = CoreTiming::GetTicks(currentMIPS);
 	u32 stackAddr = args.IsValid() && args->size >= 16 ? (u32)args->stackAddr : 0;
-	// Check compatibility
-	// TODO: Figure out what games are affected by this...
+	// The firmware walks the queue looking for the same list or the same stack, but only minds for newer SDKs.
+	// See docs/sceGe.md.
 	if (sceKernelGetCompiledSdkVersion() > 0x01FFFFFF) {
-		//numStacks = 0;
-		//stack = NULL;
-		for (int i = 0; i < DisplayListMaxCount; ++i) {
-			if (dls[i].state != PSP_GE_DL_STATE_NONE && dls[i].state != PSP_GE_DL_STATE_COMPLETED) {
-				// Logically, if the CPU has not interrupted yet, it hasn't seen the latest pc either.
-				// Exit enqueues right after an END, which fails without ignoring pendingInterrupt lists.
-				if (dls[i].pc == listpc && !dls[i].pendingInterrupt) {
-					ERROR_LOG(Log::G3D, "sceGeListEnqueue: can't enqueue, list address %08X already used", listpc);
-					return 0x80000021;
-				} else if (stackAddr != 0 && dls[i].stackAddr == stackAddr && !dls[i].pendingInterrupt) {
-					ERROR_LOG(Log::G3D, "sceGeListEnqueue: can't enqueue, stack address %08X already used", stackAddr);
-					if (!PSP_CoreParameter().compat.flags().IgnoreEnqueue) {
-						return 0x80000021;
-					}
-				}
+		for (int i : dlQueue) {
+			const DisplayList &other = dls[i];
+			// On hardware the FINISH interrupt is immediate, so a list that's only waiting for us to deliver
+			// it is already off the queue. Exit enqueues the same list right after one ends.
+			// Once the finish callback is running the list is COMPLETED, and does count - it's still linked.
+			// Nothing else runs while an interrupt is pending, so gpuState tells a FINISH from a SIGNAL.
+			if (other.pendingInterrupt && other.state != PSP_GE_DL_STATE_COMPLETED && gpuState == GPUSTATE_DONE) {
+				continue;
+			}
+			// This is the address it was enqueued at (or stopped at by sceGeBreak), not where it has got to since.
+			if (other.startpc == (listpc & 0x0FFFFFFF)) {
+				ERROR_LOG(Log::G3D, "sceGeListEnqueue: can't enqueue, list address %08X already used", listpc);
+				return 0x80000021;
+			}
+			// Lists that haven't started executing yet are free to share a stack.
+			if (stackAddr != 0 && other.stackAddr == stackAddr && other.started) {
+				ERROR_LOG(Log::G3D, "sceGeListEnqueue: can't enqueue, stack address %08X already used", stackAddr);
+				return 0x80000021;
 			}
 		}
 	}
-	// TODO Check if list stack dls[i].stack already used then return 0x80000021 as above
 
 	for (int i = 0; i < DisplayListMaxCount; ++i) {
 		int possibleID = (i + nextListID) % DisplayListMaxCount;
@@ -454,6 +645,8 @@ u32 GPUCommon::EnqueueList(u32 listpc, u32 stall, int subIntrBase, PSPPointer<Ps
 	} else if (currentList) {
 		dl.state = PSP_GE_DL_STATE_QUEUED;
 		dlQueue.push_back(id);
+		// This can come from the finish callback of what was the last list, so we're not done after all.
+		drawCompleteTicks = (u64)-1;
 	} else {
 		dl.state = PSP_GE_DL_STATE_RUNNING;
 		currentList = &dl;
@@ -476,7 +669,9 @@ u32 GPUCommon::DequeueList(int listid) {
 		return SCE_KERNEL_ERROR_INVALID_ID;
 
 	auto &dl = dls[listid];
-	if (dl.started)
+	// Anything that has started executing is off limits, which includes completed lists until sceGeDrawSync
+	// recycles them.  We clear started when restoring the context, so check the state too.
+	if (dl.started || dl.state == PSP_GE_DL_STATE_COMPLETED)
 		return SCE_KERNEL_ERROR_BUSY;
 
 	dl.state = PSP_GE_DL_STATE_NONE;
@@ -489,7 +684,7 @@ u32 GPUCommon::DequeueList(int listid) {
 	dl.waitUntilTicks = 0;
 	__GeTriggerWait(GPU_SYNC_LIST, listid);
 
-	CheckDrawSync();
+	// Completed lists stay completed, even if this empties the queue.  Only sceGeDrawSync recycles them.
 	return 0;
 }
 
@@ -517,8 +712,10 @@ u32 GPUCommon::Continue(bool *runList) {
 	if (currentList->state == PSP_GE_DL_STATE_PAUSED)
 	{
 		if (!isbreak) {
-			// TODO: Supposedly this returns SCE_KERNEL_ERROR_BUSY in some case, previously it had
-			// currentList->signal == PSP_GE_SIGNAL_HANDLER_PAUSE, but it doesn't reproduce.
+			// The PAUSE signal has been seen, but the FINISH that delivers it hasn't.  There's no getting out
+			// of this on hardware if the list is stalled in between, short of sceGeBreak(1).
+			if (currentList->signal == PSP_GE_SIGNAL_HANDLER_PAUSE)
+				return SCE_KERNEL_ERROR_BUSY;
 
 			currentList->state = PSP_GE_DL_STATE_RUNNING;
 			currentList->signal = PSP_GE_SIGNAL_NONE;
@@ -566,6 +763,10 @@ u32 GPUCommon::Break(int mode) {
 			dls[i].state = PSP_GE_DL_STATE_NONE;
 			dls[i].signal = PSP_GE_SIGNAL_NONE;
 		}
+		// This resets the GE, and an interrupt that was raised but couldn't be taken yet goes with it:
+		// no callback for a list that reached its FINISH with interrupts off.  One that we just haven't
+		// got around to raising is another matter, the game would have had that callback long ago.
+		__GeCancelRaisedInterrupts(interruptRunning);
 
 		nextListID = 0;
 		currentList = NULL;
@@ -606,16 +807,23 @@ u32 GPUCommon::Break(int mode) {
 	if (currentList->signal == PSP_GE_SIGNAL_SYNC)
 		currentList->pc += 8;
 
+	// The firmware keeps the pc to resume at where the list's address was, so that's now what a new list
+	// is compared against in sceGeListEnQueue.
+	currentList->startpc = currentList->pc;
 	currentList->interrupted = true;
 	currentList->state = PSP_GE_DL_STATE_PAUSED;
 	currentList->signal = PSP_GE_SIGNAL_HANDLER_SUSPEND;
-	isbreak = true;
+	// On hardware, the break sets off a finish interrupt of its own, and until that has been taken,
+	// sceGeContinue only marks the list to be started by it.  From a thread that's immediate, so this
+	// is only ever seen from a callback, or with interrupts off.  InterruptEnd() is where it ends.
+	isbreak = __IsInInterrupt() || !__InterruptsEnabled();
 
 	return currentList->id;
 }
 
 void GPUCommon::PSPFrame() {
 	immCount_ = 0;
+	DecimateVideos();
 	if (dumpNextFrame_) {
 		NOTICE_LOG(Log::G3D, "DUMPING THIS FRAME");
 		dumpThisFrame_ = true;
@@ -734,14 +942,27 @@ inline void GPUCommon::UpdateState(GPURunState state) {
 
 // This is now called when coreState == CORE_RUNNING_GE, in addition to from the various sceGe commands.
 DLResult GPUCommon::ProcessDLQueue() {
+	const DLResult result = RunDLQueue();
+	// Games read the depth buffer back on the CPU once a list has ended, without waiting for the GE
+	// (Syphon Filter's light flares). So the depth rasterizer has to be done by then. Not at a stall,
+	// though, which some games hit hundreds of times a frame.
+	if (listEndedSinceDepthWait_) {
+		listEndedSinceDepthWait_ = false;
+		drawEngineCommon_->WaitForSubmittedDepth();
+	}
+	return result;
+}
+
+DLResult GPUCommon::RunDLQueue() {
 	if (!resumingFromDebugBreak_) {
 		startingTicks = CoreTiming::GetTicks(currentMIPS);
 		cyclesExecuted = 0;
 
-		// ?? Seems to be correct behaviour to process the list anyway?
+		// Still busy with earlier work (e.g. the part of a list before its stall address): run the
+		// list now, but account for its time from when the GE gets free.
 		if (startingTicks < busyTicks) {
-			DEBUG_LOG(Log::G3D, "Can't execute a list yet, still busy for %lld ticks", busyTicks - startingTicks);
-			//return;
+			DEBUG_LOG(Log::G3D, "Starting a list while still busy for %lld ticks", busyTicks - startingTicks);
+			cyclesExecuted = (int)(busyTicks - startingTicks);
 		}
 	}
 
@@ -756,15 +977,17 @@ DLResult GPUCommon::ProcessDLQueue() {
 	for (int listIndex = GetNextListIndex(); listIndex != -1; listIndex = GetNextListIndex()) {
 		DisplayList &list = dls[listIndex];
 
-		if (list.state == PSP_GE_DL_STATE_PAUSED) {
-			return DLResult::Done;
-		}
+		if (!resumingFromDebugBreak_) {
+			if (list.state == PSP_GE_DL_STATE_PAUSED) {
+				return DLResult::Done;
+			}
 
-		// Temporary workaround for Crazy Taxi, see #19894
-		if (list.state == PSP_GE_DL_STATE_NONE) {
-			WARN_LOG(Log::G3D, "Discarding display list with state NONE (pc=%08x). This is odd.", list.pc);
-			dlQueue.erase(std::remove(dlQueue.begin(), dlQueue.end(), listIndex), dlQueue.end());
-			return DLResult::Done;
+			// A SIGNAL or FINISH stops the hardware, and it's the interrupt handler that gets it going again:
+			// on the same list after a signal, or on the next one after running the finish callback.
+			// So until we've delivered that interrupt, nothing runs, whoever asks.  See docs/sceGe.md.
+			if (list.pendingInterrupt) {
+				return DLResult::Done;
+			}
 		}
 
 		DEBUG_LOG(Log::G3D, "%s DL execution at %08x - stall = %08x (startingTicks=%lld)",
@@ -782,8 +1005,12 @@ DLResult GPUCommon::ProcessDLQueue() {
 			gstate_c.offsetAddr = list.offsetAddr;
 
 			if (!Memory::IsValidAddress(list.pc)) {
-				ERROR_LOG(Log::G3D, "DL PC = %08x WTF!!!!", list.pc);
-				return DLResult::Done;
+				// Nothing to execute here, and leaving it at the head of the queue would block everything
+				// behind it for good.  Treat it like a list that ran into an error.
+				ERROR_LOG(Log::G3D, "Display list %d has a bad pc %08x (state %d), dropping it", listIndex, list.pc, (int)list.state);
+				CompleteFailedList(list);
+				dlQueue.erase(std::remove(dlQueue.begin(), dlQueue.end(), listIndex), dlQueue.end());
+				continue;
 			}
 
 			cycleLastPC = list.pc;
@@ -853,11 +1080,30 @@ DLResult GPUCommon::ProcessDLQueue() {
 
 		switch (gpuState) {
 		case GPUSTATE_DONE:
+			if (list.pendingInterrupt) {
+				// The list stays at the head of the queue until its finish callback has run, and the next
+				// list isn't started before that.  InterruptEnd() takes it off the queue.
+				if (dlQueue.size() == 1) {
+					// That was all the drawing there is though, and this is when it was done.  A sceGeDrawSync
+					// that comes after this, but before we get to deliver the interrupt, shouldn't wait.
+					drawCompleteTicks = startingTicks + cyclesExecuted;
+					busyTicks = std::max(busyTicks, drawCompleteTicks);
+					__GeTriggerSync(GPU_SYNC_DRAW, 1, drawCompleteTicks);
+				}
+				if (g_coreCollectDebugStats) {
+					gpuStats.perFrame.otherGPUCycles += cyclesExecuted;
+				}
+				return DLResult::Done;
+			}
+			break;
 		case GPUSTATE_ERROR:
-			// don't do anything - though dunno about error...
+			// The list can't continue. It's removed from the queue below.
+			CompleteFailedList(list);
 			break;
 		case GPUSTATE_STALL:
-			// Resume work on this same display list later.
+			// Resume work on this same display list later. The GE is still busy with what it has
+			// done so far, so the next run starts after that, not when the stall is lifted.
+			busyTicks = std::max(busyTicks, startingTicks + cyclesExecuted);
 			return DLResult::Done;
 		default:
 			return DLResult::Error;
@@ -953,6 +1199,13 @@ void GPUCommon::DoExecuteCall(u32 target) {
 	// Local variable for better codegen
 	DisplayList *currentList = this->currentList;
 
+	// Soul Calibur: Broken Destiny reaches its lighting setup for weapon trails with a third CALL, so
+	// on hardware they stay unlit and take their color from the vertices (#7395).
+	if (currentList->HardwareCallDepth() >= 2) {
+		DEBUG_LOG(Log::G3D, "CALL to %08x: skipped, already two levels deep", target);
+		return;
+	}
+
 	// Bone matrix optimization - many games will CALL a bone matrix (!).
 	// We don't optimize during recording or debugging - so the matrix data gets recorded.
 	if (useFastRunLoop_ && Memory::IsValidRange(target, 13 * 4) && (Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA) {
@@ -975,7 +1228,8 @@ void GPUCommon::DoExecuteCall(u32 target) {
 		auto &stackEntry = currentList->stack[currentList->stackptr++];
 		stackEntry.pc = currentList->pc + 4;
 		stackEntry.offsetAddr = gstate_c.offsetAddr;
-		// The base address is NOT saved/restored for a regular call.
+		// The base address is NOT saved/restored for a regular call, and 0 marks it as one.
+		stackEntry.baseAddr = 0;
 		UpdatePC(currentList->pc, target - 4);
 		currentList->pc = target - 4;	// pc will be increased after we return, counteract that
 	}
@@ -995,7 +1249,7 @@ void GPUCommon::Execute_Ret(u32 op, u32 diff) {
 		currentList->pc = target - 4;
 #ifdef _DEBUG
 		if (!Memory::IsValidAddress(currentList->pc)) {
-			ERROR_LOG_REPORT(Log::G3D, "Invalid DL PC %08x on return", currentList->pc);
+			ERROR_LOG(Log::G3D, "Invalid DL PC %08x on return", currentList->pc);
 			UpdateState(GPUSTATE_ERROR);
 		}
 #endif
@@ -1004,7 +1258,8 @@ void GPUCommon::Execute_Ret(u32 op, u32 diff) {
 
 void GPUCommon::Execute_End(u32 op, u32 diff) {
 	if (flushOnParams_) {
-		drawEngineCommon_->FlushQueuedDepth();
+		drawEngineCommon_->SubmitQueuedDepth();
+		listEndedSinceDepthWait_ = true;
 		Flush();
 	}
 
@@ -1044,6 +1299,9 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 				// But right now, signal is always reset by interrupts, so that causes pause to not work.
 				trigger = false;
 				currentList->signal = behaviour;
+				// The list reads as paused from here on, though it keeps executing until that FINISH.
+				// If it stalls before it, it's stuck: only a running list's stall address is updated.
+				currentList->state = PSP_GE_DL_STATE_PAUSED;
 				DEBUG_LOG(Log::G3D, "Signal with Pause. signal/end: %04x %04x", signal, enddata);
 				break;
 			case PSP_GE_SIGNAL_SYNC:
@@ -1073,7 +1331,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 					}
 
 					if (!Memory::IsValidAddress(target)) {
-						ERROR_LOG_REPORT(Log::G3D, "Signal with Jump (%s): bad address. signal/end: %04x %04x", targetType, signal, enddata);
+						ERROR_LOG(Log::G3D, "Signal with Jump (%s): bad address. signal/end: %04x %04x", targetType, signal, enddata);
 						UpdateState(GPUSTATE_ERROR);
 					} else {
 						UpdatePC(currentList->pc, target);
@@ -1100,16 +1358,16 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 					}
 
 					if (currentList->stackptr == ARRAY_SIZE(currentList->stack)) {
-						ERROR_LOG_REPORT(Log::G3D, "Signal with Call (%s): stack full. signal/end: %04x %04x", targetType, signal, enddata);
+						ERROR_LOG(Log::G3D, "Signal with Call (%s): stack full. signal/end: %04x %04x", targetType, signal, enddata);
 					} else if (!Memory::IsValidAddress(target)) {
-						ERROR_LOG_REPORT(Log::G3D, "Signal with Call (%s): bad address. signal/end: %04x %04x", targetType, signal, enddata);
+						ERROR_LOG(Log::G3D, "Signal with Call (%s): bad address. signal/end: %04x %04x", targetType, signal, enddata);
 						UpdateState(GPUSTATE_ERROR);
 					} else {
 						// TODO: This might save/restore other state...
 						auto &stackEntry = currentList->stack[currentList->stackptr++];
 						stackEntry.pc = currentList->pc;
 						stackEntry.offsetAddr = gstate_c.offsetAddr;
-						stackEntry.baseAddr = gstate.base;
+						stackEntry.baseAddr = gstate.base | (GE_CMD_BASE << 24);
 						UpdatePC(currentList->pc, target);
 						currentList->pc = target;
 						DEBUG_LOG(Log::G3D, "Signal with Call (%s). signal/end: %04x %04x", targetType, signal, enddata);
@@ -1121,7 +1379,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 					trigger = false;
 					currentList->signal = behaviour;
 					if (currentList->stackptr == 0) {
-						ERROR_LOG_REPORT(Log::G3D, "Signal with Return: stack empty. signal/end: %04x %04x", signal, enddata);
+						ERROR_LOG(Log::G3D, "Signal with Return: stack empty. signal/end: %04x %04x", signal, enddata);
 					} else {
 						// TODO: This might save/restore other state...
 						auto &stackEntry = currentList->stack[--currentList->stackptr];
@@ -1134,7 +1392,7 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 				}
 				break;
 			default:
-				ERROR_LOG_REPORT(Log::G3D, "UNKNOWN Signal UNIMPLEMENTED %i ! signal/end: %04x %04x", behaviour, signal, enddata);
+				ERROR_LOG(Log::G3D, "UNKNOWN Signal UNIMPLEMENTED %i ! signal/end: %04x %04x", behaviour, signal, enddata);
 				break;
 			}
 			// TODO: Technically, jump/call/ret should generate an interrupt, but before the pc change maybe?
@@ -1167,17 +1425,19 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 			FlushImm();
 			currentList->subIntrToken = prev & 0xFFFF;
 			UpdateState(GPUSTATE_DONE);
-			// Since we marked done, we have to restore the context now before the next list runs.
-			if (currentList->started && currentList->context.IsValid()) {
-				gstate.Restore(currentList->context);
-				ReapplyGfxState();
-				// Don't restore the context again.
-				currentList->started = false;
-			}
 
 			if (currentList->interruptsEnabled && __GeTriggerInterrupt(currentList->id, currentList->pc, startingTicks + cyclesExecuted)) {
+				// The context is restored once the finish callback has run, which gets to see the state
+				// the list left behind.  Nothing else runs before then, see InterruptEnd().
 				currentList->pendingInterrupt = true;
 			} else {
+				// No interrupt to wait for, so this is it.
+				if (currentList->started && currentList->context.IsValid()) {
+					gstate.Restore(currentList->context);
+					ReapplyGfxState();
+					// Don't restore the context again.
+					currentList->started = false;
+				}
 				currentList->state = PSP_GE_DL_STATE_COMPLETED;
 				currentList->waitUntilTicks = startingTicks + cyclesExecuted;
 				busyTicks = std::max(busyTicks, currentList->waitUntilTicks);
@@ -1190,6 +1450,20 @@ void GPUCommon::Execute_End(u32 op, u32 diff) {
 		DEBUG_LOG(Log::G3D, "END: Not finished: %06x", prev & 0xFFFFFF);
 		break;
 	}
+}
+
+// A list dropped on an error still has to complete like a finished one, or its ID is never freed and
+// sceGeListSync on it never returns.
+void GPUCommon::CompleteFailedList(DisplayList &list) {
+	if (list.started && list.context.IsValid()) {
+		gstate.Restore(list.context);
+		ReapplyGfxState();
+		list.started = false;
+	}
+	list.state = PSP_GE_DL_STATE_COMPLETED;
+	list.waitUntilTicks = startingTicks + cyclesExecuted;
+	busyTicks = std::max(busyTicks, list.waitUntilTicks);
+	__GeTriggerSync(GPU_SYNC_LIST, list.id, list.waitUntilTicks);
 }
 
 void GPUCommon::Execute_BoundingBox(u32 op, u32 diff) {
@@ -1324,6 +1598,7 @@ void GPUCommon::FlushImm() {
 	}
 
 	SetDrawType(DRAW_PRIM, immPrim_);
+	gstate_c.framebufFormat = gstate.FrameBufFormat();
 
 	VirtualFramebuffer *vfb = nullptr;
 	if (framebufferManager_) {
@@ -1332,6 +1607,7 @@ void GPUCommon::FlushImm() {
 	}
 	if (vfb) {
 		CheckDepthUsage(vfb);
+		framebufferManager_->CheckMaskCopy(vfb);
 	}
 
 	bool antialias = (immFlags_ & GE_IMM_ANTIALIAS) != 0;
@@ -1354,8 +1630,10 @@ void GPUCommon::FlushImm() {
 
 	bool changed = texturing != prevTexturing || cullEnable != prevCullEnable || dither != prevDither;
 	changed = changed || prevShading != shading || prevFog != fog;
+	// Always flush, even if the flags match: DispatchSubmitImm switches to through mode and a different
+	// vertex decoder, which would otherwise apply to the draws already queued.
+	Flush();
 	if (changed) {
-		Flush();
 		gstate.antiAliasEnable = (GE_CMD_ANTIALIASENABLE << 24) | (int)antialias;
 		gstate.shademodel = (GE_CMD_SHADEMODE << 24) | (int)shading;
 		gstate.cullfaceEnable = (GE_CMD_CULLFACEENABLE << 24) | (int)cullEnable;
@@ -1397,6 +1675,269 @@ void GPUCommon::FastLoadBoneMatrix(u32 target) {
 	if (g_coreCollectDebugStats) {
 		gpuStats.perFrame.otherGPUCycles += 2 * 14;
 	}
+}
+
+void GPUCommon::Execute_WorldMtxNum(u32 op, u32 diff) {
+	if (!currentList) {
+		gstate.worldmtxnum = (GE_CMD_WORLDMATRIXNUMBER << 24) | (op & 0xF);
+		return;
+	}
+
+	// This is almost always followed by GE_CMD_WORLDMATRIXDATA.
+	const u32_le *src = (const u32_le *)Memory::GetPointerUnchecked(currentList->pc + 4);
+	u32 *dst = (u32 *)(gstate.worldMatrix + (op & 0xF));
+	const int end = 12 - (op & 0xF);
+	int i = 0;
+
+	// We must record the individual data commands while debugRecording_.
+	bool fastLoad = !debugRecording_ && end > 0;
+	// Stalling in the middle of a matrix would be stupid, I doubt this check is necessary.
+	if (currentList->pc < currentList->stall && currentList->pc + end * 4 >= currentList->stall) {
+		fastLoad = false;
+	}
+
+	if (fastLoad) {
+		while ((src[i] >> 24) == GE_CMD_WORLDMATRIXDATA) {
+			const u32 newVal = src[i] << 8;
+			if (dst[i] != newVal) {
+				Flush();
+				dst[i] = newVal;
+				gstate_c.Dirty(DIRTY_WORLDMATRIX | DIRTY_WORLD_VIEW_PROJ_MATRIX | DIRTY_CULL_MATRIX);
+			}
+			if (++i >= end) {
+				break;
+			}
+		}
+	}
+
+	const int count = i;
+	gstate.worldmtxnum = (GE_CMD_WORLDMATRIXNUMBER << 24) | ((op & 0xF) + count);
+
+	// Skip over the loaded data, it's done now.
+	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
+}
+
+void GPUCommon::Execute_WorldMtxData(u32 op, u32 diff) {
+	// Note: it's uncommon to get here now, see above.
+	int num = gstate.worldmtxnum & 0x00FFFFFF;
+	u32 newVal = op << 8;
+	if (num < 12 && newVal != ((const u32 *)gstate.worldMatrix)[num]) {
+		Flush();
+		((u32 *)gstate.worldMatrix)[num] = newVal;
+		gstate_c.Dirty(DIRTY_WORLDMATRIX | DIRTY_WORLD_VIEW_PROJ_MATRIX | DIRTY_CULL_MATRIX);
+	}
+	num++;
+	gstate.worldmtxnum = (GE_CMD_WORLDMATRIXNUMBER << 24) | (num & 0x00FFFFFF);
+	gstate.worldmtxdata = GE_CMD_WORLDMATRIXDATA << 24;
+}
+
+void GPUCommon::Execute_ViewMtxNum(u32 op, u32 diff) {
+	if (!currentList) {
+		gstate.viewmtxnum = (GE_CMD_VIEWMATRIXNUMBER << 24) | (op & 0xF);
+		return;
+	}
+
+	// This is almost always followed by GE_CMD_VIEWMATRIXDATA.
+	const u32_le *src = (const u32_le *)Memory::GetPointerUnchecked(currentList->pc + 4);
+	u32 *dst = (u32 *)(gstate.viewMatrix + (op & 0xF));
+	const int end = 12 - (op & 0xF);
+	int i = 0;
+
+	bool fastLoad = !debugRecording_ && end > 0;
+	if (currentList->pc < currentList->stall && currentList->pc + end * 4 >= currentList->stall) {
+		fastLoad = false;
+	}
+
+	if (fastLoad) {
+		while ((src[i] >> 24) == GE_CMD_VIEWMATRIXDATA) {
+			const u32 newVal = src[i] << 8;
+			if (dst[i] != newVal) {
+				Flush();
+				dst[i] = newVal;
+				gstate_c.Dirty(DIRTY_VIEWMATRIX | DIRTY_WORLD_VIEW_PROJ_MATRIX | DIRTY_VIEW_PROJ_MATRIX | DIRTY_CULL_MATRIX) ;
+			}
+			if (++i >= end) {
+				break;
+			}
+		}
+	}
+
+	const int count = i;
+	gstate.viewmtxnum = (GE_CMD_VIEWMATRIXNUMBER << 24) | ((op & 0xF) + count);
+
+	// Skip over the loaded data, it's done now.
+	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
+}
+
+void GPUCommon::Execute_ViewMtxData(u32 op, u32 diff) {
+	// Note: it's uncommon to get here now, see above.
+	int num = gstate.viewmtxnum & 0x00FFFFFF;
+	u32 newVal = op << 8;
+	if (num < 12 && newVal != ((const u32 *)gstate.viewMatrix)[num]) {
+		Flush();
+		((u32 *)gstate.viewMatrix)[num] = newVal;
+		gstate_c.Dirty(DIRTY_VIEWMATRIX | DIRTY_WORLD_VIEW_PROJ_MATRIX | DIRTY_VIEW_PROJ_MATRIX | DIRTY_CULL_MATRIX);
+	}
+	num++;
+	gstate.viewmtxnum = (GE_CMD_VIEWMATRIXNUMBER << 24) | (num & 0x00FFFFFF);
+	gstate.viewmtxdata = GE_CMD_VIEWMATRIXDATA << 24;
+}
+
+void GPUCommon::Execute_ProjMtxNum(u32 op, u32 diff) {
+	if (!currentList) {
+		gstate.projmtxnum = (GE_CMD_PROJMATRIXNUMBER << 24) | (op & 0xF);
+		return;
+	}
+
+	// This is almost always followed by GE_CMD_PROJMATRIXDATA.
+	const u32_le *src = (const u32_le *)Memory::GetPointerUnchecked(currentList->pc + 4);
+	u32 *dst = (u32 *)(gstate.projMatrix + (op & 0xF));
+	const int end = 16 - (op & 0xF);
+	int i = 0;
+
+	bool fastLoad = !debugRecording_;
+	if (currentList->pc < currentList->stall && currentList->pc + end * 4 >= currentList->stall) {
+		fastLoad = false;
+	}
+
+	if (fastLoad) {
+		while ((src[i] >> 24) == GE_CMD_PROJMATRIXDATA) {
+			const u32 newVal = src[i] << 8;
+			if (dst[i] != newVal) {
+				Flush();
+				dst[i] = newVal;
+				gstate_c.Dirty(DIRTY_PROJMATRIX | DIRTY_WORLD_VIEW_PROJ_MATRIX | DIRTY_VIEW_PROJ_MATRIX | DIRTY_CULL_MATRIX);
+			}
+			if (++i >= end) {
+				break;
+			}
+		}
+	}
+
+	const int count = i;
+	gstate.projmtxnum = (GE_CMD_PROJMATRIXNUMBER << 24) | ((op & 0xF) + count);
+
+	// Skip over the loaded data, it's done now.
+	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
+}
+
+void GPUCommon::Execute_ProjMtxData(u32 op, u32 diff) {
+	// Note: it's uncommon to get here now, see above.
+	int num = gstate.projmtxnum & 0x00FFFFFF;
+	u32 newVal = op << 8;
+	if (num < 16 && newVal != ((const u32 *)gstate.projMatrix)[num]) {
+		Flush();
+		((u32 *)gstate.projMatrix)[num] = newVal;
+		gstate_c.Dirty(DIRTY_PROJMATRIX | DIRTY_WORLD_VIEW_PROJ_MATRIX | DIRTY_VIEW_PROJ_MATRIX | DIRTY_CULL_MATRIX);
+	}
+	num++;
+	if (num <= 16)
+		gstate.projmtxnum = (GE_CMD_PROJMATRIXNUMBER << 24) | (num & 0x00FFFFFF);
+	gstate.projmtxdata = GE_CMD_PROJMATRIXDATA << 24;
+}
+
+void GPUCommon::Execute_TgenMtxNum(u32 op, u32 diff) {
+	if (!currentList) {
+		gstate.texmtxnum = (GE_CMD_TGENMATRIXNUMBER << 24) | (op & 0xF);
+		return;
+	}
+
+	// This is almost always followed by GE_CMD_TGENMATRIXDATA.
+	const u32_le *src = (const u32_le *)Memory::GetPointerUnchecked(currentList->pc + 4);
+	u32 *dst = (u32 *)(gstate.tgenMatrix + (op & 0xF));
+	const int end = 12 - (op & 0xF);
+	int i = 0;
+
+	bool fastLoad = !debugRecording_ && end > 0;
+	if (currentList->pc < currentList->stall && currentList->pc + end * 4 >= currentList->stall) {
+		fastLoad = false;
+	}
+
+	if (fastLoad) {
+		while ((src[i] >> 24) == GE_CMD_TGENMATRIXDATA) {
+			const u32 newVal = src[i] << 8;
+			if (dst[i] != newVal) {
+				Flush();
+				dst[i] = newVal;
+				// We check the matrix to see if we need projection.
+				gstate_c.Dirty(DIRTY_TEXMATRIX | DIRTY_FRAGMENTSHADER_STATE);
+			}
+			if (++i >= end) {
+				break;
+			}
+		}
+	}
+
+	const int count = i;
+	gstate.texmtxnum = (GE_CMD_TGENMATRIXNUMBER << 24) | ((op & 0xF) + count);
+
+	// Skip over the loaded data, it's done now.
+	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
+}
+
+void GPUCommon::Execute_TgenMtxData(u32 op, u32 diff) {
+	// Note: it's uncommon to get here now, see above.
+	int num = gstate.texmtxnum & 0x00FFFFFF;
+	u32 newVal = op << 8;
+	if (num < 12 && newVal != ((const u32 *)gstate.tgenMatrix)[num]) {
+		Flush();
+		((u32 *)gstate.tgenMatrix)[num] = newVal;
+		gstate_c.Dirty(DIRTY_TEXMATRIX | DIRTY_FRAGMENTSHADER_STATE);  // We check the matrix to see if we need projection
+	}
+	num++;
+	gstate.texmtxnum = (GE_CMD_TGENMATRIXNUMBER << 24) | (num & 0x00FFFFFF);
+	gstate.texmtxdata = GE_CMD_TGENMATRIXDATA << 24;
+}
+
+void GPUCommon::Execute_BoneMtxNum(u32 op, u32 diff) {
+	if (!currentList) {
+		gstate.boneMatrixNumber = (GE_CMD_BONEMATRIXNUMBER << 24) | (op & 0x7F);
+		return;
+	}
+
+	// This is almost always followed by GE_CMD_BONEMATRIXDATA.
+	const u32_le *src = (const u32_le *)Memory::GetPointerUnchecked(currentList->pc + 4);
+	u32 *dst = (u32 *)(gstate.boneMatrix + (op & 0x7F));
+	const int end = 12 * 8 - (op & 0x7F);
+	int i = 0;
+
+	bool fastLoad = !debugRecording_ && end > 0;
+	if (currentList->pc < currentList->stall && currentList->pc + end * 4 >= currentList->stall) {
+		fastLoad = false;
+	}
+
+	if (fastLoad) {
+		while ((src[i] >> 24) == GE_CMD_BONEMATRIXDATA) {
+			dst[i] = src[i] << 8;
+			if (++i >= end) {
+				break;
+			}
+		}
+	}
+
+	const int count = i;
+	gstate.boneMatrixNumber = (GE_CMD_BONEMATRIXNUMBER << 24) | ((op & 0x7F) + count);
+
+	// Skip over the loaded data, it's done now.
+	currentList->pc += count * 4;
+	UpdatePC(currentList->pc, currentList->pc);
+}
+
+void GPUCommon::Execute_BoneMtxData(u32 op, u32 diff) {
+	// Note: it's uncommon to get here now, see above.
+	int num = gstate.boneMatrixNumber & 0x00FFFFFF;
+	u32 newVal = op << 8;
+	if (num < 96 && newVal != ((const u32 *)gstate.boneMatrix)[num]) {
+		// Bone matrices should NOT flush, as we're always doing skinning in decode nowadays!
+		((u32 *)gstate.boneMatrix)[num] = newVal;
+	}
+	num++;
+	gstate.boneMatrixNumber = (GE_CMD_BONEMATRIXNUMBER << 24) | (num & 0x00FFFFFF);
+	gstate.boneMatrixData = GE_CMD_BONEMATRIXDATA << 24;
 }
 
 struct DisplayList_v1 {
@@ -1442,7 +1983,7 @@ struct DisplayList_v2 {
 };
 
 void GPUCommon::DoState(PointerWrap &p) {
-	auto s = p.Section("GPUCommon", 1, 6);
+	auto s = p.Section("GPUCommon", 1, 8);
 	if (!s)
 		return;
 
@@ -1499,12 +2040,40 @@ void GPUCommon::DoState(PointerWrap &p) {
 			dls[i].stackAddr = 0;
 		}
 	}
+	if (s < 7 && p.mode == PointerWrap::MODE_READ) {
+		// We didn't use to mark a PAUSE signal as delivered, which sceGeContinue now goes by.
+		// Back then, a list was only PAUSED with that signal set once it had reached its FINISH,
+		// and if the interrupt for that is still to come, it'll take care of this.
+		for (DisplayList &dl : dls) {
+			if (dl.state == PSP_GE_DL_STATE_PAUSED && dl.signal == PSP_GE_SIGNAL_HANDLER_PAUSE && !dl.pendingInterrupt) {
+				dl.signal = PSP_GE_SIGNAL_HANDLER_SUSPEND;
+			}
+		}
+	}
+
 	int currentID = 0;
 	if (currentList != nullptr) {
 		currentID = (int)(currentList - &dls[0]);
 	}
 	Do(p, currentID);
-	if (currentID == 0) {
+	if (p.mode == PointerWrap::MODE_READ) {
+		bool valid = currentID >= 0 && currentID < DisplayListMaxCount;
+		for (int id : dlQueue) {
+			valid = valid && id >= 0 && id < DisplayListMaxCount;
+		}
+		for (const DisplayList &dl : dls) {
+			valid = valid && dl.stackptr >= 0 && dl.stackptr <= (int)ARRAY_SIZE(dl.stack);
+		}
+		if (!valid) {
+			ERROR_LOG(Log::G3D, "Savestate has an invalid display list id or stack pointer");
+			p.SetError(p.ERROR_FAILURE);
+			return;
+		}
+		// Video frames aren't saved, and the ones before the load are no longer in memory.
+		videos_.clear();
+	}
+	// List 0 looks the same as no list here, but no list means an empty queue.
+	if (currentID == 0 && (dlQueue.empty() || dlQueue.front() != 0)) {
 		currentList = nullptr;
 	} else {
 		currentList = &dls[currentID];
@@ -1517,9 +2086,26 @@ void GPUCommon::DoState(PointerWrap &p) {
 
 	if (s >= 5) {
 		Do(p, matrixVisible.all);
+	} else if (p.mode == PointerWrap::MODE_READ) {
+		ResetMatrices();
 	}
 	if (s >= 6) {
 		Do(p, edramTranslation_);
+	} else if (p.mode == PointerWrap::MODE_READ) {
+		edramTranslation_ = 0x400;
+	}
+	// Which slot (and so which id) the next list gets. Older states start over at 0, rather than
+	// carry on from the session before the load.
+	if (s >= 8) {
+		Do(p, nextListID);
+	} else {
+		nextListID = 0;
+	}
+	if (p.mode == PointerWrap::MODE_READ) {
+		if (nextListID < 0 || nextListID > DisplayListMaxCount) {
+			nextListID = 0;
+		}
+		recorder_.RestartAfterLoad();
 	}
 }
 
@@ -1539,9 +2125,6 @@ void GPUCommon::InterruptEnd(int listid) {
 			gstate.Restore(dl.context);
 			ReapplyGfxState();
 		}
-		dl.waitUntilTicks = 0;
-		__GeTriggerWait(GPU_SYNC_LIST, listid);
-
 		// Make sure the list isn't still queued since it's now completed.
 		if (!dlQueue.empty()) {
 			if (listid == dlQueue.front())
@@ -1549,6 +2132,16 @@ void GPUCommon::InterruptEnd(int listid) {
 			else
 				dlQueue.remove(listid);
 		}
+
+		// If that was the last list, threads in sceGeDrawSync are woken before the ones waiting for this list.
+		// Not for a list sceGeBreak(1) has reset though, that doesn't wake anyone.
+		if (dlQueue.empty() && dl.state == PSP_GE_DL_STATE_COMPLETED) {
+			bool wokeThreads = __GeTriggerWait(GPU_SYNC_DRAW, 1);
+			SyncEnd(GPU_SYNC_DRAW, 1, wokeThreads);
+		}
+
+		dl.waitUntilTicks = 0;
+		__GeTriggerWait(GPU_SYNC_LIST, listid);
 	}
 }
 
@@ -1713,6 +2306,64 @@ void GPUCommon::SetCmdValue(u32 op) {
 	downcount = 0;
 }
 
+// One row of a block transfer whose source and destination overlap, as the GE copies it (ppsspp-re geprobe
+// exp219, exp220: 562 of 570 cases exact). The source is read in whole aligned 16-byte blocks, four at a
+// time from the row's first block, and each byte placed at its destination address in a buffer of four
+// 16-byte slots (indexed by destination address bits 4-5, tagged by destination block), only the bytes
+// inside the transfer marked written. Placing into a slot tagged with another block writes that block's
+// written bytes to memory and retags the slot, keeping its bytes. Reading a source block that its slot is
+// tagged with takes the slot's bytes as they are, stale ones included. The slots are written out after the row.
+static void BlockTransferOverlappingRow(u32 srcAddr, u32 dstAddr, u32 bytes) {
+	struct Slot {
+		u32 block;
+		bool used;
+		u16 written;
+		u8 data[16];
+	};
+	Slot slots[4]{};
+	auto writeOut = [](const Slot &slot) {
+		if (!slot.used || !slot.written)
+			return;
+		u8 *p = Memory::GetPointerWriteUnchecked(slot.block << 4);
+		for (int k = 0; k < 16; ++k) {
+			if (slot.written & (1 << k))
+				p[k] = slot.data[k];
+		}
+	};
+	const u32 firstBlock = srcAddr >> 4, lastBlock = (srcAddr + bytes - 1) >> 4;
+	const u32 delta = dstAddr - srcAddr;
+	for (u32 group = firstBlock; group <= lastBlock; group += 4) {
+		const u32 count = std::min(4u, lastBlock - group + 1);
+		u8 read[4][16];
+		for (u32 i = 0; i < count; ++i) {
+			const u32 block = group + i;
+			const Slot &slot = slots[block & 3];
+			if (slot.used && slot.block == block && slot.written)
+				memcpy(read[i], slot.data, 16);
+			else
+				memcpy(read[i], Memory::GetPointerUnchecked(block << 4), 16);
+		}
+		for (u32 i = 0; i < count; ++i) {
+			for (u32 k = 0; k < 16; ++k) {
+				const u32 addr = ((group + i) << 4) + k;
+				const u32 dst = addr + delta;
+				Slot &slot = slots[(dst >> 4) & 3];
+				if (!slot.used || slot.block != dst >> 4) {
+					writeOut(slot);
+					slot.used = true;
+					slot.block = dst >> 4;
+					slot.written = 0;
+				}
+				slot.data[dst & 15] = read[i][k];
+				if (addr - srcAddr < bytes)
+					slot.written |= 1 << (dst & 15);
+			}
+		}
+	}
+	for (const Slot &slot : slots)
+		writeOut(slot);
+}
+
 void GPUCommon::DoBlockTransfer(u32 skipDrawReason) {
 	u32 srcBasePtr = gstate.getTransferSrcAddress();
 	u32 srcStride = gstate.getTransferSrcStride();
@@ -1762,8 +2413,10 @@ void GPUCommon::DoBlockTransfer(u32 skipDrawReason) {
 		// Can use GetPointerUnchecked because we checked the addresses above. We could also avoid them
 		// entirely by walking a couple of pointers...
 
-		// Simple case: just a straight copy, no overlap or wrapping.
-		if (srcStride == dstStride && (u32)width == srcStride && !srcDstOverlap && srcValid && dstValid) {
+		if (CopyBlockTransfer(srcBasePtr, srcStride, srcX, srcY, dstBasePtr, dstStride, dstX, dstY, width, height, bpp)) {
+			// The backend copied it.
+		} else if (srcStride == dstStride && (u32)width == srcStride && !srcDstOverlap && srcValid && dstValid) {
+			// Simple case: just a straight copy, no overlap or wrapping.
 			u32 srcLineStartAddr = srcBasePtr + (srcY * srcStride + srcX) * bpp;
 			u32 dstLineStartAddr = dstBasePtr + (dstY * dstStride + dstX) * bpp;
 			u32 bytesToCopy = width * height * bpp;
@@ -1809,11 +2462,16 @@ void GPUCommon::DoBlockTransfer(u32 skipDrawReason) {
 				bool dstLineWrap = !Memory::IsValidRange(dstLineStartAddr, bytesToCopy);
 
 				if (!srcLineWrap && !dstLineWrap) {
-					const u8 *srcp = Memory::GetPointerOrException(srcLineStartAddr);
-					u8 *dstp = Memory::GetPointerWriteOrException(dstLineStartAddr);
-					for (u32 i = 0; i < bytesToCopy; i += 64) {
-						u32 chunk = i + 64 > bytesToCopy ? bytesToCopy - i : 64;
-						memmove(dstp + i, srcp + i, chunk);
+					const bool lineOverlap = srcLineStartAddr < dstLineStartAddr + bytesToCopy && dstLineStartAddr < srcLineStartAddr + bytesToCopy;
+					// The whole blocks the GE reads and writes.
+					const u32 srcBlocksStart = srcLineStartAddr & ~15, dstBlocksStart = dstLineStartAddr & ~15;
+					if (lineOverlap && Memory::IsValidRange(srcBlocksStart, ((srcLineStartAddr + bytesToCopy + 15) & ~15) - srcBlocksStart) &&
+						Memory::IsValidRange(dstBlocksStart, ((dstLineStartAddr + bytesToCopy + 15) & ~15) - dstBlocksStart)) {
+						BlockTransferOverlappingRow(srcLineStartAddr, dstLineStartAddr, bytesToCopy);
+					} else {
+						const u8 *srcp = Memory::GetPointerOrException(srcLineStartAddr);
+						u8 *dstp = Memory::GetPointerWriteOrException(dstLineStartAddr);
+						memmove(dstp, srcp, bytesToCopy);
 					}
 
 					// If we're tracking detail, it's useful to have the gaps illustrated properly.
@@ -1922,6 +2580,17 @@ void GPUCommon::DoBlockTransfer(u32 skipDrawReason) {
 	cyclesExecuted += ((height * width * bpp) * 16) / 10;
 }
 
+// A block copy of a video frame is still a video frame, and games do move them around: Dragon Ball
+// Z - Shin Budokai: Another Road colour-converts into RAM, sceDmacMemcpy's the result into VRAM and
+// textures from there, never sampling the converted buffer itself. Without carrying the status
+// across the copy, what we actually sample looks like an ordinary texture that happens to have new
+// contents every frame, so we hash it, miss, and rebuild it - forever.
+void GPUCommon::NotifyVideoCopy(u32 dest, u32 src, int size) {
+	if (size > 0 && IsVideo(src)) {
+		NoteVideoRange(dest, (u32)size);
+	}
+}
+
 bool GPUCommon::PerformMemoryCopy(u32 dest, u32 src, int size, GPUCopyFlag flags) {
 	if (size == 0) {
 		_dbg_assert_msg_(false, "Zero-sized PerformMemoryCopy: %08x -> %08x, size %d (flag: %d)", src, dest, size, (int)flags);
@@ -1941,7 +2610,8 @@ bool GPUCommon::PerformMemoryCopy(u32 dest, u32 src, int size, GPUCopyFlag flags
 	}
 
 	// Track stray copies of a framebuffer in RAM. MotoGP does this.
-	if (framebufferManager_->MayIntersectFramebufferColor(src) || framebufferManager_->MayIntersectFramebufferColor(dest)) {
+	// Depth buffers are usually above the color range, so requested depth copies always go through.
+	if ((flags & GPUCopyFlag::DEPTH_REQUESTED) || framebufferManager_->MayIntersectFramebufferColor(src) || framebufferManager_->MayIntersectFramebufferColor(dest)) {
 		if (!framebufferManager_->NotifyFramebufferCopy(src, dest, size, flags, gstate_c.skipDrawReason)) {
 			// We use matching values in PerformReadbackToMemory/PerformWriteColorFromMemory.
 			// Since they're identical we don't need to copy.
@@ -2016,12 +2686,19 @@ bool GPUCommon::PerformWriteColorFromMemory(u32 dest, int size) {
 	return false;
 }
 
-void GPUCommon::PerformWriteFormattedFromMemory(u32 addr, int size, int frameWidth, GEBufferFormat format) {
+void GPUCommon::PerformWriteFormattedFromMemory(u32 addr, int size, int frameWidth, GEBufferFormat format, int rectWidth) {
+	NoteVideoRange(addr, (u32)size, (u32)(rectWidth * BufferFormatBytesPerPixel(format)));
 	if (Memory::IsVRAMAddress(addr)) {
-		framebufferManager_->PerformWriteFormattedFromMemory(addr, size, frameWidth, format);
+		framebufferManager_->PerformWriteFormattedFromMemory(addr, size, frameWidth, format, rectWidth);
 	}
-	textureCache_->NotifyWriteFormattedFromMemory(addr, size, frameWidth, format);
 	InvalidateCache(addr, size, GPU_INVALIDATE_SAFE);
+}
+
+bool GPUCommon::PerformReadbackStencilToMemory(u32 dest, int size) {
+	if (Memory::IsVRAMAddress(dest) && framebufferManager_->MayIntersectFramebufferColor(dest)) {
+		return framebufferManager_->ReadbackStencilToMemory(dest, size);
+	}
+	return false;
 }
 
 bool GPUCommon::PerformWriteStencilFromMemory(u32 dest, int size, WriteStencil flags) {
@@ -2049,12 +2726,16 @@ bool GPUCommon::NeedsSlowInterpreter() const {
 void GPUCommon::ClearBreakNext() {
 	breakNext_ = GPUDebug::BreakNext::NONE;
 	breakAtCount_ = -1;
+	// A step that never reached its target leaves these behind, and they'd trip unexpectedly later.
+	breakpoints_.ClearTempBreakpoints();
 	GPUStepping::ResumeFromStepping();
 }
 
 void GPUCommon::SetBreakNext(GPUDebug::BreakNext next) {
 	breakNext_ = next;
 	breakAtCount_ = -1;
+	// Drop the ones from a previous step that didn't get there, before adding this one's.
+	breakpoints_.ClearTempBreakpoints();
 	switch (next) {
 	case GPUDebug::BreakNext::TEX:
 		breakpoints_.AddTextureChangeTempBreakpoint();
@@ -2281,13 +2962,18 @@ void GPUCommon::UpdateMatrixProducts() {
 
 		// Now, check the Z range. If the viewport matches the limits of Z, we can avoid the need to do near clipping in many cases
 		// since the host hardware will take care of it automatically.
-		const float absZScale = fabsf(gstate.getViewportZScale());
+		const float zScale = gstate.getViewportZScale();
 		const float zCenter = gstate.getViewportZCenter();
 		const float zMin = gstate.getDepthRangeMin();
-		const float frontPlane = zCenter - absZScale;
-		if (frontPlane == zMin || frontPlane == zMin + 1.0f) {
-			gstate_c.viewportNearPlaneMatchesOutput = true;
-		}
+		const float zMax = gstate.getDepthRangeMax();
+		const float frontPlane = zCenter - fabsf(zScale);
+		gstate_c.viewportNearPlaneMatchesOutput = frontPlane == zMin || frontPlane == zMin + 1.0f;
+
+		// The near plane (z = -w) and the far plane (z = w) in screen Z.
+		auto onClipPlane = [&](float planeZ) {
+			return (zMin > 0.0f && fabsf(planeZ - zMin) <= 1.0f) || (zMax < 65535.0f && fabsf(planeZ - zMax) <= 1.0f);
+		};
+		gstate_c.viewportZPlanesOnClipPlanes = onClipPlane(zCenter - zScale) && onClipPlane(zCenter + zScale);
 	}
 	// It's just a bit operation, cheaper to clean all three together.
 	gstate_c.Clean(DIRTY_WORLD_VIEW_PROJ_MATRIX | DIRTY_VIEW_PROJ_MATRIX | DIRTY_CULL_MATRIX);

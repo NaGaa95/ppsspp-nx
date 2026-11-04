@@ -37,6 +37,8 @@ class IOFile;
 
 class LinkedShader {
 public:
+	LinkedShader(const LinkedShader &) = delete;
+	LinkedShader &operator=(const LinkedShader &) = delete;
 	LinkedShader(GLRenderManager *render, VShaderID VSID, Shader *vs, FShaderID FSID, Shader *fs, bool useHWTransform, bool preloading = false);
 	~LinkedShader();
 
@@ -68,6 +70,7 @@ public:
 	int u_texmtx;
 	int u_world;
 	int u_mipBias;
+	int u_texLodBias;
 	int u_scaleX;
 	int u_scaleY;
 	int u_NaN;
@@ -120,12 +123,6 @@ public:
 	int u_lightdiffuse[4];  // each light consist of vec4[3]
 	int u_lightspecular[4];  // attenuation
 	int u_lightambient[4];  // attenuation
-
-	// Spline Tessellation
-	int u_tess_points; // Control Points
-	int u_tess_weights_u;
-	int u_tess_weights_v;
-	int u_spline_counts;
 };
 
 // Real public interface
@@ -139,6 +136,8 @@ struct ShaderDescGLES {
 
 class Shader {
 public:
+	Shader(const Shader &) = delete;
+	Shader &operator=(const Shader &) = delete;
 	Shader(GLRenderManager *render, const char *code, const std::string &desc, const ShaderDescGLES &params);
 	~Shader();
 	GLRShader *shader;

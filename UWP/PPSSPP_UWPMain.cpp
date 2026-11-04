@@ -463,6 +463,8 @@ bool System_GetPropertyBool(SystemProperty prop) {
 	}
 	case SYSPROP_HAS_FILE_BROWSER:
 		return true;
+	case SYSPROP_CAN_LAUNCH_URL:
+		return true;
 	case SYSPROP_HAS_FOLDER_BROWSER:
 		return true;
 	case SYSPROP_HAS_IMAGE_BROWSER:
@@ -492,6 +494,8 @@ bool System_GetPropertyBool(SystemProperty prop) {
 	}
 	case SYSPROP_DEBUGGER_PRESENT:
 		return IsDebuggerPresent();
+	case SYSPROP_SUPPORTS_HTTPS:
+		return !g_Config.bDisableHTTPS;
 	case SYSPROP_OK_BUTTON_LEFT:
 		return true;
 	case SYSPROP_CAN_GET_FREE_SPACE_FAST:
@@ -544,7 +548,7 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 		std::vector<std::string> supportedExtensions = {};
 		switch ((BrowseFileType)param3) {
 		case BrowseFileType::BOOTABLE:
-			supportedExtensions = { ".cso", ".iso", ".chd", ".elf", ".pbp", ".zip", ".prx", ".bin" };  // should .bin even be here?
+			supportedExtensions = { ".cso", ".iso", ".chd", ".elf", ".pbp", ".zip", ".prx", ".bin", ".cue", ".ccd", ".mds", ".mdf", ".img" };
 			break;
 		case BrowseFileType::SAVE_STATE:
 			supportedExtensions = { ".ppst" };

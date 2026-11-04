@@ -15,6 +15,8 @@
 #include "Core/Debugger/Breakpoints.h"
 #include "Core/HLE/HLE.h"
 #include "Core/HLE/ReplaceTables.h"
+#include "Core/HW/MMIO.h"
+#include "Core/MemFault.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
 #include "Core/MIPS/MIPSTables.h"
@@ -53,11 +55,6 @@ alignas(16) static const uint32_t lowBytesMask[4] = {
 };
 
 u32 IRRunBreakpoint(u32 pc) {
-	// Should we skip this breakpoint?
-	uint32_t skipFirst = g_breakpoints.CheckSkipFirst();
-	if (skipFirst == pc || skipFirst == currentMIPS->pc)
-		return 0;
-
 	// Did we already hit one?
 	if (coreState != CORE_RUNNING_CPU && coreState != CORE_NEXTFRAME)
 		return 1;
@@ -67,11 +64,6 @@ u32 IRRunBreakpoint(u32 pc) {
 }
 
 u32 IRRunMemCheck(u32 pc, u32 addr) {
-	// Should we skip this breakpoint?
-	uint32_t skipFirst = g_breakpoints.CheckSkipFirst();
-	if (skipFirst == pc || skipFirst == currentMIPS->pc)
-		return 0;
-
 	// Did we already hit one?
 	if (coreState != CORE_RUNNING_CPU && coreState != CORE_NEXTFRAME)
 		return 1;
@@ -80,192 +72,522 @@ u32 IRRunMemCheck(u32 pc, u32 addr) {
 	return coreState != CORE_RUNNING_CPU ? 1 : 0;
 }
 
-u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
-	while (true) {
-		switch (inst->op) {
-		case IROp::SetConst:
-			mips->r[inst->dest] = inst->constant;
-			break;
-		case IROp::SetConstF:
-			memcpy(&mips->f[inst->dest], &inst->constant, 4);
-			break;
-		case IROp::Add:
-			mips->r[inst->dest] = mips->r[inst->src1] + mips->r[inst->src2];
-			break;
-		case IROp::Sub:
-			mips->r[inst->dest] = mips->r[inst->src1] - mips->r[inst->src2];
-			break;
-		case IROp::And:
-			mips->r[inst->dest] = mips->r[inst->src1] & mips->r[inst->src2];
-			break;
-		case IROp::Or:
-			mips->r[inst->dest] = mips->r[inst->src1] | mips->r[inst->src2];
-			break;
-		case IROp::Xor:
-			mips->r[inst->dest] = mips->r[inst->src1] ^ mips->r[inst->src2];
-			break;
-		case IROp::Mov:
-			mips->r[inst->dest] = mips->r[inst->src1];
-			break;
-		case IROp::AddConst:
-			mips->r[inst->dest] = mips->r[inst->src1] + inst->constant;
-			break;
-		case IROp::OptAddConst:  // For this one, it's worth having a "unary" variant of the above that only needs to read one register param.
-			mips->r[inst->dest] += inst->constant;
-			break;
-		case IROp::SubConst:
-			mips->r[inst->dest] = mips->r[inst->src1] - inst->constant;
-			break;
-		case IROp::AndConst:
-			mips->r[inst->dest] = mips->r[inst->src1] & inst->constant;
-			break;
-		case IROp::OptAndConst:  // For this one, it's worth having a "unary" variant of the above that only needs to read one register param.
-			mips->r[inst->dest] &= inst->constant;
-			break;
-		case IROp::OrConst:
-			mips->r[inst->dest] = mips->r[inst->src1] | inst->constant;
-			break;
-		case IROp::OptOrConst:
-			mips->r[inst->dest] |= inst->constant;
-			break;
-		case IROp::XorConst:
-			mips->r[inst->dest] = mips->r[inst->src1] ^ inst->constant;
-			break;
-		case IROp::Neg:
-			mips->r[inst->dest] = (u32)(-(s32)mips->r[inst->src1]);
-			break;
-		case IROp::Not:
-			mips->r[inst->dest] = ~mips->r[inst->src1];
-			break;
-		case IROp::Ext8to32:
-			mips->r[inst->dest] = SignExtend8ToU32(mips->r[inst->src1]);
-			break;
-		case IROp::Ext16to32:
-			mips->r[inst->dest] = SignExtend16ToU32(mips->r[inst->src1]);
-			break;
-		case IROp::ReverseBits:
-			mips->r[inst->dest] = ReverseBits32(mips->r[inst->src1]);
-			break;
+// LoadKernel* and StoreKernel*: memory, or a hardware register, like the interpreter's loads and stores.
+template <int size>
+static bool IsValidAlignedAddress(const Memory::AddressSpace &space, u32 addr) {
+	switch (size) {
+	case 1: return space.IsValidAddress(addr);
+	case 2: return space.IsValid2AlignedAddress(addr);
+	default: return space.IsValid4AlignedAddress(addr);
+	}
+}
 
-		case IROp::Load8:
-			mips->r[inst->dest] = Memory::ReadUnchecked_U8(mips->r[inst->src1] + inst->constant);
-			break;
-		case IROp::Load8Ext:
-			mips->r[inst->dest] = SignExtend8ToU32(Memory::ReadUnchecked_U8(mips->r[inst->src1] + inst->constant));
-			break;
-		case IROp::Load16:
-			mips->r[inst->dest] = Memory::ReadUnchecked_U16(mips->r[inst->src1] + inst->constant);
-			break;
-		case IROp::Load16Ext:
-			mips->r[inst->dest] = SignExtend16ToU32(Memory::ReadUnchecked_U16(mips->r[inst->src1] + inst->constant));
-			break;
-		case IROp::Load32:
-			mips->r[inst->dest] = Memory::ReadUnchecked_U32(mips->r[inst->src1] + inst->constant);
-			break;
-		case IROp::Load32Left:
+template <int size, bool sign>
+static u32 RunKernelLoad(MIPSState *mips, u32 addr) {
+	u32 value;
+	if (IsValidAlignedAddress<size>(*mips->space, addr)) {
+		switch (size) {
+		case 1: value = mips->space->ReadUnchecked_U8(addr); break;
+		case 2: value = mips->space->ReadUnchecked_U16(addr); break;
+		default: value = mips->space->ReadUnchecked_U32(addr); break;
+		}
+	} else if (Memory::IsMMIOAccess(addr)) {
+		value = MMIO::Read(mips, addr, size);
+	} else {
+		Core_MemoryException(addr, size, mips->pc, MemoryExceptionType::READ_WORD, "kernel load");
+		return 0;
+	}
+	if (sign)
+		value = size == 1 ? SignExtend8ToU32(value) : SignExtend16ToU32(value);
+	return value;
+}
+
+template <int size>
+static void RunKernelStore(MIPSState *mips, u32 addr, u32 value) {
+	if (IsValidAlignedAddress<size>(*mips->space, addr)) {
+		switch (size) {
+		case 1: mips->space->WriteUnchecked_U8((u8)value, addr); break;
+		case 2: mips->space->WriteUnchecked_U16((u16)value, addr); break;
+		default: mips->space->WriteUnchecked_U32(value, addr); break;
+		}
+	} else if (Memory::IsMMIOAccess(addr)) {
+		MMIO::Write(mips, addr, size, value);
+	} else {
+		Core_MemoryException(addr, size, mips->pc, MemoryExceptionType::WRITE_WORD, "kernel store");
+	}
+}
+
+u32 IRRunKernelLoad(MIPSState *mips, u32 addr, u32 op) {
+	switch ((IROp)op) {
+	case IROp::LoadKernel8: return RunKernelLoad<1, false>(mips, addr);
+	case IROp::LoadKernel8Ext: return RunKernelLoad<1, true>(mips, addr);
+	case IROp::LoadKernel16: return RunKernelLoad<2, false>(mips, addr);
+	case IROp::LoadKernel16Ext: return RunKernelLoad<2, true>(mips, addr);
+	default: return RunKernelLoad<4, false>(mips, addr);
+	}
+}
+
+void IRRunKernelStore(MIPSState *mips, u32 addr, u32 value, u32 op) {
+	switch ((IROp)op) {
+	case IROp::StoreKernel8: RunKernelStore<1>(mips, addr, value); break;
+	case IROp::StoreKernel16: RunKernelStore<2>(mips, addr, value); break;
+	default: RunKernelStore<4>(mips, addr, value); break;
+	}
+}
+
+// With GCC and Clang, each op jumps straight to the next op's handler through a table ("threaded"
+// dispatch), which predicts much better than the one shared indirect jump of a switch. Other
+// compilers get the switch. Ops missing from the table fall back to the switch, so they still work.
+// Clang keeps one jump per op only while the shared tail stays small, and a direct goto to a handler
+// label also makes it give up, leaving a single indirect jump (10-15% slower). Count the `br`s in
+// the disassembly after changing the dispatch.
+#if defined(__GNUC__) || defined(__clang__)
+#define IR_THREADED_DISPATCH 1
+#define IR_CASE(op) case IROp::op: L_##op:
+#else
+#define IR_CASE(op) case IROp::op:
+#endif
+
+#ifdef _DEBUG
+#define IR_CHECK_ZERO_REG() if (mips->r[0] != 0) Crash();
+#else
+#define IR_CHECK_ZERO_REG()
+#endif
+
+#if IR_THREADED_DISPATCH
+#define IR_NEXT do { IR_CHECK_ZERO_REG(); inst++; goto *dispatch[(int)inst->op]; } while (false)
+#define IR_DISPATCH goto *dispatch[(int)inst->op]
+#else
+#define IR_NEXT { IR_CHECK_ZERO_REG(); inst++; continue; }
+#define IR_DISPATCH goto L_switch
+#endif
+
+// Leaves the block for pcExpr. While downcount lasts, runs the block there right away if it's
+// compiled, the way IRJit::RunBlocks would after we returned (minus the call and the lookup there).
+#define IR_EXIT(pcExpr) do { \
+	const u32 exitPC = (pcExpr); \
+	if (!chainArena || mips->downcount < 0 || !space.IsValid4AlignedAddress(exitPC)) \
+		return exitPC; \
+	const u32 offset = *space.GetBlockShadowEntry(exitPC); \
+	if (offset <= Memory::BLOCK_SHADOW_HOOK_NO_JIT) \
+		return exitPC; \
+	mips->pc = exitPC; \
+	inst = chainArena + offset; \
+	IR_CHECK_ZERO_REG(); \
+	IR_DISPATCH; \
+} while (false)
+
+u32 IRInterpret(MIPSState *mips, const IRInst *inst, const IRInst *chainArena) {
+	const Memory::AddressSpace &space = *mips->space;
+	// Lets a bad guest access halt the core. Calls out to HLE and the like leave this scope.
+	Memory::IRInterpreterFaultScope faultScope(true);
+#if IR_THREADED_DISPATCH
+	static const void *dispatch[256];
+	static bool dispatchReady = false;
+	if (!dispatchReady) {
+		for (const void *&target : dispatch)
+			target = &&L_switch;
+		dispatch[(int)IROp::SetConst] = &&L_SetConst;
+		dispatch[(int)IROp::SetConstF] = &&L_SetConstF;
+		dispatch[(int)IROp::Add] = &&L_Add;
+		dispatch[(int)IROp::Sub] = &&L_Sub;
+		dispatch[(int)IROp::And] = &&L_And;
+		dispatch[(int)IROp::Or] = &&L_Or;
+		dispatch[(int)IROp::Xor] = &&L_Xor;
+		dispatch[(int)IROp::Mov] = &&L_Mov;
+		dispatch[(int)IROp::AddConst] = &&L_AddConst;
+		dispatch[(int)IROp::OptAddConst] = &&L_OptAddConst;
+		dispatch[(int)IROp::SubConst] = &&L_SubConst;
+		dispatch[(int)IROp::AndConst] = &&L_AndConst;
+		dispatch[(int)IROp::OptAndConst] = &&L_OptAndConst;
+		dispatch[(int)IROp::OrConst] = &&L_OrConst;
+		dispatch[(int)IROp::OptOrConst] = &&L_OptOrConst;
+		dispatch[(int)IROp::XorConst] = &&L_XorConst;
+		dispatch[(int)IROp::Neg] = &&L_Neg;
+		dispatch[(int)IROp::Not] = &&L_Not;
+		dispatch[(int)IROp::Ext8to32] = &&L_Ext8to32;
+		dispatch[(int)IROp::Ext16to32] = &&L_Ext16to32;
+		dispatch[(int)IROp::ReverseBits] = &&L_ReverseBits;
+		dispatch[(int)IROp::Load8] = &&L_Load8;
+		dispatch[(int)IROp::Load8Ext] = &&L_Load8Ext;
+		dispatch[(int)IROp::Load16] = &&L_Load16;
+		dispatch[(int)IROp::Load16Ext] = &&L_Load16Ext;
+		dispatch[(int)IROp::Load32] = &&L_Load32;
+		dispatch[(int)IROp::Load32Left] = &&L_Load32Left;
+		dispatch[(int)IROp::Load32Right] = &&L_Load32Right;
+		dispatch[(int)IROp::Load32Linked] = &&L_Load32Linked;
+		dispatch[(int)IROp::LoadFloat] = &&L_LoadFloat;
+		dispatch[(int)IROp::Store8] = &&L_Store8;
+		dispatch[(int)IROp::Store16] = &&L_Store16;
+		dispatch[(int)IROp::Store32] = &&L_Store32;
+		dispatch[(int)IROp::Store32Left] = &&L_Store32Left;
+		dispatch[(int)IROp::Store32Right] = &&L_Store32Right;
+		dispatch[(int)IROp::Store32Conditional] = &&L_Store32Conditional;
+		dispatch[(int)IROp::StoreFloat] = &&L_StoreFloat;
+		dispatch[(int)IROp::LoadVec4] = &&L_LoadVec4;
+		dispatch[(int)IROp::StoreVec4] = &&L_StoreVec4;
+		dispatch[(int)IROp::LoadKernel8] = &&L_LoadKernel8;
+		dispatch[(int)IROp::LoadKernel8Ext] = &&L_LoadKernel8Ext;
+		dispatch[(int)IROp::LoadKernel16] = &&L_LoadKernel16;
+		dispatch[(int)IROp::LoadKernel16Ext] = &&L_LoadKernel16Ext;
+		dispatch[(int)IROp::LoadKernel32] = &&L_LoadKernel32;
+		dispatch[(int)IROp::StoreKernel8] = &&L_StoreKernel8;
+		dispatch[(int)IROp::StoreKernel16] = &&L_StoreKernel16;
+		dispatch[(int)IROp::StoreKernel32] = &&L_StoreKernel32;
+		dispatch[(int)IROp::Vec4Init] = &&L_Vec4Init;
+		dispatch[(int)IROp::Vec4Shuffle] = &&L_Vec4Shuffle;
+		dispatch[(int)IROp::Vec4Blend] = &&L_Vec4Blend;
+		dispatch[(int)IROp::Vec4Mov] = &&L_Vec4Mov;
+		dispatch[(int)IROp::Vec4Add] = &&L_Vec4Add;
+		dispatch[(int)IROp::Vec4Sub] = &&L_Vec4Sub;
+		dispatch[(int)IROp::Vec4Mul] = &&L_Vec4Mul;
+		dispatch[(int)IROp::Vec4Div] = &&L_Vec4Div;
+		dispatch[(int)IROp::Vec4Scale] = &&L_Vec4Scale;
+		dispatch[(int)IROp::Vec4Neg] = &&L_Vec4Neg;
+		dispatch[(int)IROp::Vec4Abs] = &&L_Vec4Abs;
+		dispatch[(int)IROp::Vec2Unpack16To31] = &&L_Vec2Unpack16To31;
+		dispatch[(int)IROp::Vec2Unpack16To32] = &&L_Vec2Unpack16To32;
+		dispatch[(int)IROp::Vec4Unpack8To32] = &&L_Vec4Unpack8To32;
+		dispatch[(int)IROp::Vec2Pack32To16] = &&L_Vec2Pack32To16;
+		dispatch[(int)IROp::Vec2Pack31To16] = &&L_Vec2Pack31To16;
+		dispatch[(int)IROp::Vec4Pack32To8] = &&L_Vec4Pack32To8;
+		dispatch[(int)IROp::Vec4Pack31To8] = &&L_Vec4Pack31To8;
+		dispatch[(int)IROp::Vec4DuplicateUpperBitsAndShift1] = &&L_Vec4DuplicateUpperBitsAndShift1;
+		dispatch[(int)IROp::FCmpVfpuBit] = &&L_FCmpVfpuBit;
+		dispatch[(int)IROp::FCmpVfpuAggregate] = &&L_FCmpVfpuAggregate;
+		dispatch[(int)IROp::FCmovVfpuCC] = &&L_FCmovVfpuCC;
+		dispatch[(int)IROp::Vec4Min] = &&L_Vec4Min;
+		dispatch[(int)IROp::Vec4Max] = &&L_Vec4Max;
+		dispatch[(int)IROp::Vec4Slt] = &&L_Vec4Slt;
+		dispatch[(int)IROp::Vec4Sge] = &&L_Vec4Sge;
+		dispatch[(int)IROp::Vec4CvtScaledSW] = &&L_Vec4CvtScaledSW;
+		dispatch[(int)IROp::Vec4VfpuDot] = &&L_Vec4VfpuDot;
+		dispatch[(int)IROp::Vec4VfpuMultiDot] = &&L_Vec4VfpuMultiDot;
+		dispatch[(int)IROp::FSin] = &&L_FSin;
+		dispatch[(int)IROp::FCos] = &&L_FCos;
+		dispatch[(int)IROp::FRSqrt] = &&L_FRSqrt;
+		dispatch[(int)IROp::FRecip] = &&L_FRecip;
+		dispatch[(int)IROp::FAsin] = &&L_FAsin;
+		dispatch[(int)IROp::FVSqrt] = &&L_FVSqrt;
+		dispatch[(int)IROp::FExp2] = &&L_FExp2;
+		dispatch[(int)IROp::FLog2] = &&L_FLog2;
+		dispatch[(int)IROp::FSinCos] = &&L_FSinCos;
+		dispatch[(int)IROp::FHalfToFloat] = &&L_FHalfToFloat;
+		dispatch[(int)IROp::ShlImm] = &&L_ShlImm;
+		dispatch[(int)IROp::ShrImm] = &&L_ShrImm;
+		dispatch[(int)IROp::SarImm] = &&L_SarImm;
+		dispatch[(int)IROp::RorImm] = &&L_RorImm;
+		dispatch[(int)IROp::Shl] = &&L_Shl;
+		dispatch[(int)IROp::Shr] = &&L_Shr;
+		dispatch[(int)IROp::Sar] = &&L_Sar;
+		dispatch[(int)IROp::Ror] = &&L_Ror;
+		dispatch[(int)IROp::Clz] = &&L_Clz;
+		dispatch[(int)IROp::Slt] = &&L_Slt;
+		dispatch[(int)IROp::SltU] = &&L_SltU;
+		dispatch[(int)IROp::SltConst] = &&L_SltConst;
+		dispatch[(int)IROp::SltUConst] = &&L_SltUConst;
+		dispatch[(int)IROp::MovZ] = &&L_MovZ;
+		dispatch[(int)IROp::MovNZ] = &&L_MovNZ;
+		dispatch[(int)IROp::Max] = &&L_Max;
+		dispatch[(int)IROp::Min] = &&L_Min;
+		dispatch[(int)IROp::MtLo] = &&L_MtLo;
+		dispatch[(int)IROp::MtHi] = &&L_MtHi;
+		dispatch[(int)IROp::MfLo] = &&L_MfLo;
+		dispatch[(int)IROp::MfHi] = &&L_MfHi;
+		dispatch[(int)IROp::Mult] = &&L_Mult;
+		dispatch[(int)IROp::MultU] = &&L_MultU;
+		dispatch[(int)IROp::Madd] = &&L_Madd;
+		dispatch[(int)IROp::MaddU] = &&L_MaddU;
+		dispatch[(int)IROp::Msub] = &&L_Msub;
+		dispatch[(int)IROp::MsubU] = &&L_MsubU;
+		dispatch[(int)IROp::Div] = &&L_Div;
+		dispatch[(int)IROp::DivU] = &&L_DivU;
+		dispatch[(int)IROp::BSwap16] = &&L_BSwap16;
+		dispatch[(int)IROp::BSwap32] = &&L_BSwap32;
+		dispatch[(int)IROp::FAdd] = &&L_FAdd;
+		dispatch[(int)IROp::FSub] = &&L_FSub;
+		dispatch[(int)IROp::FMul] = &&L_FMul;
+		dispatch[(int)IROp::FDiv] = &&L_FDiv;
+		dispatch[(int)IROp::FMin] = &&L_FMin;
+		dispatch[(int)IROp::FMax] = &&L_FMax;
+		dispatch[(int)IROp::FMov] = &&L_FMov;
+		dispatch[(int)IROp::FAbs] = &&L_FAbs;
+		dispatch[(int)IROp::FSqrt] = &&L_FSqrt;
+		dispatch[(int)IROp::FNeg] = &&L_FNeg;
+		dispatch[(int)IROp::FSat0_1] = &&L_FSat0_1;
+		dispatch[(int)IROp::FSatMinus1_1] = &&L_FSatMinus1_1;
+		dispatch[(int)IROp::FSign] = &&L_FSign;
+		dispatch[(int)IROp::FpCondFromReg] = &&L_FpCondFromReg;
+		dispatch[(int)IROp::FpCondToReg] = &&L_FpCondToReg;
+		dispatch[(int)IROp::FpCtrlFromReg] = &&L_FpCtrlFromReg;
+		dispatch[(int)IROp::FpCtrlToReg] = &&L_FpCtrlToReg;
+		dispatch[(int)IROp::VfpuCtrlToReg] = &&L_VfpuCtrlToReg;
+		dispatch[(int)IROp::FRound] = &&L_FRound;
+		dispatch[(int)IROp::FTrunc] = &&L_FTrunc;
+		dispatch[(int)IROp::FCeil] = &&L_FCeil;
+		dispatch[(int)IROp::FFloor] = &&L_FFloor;
+		dispatch[(int)IROp::FCmp] = &&L_FCmp;
+		dispatch[(int)IROp::FCvtSW] = &&L_FCvtSW;
+		dispatch[(int)IROp::FCvtWS] = &&L_FCvtWS;
+		dispatch[(int)IROp::FCvtScaledSW] = &&L_FCvtScaledSW;
+		dispatch[(int)IROp::FCvtScaledWS] = &&L_FCvtScaledWS;
+		dispatch[(int)IROp::FMovFromGPR] = &&L_FMovFromGPR;
+		dispatch[(int)IROp::OptFCvtSWFromGPR] = &&L_OptFCvtSWFromGPR;
+		dispatch[(int)IROp::FMovToGPR] = &&L_FMovToGPR;
+		dispatch[(int)IROp::OptFMovToGPRShr8] = &&L_OptFMovToGPRShr8;
+		dispatch[(int)IROp::ExitToConst] = &&L_ExitToConst;
+		dispatch[(int)IROp::ExitToReg] = &&L_ExitToReg;
+		dispatch[(int)IROp::OptExitToConstIfEqElse] = &&L_OptExitToConstIfEqElse;
+		dispatch[(int)IROp::OptExitToConstIfNeqElse] = &&L_OptExitToConstIfNeqElse;
+		dispatch[(int)IROp::OptExitToConstIfGtZElse] = &&L_OptExitToConstIfGtZElse;
+		dispatch[(int)IROp::OptExitToConstIfGeZElse] = &&L_OptExitToConstIfGeZElse;
+		dispatch[(int)IROp::OptExitToConstIfLtZElse] = &&L_OptExitToConstIfLtZElse;
+		dispatch[(int)IROp::OptExitToConstIfLeZElse] = &&L_OptExitToConstIfLeZElse;
+		dispatch[(int)IROp::ExitToConstIfEq] = &&L_ExitToConstIfEq;
+		dispatch[(int)IROp::ExitToConstIfNeq] = &&L_ExitToConstIfNeq;
+		dispatch[(int)IROp::ExitToConstIfGtZ] = &&L_ExitToConstIfGtZ;
+		dispatch[(int)IROp::ExitToConstIfGeZ] = &&L_ExitToConstIfGeZ;
+		dispatch[(int)IROp::ExitToConstIfLtZ] = &&L_ExitToConstIfLtZ;
+		dispatch[(int)IROp::ExitToConstIfLeZ] = &&L_ExitToConstIfLeZ;
+		dispatch[(int)IROp::Downcount] = &&L_Downcount;
+		dispatch[(int)IROp::SetPC] = &&L_SetPC;
+		dispatch[(int)IROp::SetPCConst] = &&L_SetPCConst;
+		dispatch[(int)IROp::Syscall] = &&L_Syscall;
+		dispatch[(int)IROp::SyscallUnresolved] = &&L_SyscallUnresolved;
+		dispatch[(int)IROp::ExitToPC] = &&L_ExitToPC;
+		dispatch[(int)IROp::Interpret] = &&L_Interpret;
+		dispatch[(int)IROp::CallReplacement] = &&L_CallReplacement;
+		dispatch[(int)IROp::SetCtrlVFPU] = &&L_SetCtrlVFPU;
+		dispatch[(int)IROp::SetCtrlVFPUReg] = &&L_SetCtrlVFPUReg;
+		dispatch[(int)IROp::SetCtrlVFPUFReg] = &&L_SetCtrlVFPUFReg;
+		dispatch[(int)IROp::ApplyRoundingMode] = &&L_ApplyRoundingMode;
+		dispatch[(int)IROp::RestoreRoundingMode] = &&L_RestoreRoundingMode;
+		dispatch[(int)IROp::UpdateRoundingMode] = &&L_UpdateRoundingMode;
+		dispatch[(int)IROp::Break] = &&L_Break;
+		dispatch[(int)IROp::Breakpoint] = &&L_Breakpoint;
+		dispatch[(int)IROp::MemoryCheck] = &&L_MemoryCheck;
+		dispatch[(int)IROp::ValidateAddress8] = &&L_ValidateAddress8;
+		dispatch[(int)IROp::ValidateAddress16] = &&L_ValidateAddress16;
+		dispatch[(int)IROp::ValidateAddress32] = &&L_ValidateAddress32;
+		dispatch[(int)IROp::ValidateAddress128] = &&L_ValidateAddress128;
+		dispatch[(int)IROp::LogIRBlock] = &&L_LogIRBlock;
+		dispatch[(int)IROp::Nop] = &&L_Nop;
+		dispatch[(int)IROp::Bad] = &&L_Bad;
+		dispatchReady = true;
+	}
+#endif
+
+	while (true) {
+	L_switch:
+		switch (inst->op) {
+		IR_CASE(SetConst)
+			mips->r[inst->dest] = inst->constant;
+			IR_NEXT;
+		IR_CASE(SetConstF)
+			memcpy(&mips->f[inst->dest], &inst->constant, 4);
+			IR_NEXT;
+		IR_CASE(Add)
+			mips->r[inst->dest] = mips->r[inst->src1] + mips->r[inst->src2];
+			IR_NEXT;
+		IR_CASE(Sub)
+			mips->r[inst->dest] = mips->r[inst->src1] - mips->r[inst->src2];
+			IR_NEXT;
+		IR_CASE(And)
+			mips->r[inst->dest] = mips->r[inst->src1] & mips->r[inst->src2];
+			IR_NEXT;
+		IR_CASE(Or)
+			mips->r[inst->dest] = mips->r[inst->src1] | mips->r[inst->src2];
+			IR_NEXT;
+		IR_CASE(Xor)
+			mips->r[inst->dest] = mips->r[inst->src1] ^ mips->r[inst->src2];
+			IR_NEXT;
+		IR_CASE(Mov)
+			mips->r[inst->dest] = mips->r[inst->src1];
+			IR_NEXT;
+		IR_CASE(AddConst)
+			mips->r[inst->dest] = mips->r[inst->src1] + inst->constant;
+			IR_NEXT;
+		IR_CASE(OptAddConst)  // For this one, it's worth having a "unary" variant of the above that only needs to read one register param.
+			mips->r[inst->dest] += inst->constant;
+			IR_NEXT;
+		IR_CASE(SubConst)
+			mips->r[inst->dest] = mips->r[inst->src1] - inst->constant;
+			IR_NEXT;
+		IR_CASE(AndConst)
+			mips->r[inst->dest] = mips->r[inst->src1] & inst->constant;
+			IR_NEXT;
+		IR_CASE(OptAndConst)  // For this one, it's worth having a "unary" variant of the above that only needs to read one register param.
+			mips->r[inst->dest] &= inst->constant;
+			IR_NEXT;
+		IR_CASE(OrConst)
+			mips->r[inst->dest] = mips->r[inst->src1] | inst->constant;
+			IR_NEXT;
+		IR_CASE(OptOrConst)
+			mips->r[inst->dest] |= inst->constant;
+			IR_NEXT;
+		IR_CASE(XorConst)
+			mips->r[inst->dest] = mips->r[inst->src1] ^ inst->constant;
+			IR_NEXT;
+		IR_CASE(Neg)
+			mips->r[inst->dest] = (u32)(-(s32)mips->r[inst->src1]);
+			IR_NEXT;
+		IR_CASE(Not)
+			mips->r[inst->dest] = ~mips->r[inst->src1];
+			IR_NEXT;
+		IR_CASE(Ext8to32)
+			mips->r[inst->dest] = SignExtend8ToU32(mips->r[inst->src1]);
+			IR_NEXT;
+		IR_CASE(Ext16to32)
+			mips->r[inst->dest] = SignExtend16ToU32(mips->r[inst->src1]);
+			IR_NEXT;
+		IR_CASE(ReverseBits)
+			mips->r[inst->dest] = ReverseBits32(mips->r[inst->src1]);
+			IR_NEXT;
+
+		IR_CASE(Load8)
+			mips->r[inst->dest] = space.ReadUnchecked_U8(mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(Load8Ext)
+			mips->r[inst->dest] = SignExtend8ToU32(space.ReadUnchecked_U8(mips->r[inst->src1] + inst->constant));
+			IR_NEXT;
+		IR_CASE(Load16)
+			mips->r[inst->dest] = space.ReadUnchecked_U16(mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(Load16Ext)
+			mips->r[inst->dest] = SignExtend16ToU32(space.ReadUnchecked_U16(mips->r[inst->src1] + inst->constant));
+			IR_NEXT;
+		IR_CASE(Load32)
+			mips->r[inst->dest] = space.ReadUnchecked_U32(mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(Load32Left)
 		{
 			u32 addr = mips->r[inst->src1] + inst->constant;
 			u32 shift = (addr & 3) * 8;
-			u32 mem = Memory::ReadUnchecked_U32(addr & 0xfffffffc);
+			u32 mem = space.ReadUnchecked_U32(addr & 0xfffffffc);
 			u32 destMask = 0x00ffffff >> shift;
 			mips->r[inst->dest] = (mips->r[inst->dest] & destMask) | (mem << (24 - shift));
-			break;
+			IR_NEXT;
 		}
-		case IROp::Load32Right:
+		IR_CASE(Load32Right)
 		{
 			u32 addr = mips->r[inst->src1] + inst->constant;
 			u32 shift = (addr & 3) * 8;
-			u32 mem = Memory::ReadUnchecked_U32(addr & 0xfffffffc);
+			u32 mem = space.ReadUnchecked_U32(addr & 0xfffffffc);
 			u32 destMask = 0xffffff00 << (24 - shift);
 			mips->r[inst->dest] = (mips->r[inst->dest] & destMask) | (mem >> shift);
-			break;
+			IR_NEXT;
 		}
-		case IROp::Load32Linked:
+		IR_CASE(Load32Linked)
 			if (inst->dest != MIPS_REG_ZERO)
-				mips->r[inst->dest] = Memory::ReadUnchecked_U32(mips->r[inst->src1] + inst->constant);
+				mips->r[inst->dest] = space.ReadUnchecked_U32(mips->r[inst->src1] + inst->constant);
 			mips->llBit = 1;
-			break;
-		case IROp::LoadFloat:
-			mips->f[inst->dest] = Memory::ReadUnchecked_Float(mips->r[inst->src1] + inst->constant);
-			break;
+			IR_NEXT;
+		IR_CASE(LoadFloat)
+			mips->f[inst->dest] = space.ReadUnchecked_Float(mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
 
-		case IROp::Store8:
-			Memory::WriteUnchecked_U8(mips->r[inst->src3], mips->r[inst->src1] + inst->constant);
-			break;
-		case IROp::Store16:
-			Memory::WriteUnchecked_U16(mips->r[inst->src3], mips->r[inst->src1] + inst->constant);
-			break;
-		case IROp::Store32:
-			Memory::WriteUnchecked_U32(mips->r[inst->src3], mips->r[inst->src1] + inst->constant);
-			break;
-		case IROp::Store32Left:
+		IR_CASE(Store8)
+			space.WriteUnchecked_U8(mips->r[inst->src3], mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(Store16)
+			space.WriteUnchecked_U16(mips->r[inst->src3], mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(Store32)
+			space.WriteUnchecked_U32(mips->r[inst->src3], mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(Store32Left)
 		{
 			u32 addr = mips->r[inst->src1] + inst->constant;
 			u32 shift = (addr & 3) * 8;
-			u32 mem = Memory::ReadUnchecked_U32(addr & 0xfffffffc);
+			u32 mem = space.ReadUnchecked_U32(addr & 0xfffffffc);
 			u32 memMask = 0xffffff00 << shift;
 			u32 result = (mips->r[inst->src3] >> (24 - shift)) | (mem & memMask);
-			Memory::WriteUnchecked_U32(result, addr & 0xfffffffc);
-			break;
+			space.WriteUnchecked_U32(result, addr & 0xfffffffc);
+			IR_NEXT;
 		}
-		case IROp::Store32Right:
+		IR_CASE(Store32Right)
 		{
 			u32 addr = mips->r[inst->src1] + inst->constant;
 			u32 shift = (addr & 3) * 8;
-			u32 mem = Memory::ReadUnchecked_U32(addr & 0xfffffffc);
+			u32 mem = space.ReadUnchecked_U32(addr & 0xfffffffc);
 			u32 memMask = 0x00ffffff >> (24 - shift);
 			u32 result = (mips->r[inst->src3] << shift) | (mem & memMask);
-			Memory::WriteUnchecked_U32(result, addr & 0xfffffffc);
-			break;
+			space.WriteUnchecked_U32(result, addr & 0xfffffffc);
+			IR_NEXT;
 		}
-		case IROp::Store32Conditional:
+		IR_CASE(Store32Conditional)
 			if (mips->llBit) {
-				Memory::WriteUnchecked_U32(mips->r[inst->src3], mips->r[inst->src1] + inst->constant);
+				space.WriteUnchecked_U32(mips->r[inst->src3], mips->r[inst->src1] + inst->constant);
 				if (inst->dest != MIPS_REG_ZERO) {
 					mips->r[inst->dest] = 1;
 				}
 			} else if (inst->dest != MIPS_REG_ZERO) {
 				mips->r[inst->dest] = 0;
 			}
-			break;
-		case IROp::StoreFloat:
-			Memory::WriteUnchecked_Float(mips->f[inst->src3], mips->r[inst->src1] + inst->constant);
-			break;
+			IR_NEXT;
+		IR_CASE(StoreFloat)
+			space.WriteUnchecked_Float(mips->f[inst->src3], mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
 
-		case IROp::LoadVec4:
+		IR_CASE(LoadVec4)
 		{
 			u32 base = mips->r[inst->src1] + inst->constant;
 			// This compiles to a nice SSE load/store on x86, and hopefully similar on ARM.
-			memcpy(&mips->f[inst->dest], Memory::GetPointerUnchecked(base), 4 * 4);
-			break;
+			memcpy(&mips->f[inst->dest], space.GetPointerUnchecked(base), 4 * 4);
+			IR_NEXT;
 		}
-		case IROp::StoreVec4:
+		IR_CASE(StoreVec4)
 		{
 			u32 base = mips->r[inst->src1] + inst->constant;
-			memcpy((float *)Memory::GetPointerUnchecked(base), &mips->f[inst->dest], 4 * 4);
-			break;
+			memcpy((float *)space.GetPointerUnchecked(base), &mips->f[inst->dest], 4 * 4);
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Init:
+		IR_CASE(LoadKernel8)
+			mips->r[inst->dest] = RunKernelLoad<1, false>(mips, mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(LoadKernel8Ext)
+			mips->r[inst->dest] = RunKernelLoad<1, true>(mips, mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(LoadKernel16)
+			mips->r[inst->dest] = RunKernelLoad<2, false>(mips, mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(LoadKernel16Ext)
+			mips->r[inst->dest] = RunKernelLoad<2, true>(mips, mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(LoadKernel32)
+			mips->r[inst->dest] = RunKernelLoad<4, false>(mips, mips->r[inst->src1] + inst->constant);
+			IR_NEXT;
+		IR_CASE(StoreKernel8)
+			RunKernelStore<1>(mips, mips->r[inst->src1] + inst->constant, mips->r[inst->src3]);
+			IR_NEXT;
+		IR_CASE(StoreKernel16)
+			RunKernelStore<2>(mips, mips->r[inst->src1] + inst->constant, mips->r[inst->src3]);
+			IR_NEXT;
+		IR_CASE(StoreKernel32)
+			RunKernelStore<4>(mips, mips->r[inst->src1] + inst->constant, mips->r[inst->src3]);
+			IR_NEXT;
+
+		IR_CASE(Vec4Init)
 		{
 			memcpy(&mips->f[inst->dest], vec4InitValues[inst->src1], 4 * sizeof(float));
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Shuffle:
+		IR_CASE(Vec4Shuffle)
 		{
 			// Can't use the SSE shuffle here because it takes an immediate. pshufb with a table would work though,
 			// or a big switch - there are only 256 shuffles possible (4^4)
 			float temp[4];
 			for (u32 i = 0; i < 4; i++)
-				temp[i] = mips->f[(u32)inst->src1 + (u32)((inst->src2 >> (i * 2)) & 3)];
+				temp[i] = mips->f[(u32)inst->src1 + (u32)Vec4ShuffleLane(inst->src2, i)];
 			const u32 dest = inst->dest;
 			for (u32 i = 0; i < 4; i++)
 				mips->f[dest + i] = temp[i];
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Blend:
+		IR_CASE(Vec4Blend)
 		{
 			const u32 dest = inst->dest;
 			const u32 src1 = inst->src1;
@@ -278,10 +600,10 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 				temp[i] = ((constant >> i) & 1) ? mips->f[src2 + i] : mips->f[src1 + i];
 			for (u32 i = 0; i < 4; i++)
 				mips->f[dest + i] = temp[i];
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Mov:
+		IR_CASE(Vec4Mov)
 		{
 #if PPSSPP_ARCH(SSE2)
 			_mm_store_ps(&mips->f[inst->dest], _mm_load_ps(&mips->f[inst->src1]));
@@ -290,49 +612,51 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 #else
 			memcpy(&mips->f[inst->dest], &mips->f[inst->src1], 4 * sizeof(float));
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Add:
+		// ARMv7 NEON always flushes denormals and rounds to nearest, whatever FPSCR says, so float
+		// arithmetic stays on VFP there, as on the other hosts (cpu/vfpu/fcr31).
+		IR_CASE(Vec4Add)
 		{
 #if PPSSPP_ARCH(SSE2)
 			_mm_store_ps(&mips->f[inst->dest], _mm_add_ps(_mm_load_ps(&mips->f[inst->src1]), _mm_load_ps(&mips->f[inst->src2])));
-#elif PPSSPP_ARCH(ARM_NEON)
+#elif PPSSPP_ARCH(ARM_NEON) && PPSSPP_ARCH(ARM64)
 			vst1q_f32(&mips->f[inst->dest], vaddq_f32(vld1q_f32(&mips->f[inst->src1]), vld1q_f32(&mips->f[inst->src2])));
 #else
 			for (int i = 0; i < 4; i++)
 				mips->f[inst->dest + i] = mips->f[inst->src1 + i] + mips->f[inst->src2 + i];
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Sub:
+		IR_CASE(Vec4Sub)
 		{
 #if PPSSPP_ARCH(SSE2)
 			_mm_store_ps(&mips->f[inst->dest], _mm_sub_ps(_mm_load_ps(&mips->f[inst->src1]), _mm_load_ps(&mips->f[inst->src2])));
-#elif PPSSPP_ARCH(ARM_NEON)
+#elif PPSSPP_ARCH(ARM_NEON) && PPSSPP_ARCH(ARM64)
 			vst1q_f32(&mips->f[inst->dest], vsubq_f32(vld1q_f32(&mips->f[inst->src1]), vld1q_f32(&mips->f[inst->src2])));
 #else
 			for (int i = 0; i < 4; i++)
 				mips->f[inst->dest + i] = mips->f[inst->src1 + i] - mips->f[inst->src2 + i];
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Mul:
+		IR_CASE(Vec4Mul)
 		{
 #if PPSSPP_ARCH(SSE2)
 			_mm_store_ps(&mips->f[inst->dest], _mm_mul_ps(_mm_load_ps(&mips->f[inst->src1]), _mm_load_ps(&mips->f[inst->src2])));
-#elif PPSSPP_ARCH(ARM_NEON)
+#elif PPSSPP_ARCH(ARM_NEON) && PPSSPP_ARCH(ARM64)
 			vst1q_f32(&mips->f[inst->dest], vmulq_f32(vld1q_f32(&mips->f[inst->src1]), vld1q_f32(&mips->f[inst->src2])));
 #else
 			for (int i = 0; i < 4; i++)
 				mips->f[inst->dest + i] = mips->f[inst->src1 + i] * mips->f[inst->src2 + i];
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Div:
+		IR_CASE(Vec4Div)
 		{
 #if PPSSPP_ARCH(SSE2)
 			_mm_store_ps(&mips->f[inst->dest], _mm_div_ps(_mm_load_ps(&mips->f[inst->src1]), _mm_load_ps(&mips->f[inst->src2])));
@@ -342,24 +666,24 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			for (int i = 0; i < 4; i++)
 				mips->f[inst->dest + i] = mips->f[inst->src1 + i] / mips->f[inst->src2 + i];
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Scale:
+		IR_CASE(Vec4Scale)
 		{
 #if PPSSPP_ARCH(SSE2)
 			_mm_store_ps(&mips->f[inst->dest], _mm_mul_ps(_mm_load_ps(&mips->f[inst->src1]), _mm_set1_ps(mips->f[inst->src2])));
-#elif PPSSPP_ARCH(ARM_NEON)
+#elif PPSSPP_ARCH(ARM_NEON) && PPSSPP_ARCH(ARM64)
 			vst1q_f32(&mips->f[inst->dest], vmulq_lane_f32(vld1q_f32(&mips->f[inst->src1]), vdup_n_f32(mips->f[inst->src2]), 0));
 #else
 			const float factor = mips->f[inst->src2];
 			for (int i = 0; i < 4; i++)
 				mips->f[inst->dest + i] = mips->f[inst->src1 + i] * factor;
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Neg:
+		IR_CASE(Vec4Neg)
 		{
 #if PPSSPP_ARCH(SSE2)
 			_mm_store_ps(&mips->f[inst->dest], _mm_xor_ps(_mm_load_ps(&mips->f[inst->src1]), _mm_load_ps((const float *)signBits)));
@@ -369,10 +693,60 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			for (int i = 0; i < 4; i++)
 				mips->f[inst->dest + i] = -mips->f[inst->src1 + i];
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Abs:
+		IR_CASE(Vec4Min)
+		{
+			float result[4];
+			for (int i = 0; i < 4; i++) {
+				const u32 a = mips->fi[inst->src1 + i], b = mips->fi[inst->src2 + i];
+				result[i] = vfpu_minmax_key(a) < vfpu_minmax_key(b) ? mips->f[inst->src1 + i] : mips->f[inst->src2 + i];
+			}
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
+		IR_CASE(Vec4Max)
+		{
+			float result[4];
+			for (int i = 0; i < 4; i++) {
+				const u32 a = mips->fi[inst->src1 + i], b = mips->fi[inst->src2 + i];
+				result[i] = vfpu_minmax_key(a) > vfpu_minmax_key(b) ? mips->f[inst->src1 + i] : mips->f[inst->src2 + i];
+			}
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
+		IR_CASE(Vec4Slt)
+		{
+			float result[4];
+			for (int i = 0; i < 4; i++)
+				result[i] = mips->f[inst->src1 + i] < mips->f[inst->src2 + i] ? 1.0f : 0.0f;
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
+		IR_CASE(Vec4Sge)
+		{
+			float result[4];
+			for (int i = 0; i < 4; i++)
+				result[i] = mips->f[inst->src1 + i] >= mips->f[inst->src2 + i] ? 1.0f : 0.0f;
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
+		IR_CASE(Vec4CvtScaledSW)
+		{
+			float result[4];
+			const float scale = 1.0f / (1UL << (inst->src2 & 0x1F));
+			for (int i = 0; i < 4; i++)
+				result[i] = (float)mips->fs[inst->src1 + i] * scale;
+			memcpy(&mips->f[inst->dest], result, sizeof(result));
+			IR_NEXT;
+		}
+
+		IR_CASE(Vec4Abs)
 		{
 #if PPSSPP_ARCH(SSE2)
 			_mm_store_ps(&mips->f[inst->dest], _mm_and_ps(_mm_load_ps(&mips->f[inst->src1]), _mm_load_ps((const float *)noSignMask)));
@@ -382,10 +756,10 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			for (int i = 0; i < 4; i++)
 				mips->f[inst->dest + i] = fabsf(mips->f[inst->src1 + i]);
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec2Unpack16To31:
+		IR_CASE(Vec2Unpack16To31)
 		{
 			const u32 dest = inst->dest;
 			const u32 src1 = inst->src1;
@@ -393,10 +767,10 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			const u32 temp1 = (mips->fi[src1] & 0xFFFF0000) >> 1;
 			mips->fi[dest] = temp0;
 			mips->fi[dest + 1] = temp1;
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec2Unpack16To32:
+		IR_CASE(Vec2Unpack16To32)
 		{
 			const u32 dest = inst->dest;
 			const u32 src1 = inst->src1;
@@ -404,10 +778,10 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			const u32 temp1 = (mips->fi[src1] & 0xFFFF0000);
 			mips->fi[dest] = temp0;
 			mips->fi[dest + 1] = temp1;
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Unpack8To32:
+		IR_CASE(Vec4Unpack8To32)
 		{
 			// Used in Gran Turismo
 #if PPSSPP_ARCH(SSE2)
@@ -426,25 +800,26 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			mips->fi[inst->dest + 2] = (mips->fi[inst->src1] << 8) & 0xFF000000;
 			mips->fi[inst->dest + 3] = (mips->fi[inst->src1]) & 0xFF000000;
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec2Pack32To16:
+		IR_CASE(Vec2Pack32To16)
 		{
 			u32 val = mips->fi[inst->src1] >> 16;
 			mips->fi[inst->dest] = val | (mips->fi[(u32)inst->src1 + 1] & 0xFFFF0000);
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec2Pack31To16:
+		IR_CASE(Vec2Pack31To16)
 		{
-			// Used in Tekken 6
-			u32 val = (mips->fi[inst->src1] >> 15) & 0xFFFF;
-			mips->fi[inst->dest] = val | ((mips->fi[(u32)inst->src1 + 1] << 1) & 0xFFFF0000);
-			break;
+			// Used in Tekken 6. Negative lanes clamp to zero.
+			const u32 s0 = (s32)mips->fi[inst->src1] < 0 ? 0 : mips->fi[inst->src1];
+			const u32 s1 = (s32)mips->fi[(u32)inst->src1 + 1] < 0 ? 0 : mips->fi[(u32)inst->src1 + 1];
+			mips->fi[inst->dest] = ((s0 >> 15) & 0xFFFF) | ((s1 << 1) & 0xFFFF0000);
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Pack32To8:
+		IR_CASE(Vec4Pack32To8)
 		{
 #if PPSSPP_ARCH(SSE2)
 			__m128i src = _mm_loadu_si128((__m128i *)&mips->fi[inst->src1]);
@@ -477,74 +852,41 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			val |= (mips->fi[(u32)inst->src1 + 3]) & 0xFF000000;
 			mips->fi[inst->dest] = val;
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec4Pack31To8:
+		IR_CASE(Vec4Pack31To8)
 		{
 			// Used in Tekken 6, Gran Turismo
 
+			// Bits 30-23 of each lane, with negative lanes clamped to zero.
 #if PPSSPP_ARCH(SSE2)
 			__m128i src = _mm_loadu_si128((__m128i *) & mips->fi[inst->src1]);
-			// Shift each 32-bit lane right by 24 bits. Then left by 1. This matches the rather weird behavior.
-			src = _mm_slli_epi32(_mm_srli_epi32(src, 24), 1);
-			// Pack 32-bit lanes to 16-bit, then 16-bit to 8-bit
-			// This moves our target bytes to the bottom of the XMM register
+			// An arithmetic shift leaves 0-255 for positive lanes and negative values for negative
+			// ones, which the unsigned saturation in the second pack turns into 0.
+			src = _mm_srai_epi32(src, 23);
 			src = _mm_packs_epi32(src, src);
 			src = _mm_packus_epi16(src, src);
-			// Extract the lower 32 bits (which now contains our 4 bytes)
 			mips->fi[inst->dest] = (u32)_mm_cvtsi128_si32(src);
 #elif PPSSPP_ARCH(ARM_NEON)
-			uint32x4_t value = vld1q_u32(&mips->fi[inst->src1]);
-			value = vshlq_n_u32(value, 1);
-			uint16x4_t halved = vshrn_n_u32(value, 16);
+			int32x4_t value = vmaxq_s32(vld1q_s32((const int32_t *)&mips->fi[inst->src1]), vdupq_n_s32(0));
+			uint32x4_t shifted = vshlq_n_u32(vreinterpretq_u32_s32(value), 1);
+			uint16x4_t halved = vshrn_n_u32(shifted, 16);
 			uint8x8_t halvedAgain = vshrn_n_u16(vcombine_u16(halved, vdup_n_u16(0)), 8);
 			mips->fi[inst->dest] = vget_lane_u32(vreinterpret_u32_u8(halvedAgain), 0);
 #else
-			u32 val = (mips->fi[(u32)inst->src1] >> 23) & 0xFF;
-			val |= (mips->fi[(u32)inst->src1 + 1] >> 15) & 0xFF00;
-			val |= (mips->fi[(u32)inst->src1 + 2] >> 7) & 0xFF0000;
-			val |= (mips->fi[(u32)inst->src1 + 3] << 1) & 0xFF000000;
+			u32 val = 0;
+			for (int i = 0; i < 4; i++) {
+				const u32 lane = mips->fi[(u32)inst->src1 + i];
+				if ((s32)lane > 0)
+					val |= ((lane >> 23) & 0xFF) << (8 * i);
+			}
 			mips->fi[(u32)inst->dest] = val;
 #endif
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Vec2ClampToZero:
-		{
-			const u32 temp0 = mips->fi[(u32)inst->src1];
-			const u32 temp1 = mips->fi[(u32)inst->src1 + 1];
-			mips->fi[(u32)inst->dest] = (int)temp0 >= 0 ? temp0 : 0;
-			mips->fi[(u32)inst->dest + 1] = (int)temp1 >= 0 ? temp1 : 0;
-			break;
-		}
-
-		case IROp::Vec4ClampToZero:
-		{
-#if PPSSPP_ARCH(SSE2)
-			// Trickery: Expand the sign bit, and use andnot to zero negative values.
-			__m128i val = _mm_load_si128((const __m128i *)&mips->fi[inst->src1]);
-			__m128i mask = _mm_srai_epi32(val, 31);
-			val = _mm_andnot_si128(mask, val);
-			_mm_store_si128((__m128i *)&mips->fi[inst->dest], val);
-#elif PPSSPP_ARCH(ARM_NEON)
-			// On ARM we use a compare. On ARM64 we could also do a shift like on x86.
-			int32x4_t val = vld1q_s32((const int32_t *)&mips->fi[inst->src1]);
-			uint32x4_t mask = vcgtq_s32(val, vdupq_n_s32(-1));  // val > -1 → keeps >= 0
-			val = vandq_s32(val, vreinterpretq_s32_u32(mask));  // zero out negative lanes
-			vst1q_s32((int32_t *)&mips->fi[inst->dest], val);
-#else
-			const int src1 = inst->src1;
-			const int dest = inst->dest;
-			for (int i = 0; i < 4; i++) {
-				u32 val = mips->fi[src1 + i];
-				mips->fi[dest + i] = (int)val >= 0 ? val : 0;
-			}
-#endif
-			break;
-		}
-
-		case IROp::Vec4DuplicateUpperBitsAndShift1:  // For vuc2i, the weird one.
+		IR_CASE(Vec4DuplicateUpperBitsAndShift1)  // For vuc2i, the weird one.
 		{
 			const int src1 = inst->src1;
 			const int dest = inst->dest;
@@ -558,10 +900,10 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			for (int i = 0; i < 4; i++) {
 				mips->fi[dest + i] = temp[i];
 			}
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::FCmpVfpuBit:
+		IR_CASE(FCmpVfpuBit)
 		{
 			const int op = inst->dest & 0xF;
 			const int bit = inst->dest >> 4;
@@ -591,189 +933,207 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 			} else {
 				mips->vfpuCtrl[VFPU_CTRL_CC] &= ~(1 << bit);
 			}
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::FCmpVfpuAggregate:
+		IR_CASE(FCmpVfpuAggregate)
 		{
 			const u32 mask = inst->dest;
 			const u32 cc = mips->vfpuCtrl[VFPU_CTRL_CC];
 			int anyBit = (cc & mask) ? 0x10 : 0x00;
 			int allBit = (cc & mask) == mask ? 0x20 : 0x00;
 			mips->vfpuCtrl[VFPU_CTRL_CC] = (cc & ~0x30) | anyBit | allBit;
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::FCmovVfpuCC:
+		IR_CASE(FCmovVfpuCC)
 			if (((mips->vfpuCtrl[VFPU_CTRL_CC] >> (inst->src2 & 0xf)) & 1) == ((u32)inst->src2 >> 7)) {
 				mips->f[inst->dest] = mips->f[inst->src1];
 			}
-			break;
+			IR_NEXT;
 
-		case IROp::Vec4Dot:
-		{
-			// Not quickly implementable on all platforms, unfortunately.
-			// Though, this is still pretty fast compared to one split into multiple IR instructions.
-			// This might be good though: https://gist.github.com/rikusalminen/3040241
-			const float *a = &mips->f[(u32)inst->src1];
-			const float *b = &mips->f[(u32)inst->src2];
-			mips->f[inst->dest] = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
-			break;
-		}
+		IR_CASE(Vec4VfpuDot)
+			mips->f[inst->dest] = vfpu_dot(&mips->f[inst->src1], &mips->f[inst->src2]);
+			IR_NEXT;
 
-		case IROp::FSin:
+		IR_CASE(Vec4VfpuMultiDot)
+			vfpu_multi_dot(&mips->f[inst->dest], &mips->f[inst->src1], &mips->f[inst->src2], IRMULTIDOT_TERMS(inst->constant), (inst->constant & IRMULTIDOT_TRANSPOSED) != 0);
+			IR_NEXT;
+
+		IR_CASE(FSin)
 			mips->f[inst->dest] = vfpu_sin(mips->f[inst->src1]);
-			break;
-		case IROp::FCos:
+			IR_NEXT;
+		IR_CASE(FCos)
 			mips->f[inst->dest] = vfpu_cos(mips->f[inst->src1]);
-			break;
-		case IROp::FRSqrt:
-			mips->f[inst->dest] = 1.0f / sqrtf(mips->f[inst->src1]);
-			break;
-		case IROp::FRecip:
-			mips->f[inst->dest] = 1.0f / mips->f[inst->src1];
-			break;
-		case IROp::FAsin:
+			IR_NEXT;
+		IR_CASE(FRSqrt)
+			mips->f[inst->dest] = vfpu_rsqrt(mips->f[inst->src1]);
+			IR_NEXT;
+		IR_CASE(FRecip)
+			mips->f[inst->dest] = vfpu_rcp(mips->f[inst->src1]);
+			IR_NEXT;
+		IR_CASE(FAsin)
 			mips->f[inst->dest] = vfpu_asin(mips->f[inst->src1]);
-			break;
+			IR_NEXT;
+		IR_CASE(FVSqrt)
+			mips->f[inst->dest] = vfpu_sqrt(mips->f[inst->src1]);
+			IR_NEXT;
+		IR_CASE(FExp2)
+			mips->f[inst->dest] = vfpu_exp2(mips->f[inst->src1]);
+			IR_NEXT;
+		IR_CASE(FLog2)
+			mips->f[inst->dest] = vfpu_log2(mips->f[inst->src1]);
+			IR_NEXT;
+		IR_CASE(FSinCos)
+		{
+			float s, c;
+			vfpu_sincos(mips->f[inst->src1], s, c);
+			mips->f[inst->dest] = s;
+			mips->f[inst->dest + 1] = c;
+			IR_NEXT;
+		}
+		IR_CASE(FHalfToFloat)
+			mips->fi[inst->dest] = vfpu_h2f((u16)(inst->src2 ? mips->fi[inst->src1] >> 16 : mips->fi[inst->src1] & 0xFFFF));
+			IR_NEXT;
 
-		case IROp::ShlImm:
+		IR_CASE(ShlImm)
 			mips->r[inst->dest] = mips->r[inst->src1] << (int)inst->src2;
-			break;
-		case IROp::ShrImm:
+			IR_NEXT;
+		IR_CASE(ShrImm)
 			mips->r[inst->dest] = mips->r[inst->src1] >> (int)inst->src2;
-			break;
-		case IROp::SarImm:
+			IR_NEXT;
+		IR_CASE(SarImm)
 			mips->r[inst->dest] = (s32)mips->r[inst->src1] >> (int)inst->src2;
-			break;
-		case IROp::RorImm:
+			IR_NEXT;
+		IR_CASE(RorImm)
 		{
 			u32 x = mips->r[inst->src1];
 			int sa = inst->src2;
 			mips->r[inst->dest] = (x >> sa) | (x << (32 - sa));
 		}
-		break;
+		IR_NEXT;
 
-		case IROp::Shl:
+		IR_CASE(Shl)
 			mips->r[inst->dest] = mips->r[inst->src1] << (mips->r[inst->src2] & 31);
-			break;
-		case IROp::Shr:
+			IR_NEXT;
+		IR_CASE(Shr)
 			mips->r[inst->dest] = mips->r[inst->src1] >> (mips->r[inst->src2] & 31);
-			break;
-		case IROp::Sar:
+			IR_NEXT;
+		IR_CASE(Sar)
 			mips->r[inst->dest] = (s32)mips->r[inst->src1] >> (mips->r[inst->src2] & 31);
-			break;
-		case IROp::Ror:
+			IR_NEXT;
+		IR_CASE(Ror)
 		{
 			u32 x = mips->r[inst->src1];
 			int sa = mips->r[inst->src2] & 31;
 			mips->r[inst->dest] = (x >> sa) | (x << (32 - sa));
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Clz:
+		IR_CASE(Clz)
 		{
 			mips->r[inst->dest] = clz32(mips->r[inst->src1]);
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Slt:
+		IR_CASE(Slt)
 			mips->r[inst->dest] = (s32)mips->r[inst->src1] < (s32)mips->r[inst->src2];
-			break;
+			IR_NEXT;
 
-		case IROp::SltU:
+		IR_CASE(SltU)
 			mips->r[inst->dest] = mips->r[inst->src1] < mips->r[inst->src2];
-			break;
+			IR_NEXT;
 
-		case IROp::SltConst:
+		IR_CASE(SltConst)
 			mips->r[inst->dest] = (s32)mips->r[inst->src1] < (s32)inst->constant;
-			break;
+			IR_NEXT;
 
-		case IROp::SltUConst:
+		IR_CASE(SltUConst)
 			mips->r[inst->dest] = mips->r[inst->src1] < inst->constant;
-			break;
+			IR_NEXT;
 
-		case IROp::MovZ:
+		IR_CASE(MovZ)
 			if (mips->r[inst->src1] == 0)
 				mips->r[inst->dest] = mips->r[inst->src2];
-			break;
-		case IROp::MovNZ:
+			IR_NEXT;
+		IR_CASE(MovNZ)
 			if (mips->r[inst->src1] != 0)
 				mips->r[inst->dest] = mips->r[inst->src2];
-			break;
+			IR_NEXT;
 
-		case IROp::Max:
+		IR_CASE(Max)
 			mips->r[inst->dest] = (s32)mips->r[inst->src1] > (s32)mips->r[inst->src2] ? mips->r[inst->src1] : mips->r[inst->src2];
-			break;
-		case IROp::Min:
+			IR_NEXT;
+		IR_CASE(Min)
 			mips->r[inst->dest] = (s32)mips->r[inst->src1] < (s32)mips->r[inst->src2] ? mips->r[inst->src1] : mips->r[inst->src2];
-			break;
+			IR_NEXT;
 
-		case IROp::MtLo:
+		IR_CASE(MtLo)
 			mips->lo = mips->r[inst->src1];
-			break;
-		case IROp::MtHi:
+			IR_NEXT;
+		IR_CASE(MtHi)
 			mips->hi = mips->r[inst->src1];
-			break;
-		case IROp::MfLo:
+			IR_NEXT;
+		IR_CASE(MfLo)
 			mips->r[inst->dest] = mips->lo;
-			break;
-		case IROp::MfHi:
+			IR_NEXT;
+		IR_CASE(MfHi)
 			mips->r[inst->dest] = mips->hi;
-			break;
+			IR_NEXT;
 
-		case IROp::Mult:
+		IR_CASE(Mult)
 		{
 			s64 result = (s64)(s32)mips->r[inst->src1] * (s64)(s32)mips->r[inst->src2];
 			memcpy(&mips->lo, &result, 8);  // note: lo is followed by hi, so this is ok (little-endian).
-			break;
+			IR_NEXT;
 		}
-		case IROp::MultU:
+		IR_CASE(MultU)
 		{
 			u64 result = (u64)mips->r[inst->src1] * (u64)mips->r[inst->src2];
 			memcpy(&mips->lo, &result, 8);
-			break;
+			IR_NEXT;
 		}
-		case IROp::Madd:
+		IR_CASE(Madd)
 		{
 			s64 result;
 			memcpy(&result, &mips->lo, 8);
 			result += (s64)(s32)mips->r[inst->src1] * (s64)(s32)mips->r[inst->src2];
 			memcpy(&mips->lo, &result, 8);
-			break;
+			IR_NEXT;
 		}
-		case IROp::MaddU:
+		IR_CASE(MaddU)
 		{
 			s64 result;
 			memcpy(&result, &mips->lo, 8);
 			result += (u64)mips->r[inst->src1] * (u64)mips->r[inst->src2];
 			memcpy(&mips->lo, &result, 8);
-			break;
+			IR_NEXT;
 		}
-		case IROp::Msub:
+		IR_CASE(Msub)
 		{
 			s64 result;
 			memcpy(&result, &mips->lo, 8);
 			result -= (s64)(s32)mips->r[inst->src1] * (s64)(s32)mips->r[inst->src2];
 			memcpy(&mips->lo, &result, 8);
-			break;
+			IR_NEXT;
 		}
-		case IROp::MsubU:
+		IR_CASE(MsubU)
 		{
 			s64 result;
 			memcpy(&result, &mips->lo, 8);
 			result -= (u64)mips->r[inst->src1] * (u64)mips->r[inst->src2];
 			memcpy(&mips->lo, &result, 8);
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::Div:
+		IR_CASE(Div)
 		{
 			s32 numerator = (s32)mips->r[inst->src1];
 			s32 denominator = (s32)mips->r[inst->src2];
 			if (numerator == (s32)0x80000000 && denominator == -1) {
+				// The one overflow. Hardware leaves the remainder at zero (cpu/cpu_alu/cpu_div).
 				mips->lo = 0x80000000;
-				mips->hi = -1;
+				mips->hi = 0;
 			} else if (denominator != 0) {
 				mips->lo = (u32)(numerator / denominator);
 				mips->hi = (u32)(numerator % denominator);
@@ -781,9 +1141,9 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 				mips->lo = numerator < 0 ? 1 : -1;
 				mips->hi = numerator;
 			}
-			break;
+			IR_NEXT;
 		}
-		case IROp::DivU:
+		IR_CASE(DivU)
 		{
 			u32 numerator = mips->r[inst->src1];
 			u32 denominator = mips->r[inst->src2];
@@ -794,29 +1154,29 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 				mips->lo = numerator <= 0xFFFF ? 0xFFFF : -1;
 				mips->hi = numerator;
 			}
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::BSwap16:
+		IR_CASE(BSwap16)
 		{
 			u32 x = mips->r[inst->src1];
 			// Don't think we can beat this with intrinsics.
 			mips->r[inst->dest] = ((x & 0xFF00FF00) >> 8) | ((x & 0x00FF00FF) << 8);
-			break;
+			IR_NEXT;
 		}
-		case IROp::BSwap32:
+		IR_CASE(BSwap32)
 		{
 			mips->r[inst->dest] = swap32(mips->r[inst->src1]);
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::FAdd:
+		IR_CASE(FAdd)
 			mips->f[inst->dest] = mips->f[inst->src1] + mips->f[inst->src2];
-			break;
-		case IROp::FSub:
+			IR_NEXT;
+		IR_CASE(FSub)
 			mips->f[inst->dest] = mips->f[inst->src1] - mips->f[inst->src2];
-			break;
-		case IROp::FMul:
+			IR_NEXT;
+		IR_CASE(FMul)
 #if 1
 		{
 			float a = mips->f[inst->src1];
@@ -827,7 +1187,7 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 				mips->f[inst->dest] = a * b;
 			}
 		}
-			break;
+			IR_NEXT;
 #else
 			// Not sure if faster since it needs to load the operands twice? But the code is simpler.
 			{
@@ -839,145 +1199,101 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 				} else {
 					mips->f[inst->dest] = mips->f[inst->src1] * mips->f[inst->src2];
 				}
-				break;
+				IR_NEXT;
 			}
 #endif
-		case IROp::FDiv:
+		IR_CASE(FDiv)
 			mips->f[inst->dest] = mips->f[inst->src1] / mips->f[inst->src2];
-			break;
-		case IROp::FMin:
-			if (my_isnan(mips->f[inst->src1]) || my_isnan(mips->f[inst->src2])) {
-				// See interpreter for this logic: this is for vmin, we're comparing mantissa+exp.
-				if (mips->fs[inst->src1] < 0 && mips->fs[inst->src2] < 0) {
-					mips->fs[inst->dest] = std::max(mips->fs[inst->src1], mips->fs[inst->src2]);
-				} else {
-					mips->fs[inst->dest] = std::min(mips->fs[inst->src1], mips->fs[inst->src2]);
-				}
-			} else {
-				mips->f[inst->dest] = std::min(mips->f[inst->src1], mips->f[inst->src2]);
-			}
-			break;
-		case IROp::FMax:
-			if (my_isnan(mips->f[inst->src1]) || my_isnan(mips->f[inst->src2])) {
-				// See interpreter for this logic: this is for vmax, we're comparing mantissa+exp.
-				if (mips->fs[inst->src1] < 0 && mips->fs[inst->src2] < 0) {
-					mips->fs[inst->dest] = std::min(mips->fs[inst->src1], mips->fs[inst->src2]);
-				} else {
-					mips->fs[inst->dest] = std::max(mips->fs[inst->src1], mips->fs[inst->src2]);
-				}
-			} else {
-				mips->f[inst->dest] = std::max(mips->f[inst->src1], mips->f[inst->src2]);
-			}
-			break;
+			IR_NEXT;
+		// These are vmin and vmax, see vfpu_minmax_key.
+		IR_CASE(FMin)
+		{
+			u32 a = mips->fi[inst->src1], b = mips->fi[inst->src2];
+			mips->fi[inst->dest] = vfpu_minmax_key(a) < vfpu_minmax_key(b) ? a : b;
+			IR_NEXT;
+		}
+		IR_CASE(FMax)
+		{
+			u32 a = mips->fi[inst->src1], b = mips->fi[inst->src2];
+			mips->fi[inst->dest] = vfpu_minmax_key(a) > vfpu_minmax_key(b) ? a : b;
+			IR_NEXT;
+		}
 
-		case IROp::FMov:
+		IR_CASE(FMov)
 			mips->f[inst->dest] = mips->f[inst->src1];
-			break;
-		case IROp::FAbs:
+			IR_NEXT;
+		IR_CASE(FAbs)
 			mips->f[inst->dest] = fabsf(mips->f[inst->src1]);
-			break;
-		case IROp::FSqrt:
-			mips->f[inst->dest] = sqrtf(mips->f[inst->src1]);
-			break;
-		case IROp::FNeg:
+			IR_NEXT;
+		IR_CASE(FSqrt)
+		{
+			float src = mips->f[inst->src1];
+			mips->f[inst->dest] = sqrtf(src);
+			// A negative input gives a positive NaN, not the host's (cpu/fpu/roundmode).
+			if (src < 0.0f) {
+				mips->fi[inst->dest] = 0x7FC00000;
+			}
+			IR_NEXT;
+		}
+		IR_CASE(FNeg)
 			mips->f[inst->dest] = -mips->f[inst->src1];
-			break;
-		case IROp::FSat0_1:
+			IR_NEXT;
+		IR_CASE(FSat0_1)
 			// We have to do this carefully to handle NAN and -0.0f.
 			mips->f[inst->dest] = vfpu_clamp(mips->f[inst->src1], 0.0f, 1.0f);
-			break;
-		case IROp::FSatMinus1_1:
+			IR_NEXT;
+		IR_CASE(FSatMinus1_1)
 			mips->f[inst->dest] = vfpu_clamp(mips->f[inst->src1], -1.0f, 1.0f);
-			break;
+			IR_NEXT;
 
-		case IROp::FSign:
+		IR_CASE(FSign)
 		{
-			// Bitwise trickery
+			// Bitwise trickery. Denormals give zero, as on the hardware.
 			u32 val;
 			memcpy(&val, &mips->f[inst->src1], sizeof(u32));
-			if (val == 0 || val == 0x80000000)
+			if ((val & 0x7F800000) == 0)
 				mips->f[inst->dest] = 0.0f;
 			else if ((val >> 31) == 0)
 				mips->f[inst->dest] = 1.0f;
 			else
 				mips->f[inst->dest] = -1.0f;
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::FpCondFromReg:
-			mips->fpcond = mips->r[inst->dest];
-			break;
-		case IROp::FpCondToReg:
+		IR_CASE(FpCondFromReg)
+			// Note: the register is in src1, see the "_G" meta - the native backends read it there.
+			mips->fpcond = mips->r[inst->src1];
+			IR_NEXT;
+		IR_CASE(FpCondToReg)
 			mips->r[inst->dest] = mips->fpcond;
-			break;
-		case IROp::FpCtrlFromReg:
+			IR_NEXT;
+		IR_CASE(FpCtrlFromReg)
 			mips->fcr31 = mips->r[inst->src1] & 0x0181FFFF;
 			// Extract the new fpcond value.
 			// TODO: Is it really helping us to keep it separate?
 			mips->fpcond = (mips->fcr31 >> 23) & 1;
-			break;
-		case IROp::FpCtrlToReg:
+			IR_NEXT;
+		IR_CASE(FpCtrlToReg)
 			// Update the fpcond bit first.
 			mips->fcr31 = (mips->fcr31 & ~(1 << 23)) | ((mips->fpcond & 1) << 23);
 			mips->r[inst->dest] = mips->fcr31;
-			break;
-		case IROp::VfpuCtrlToReg:
+			IR_NEXT;
+		IR_CASE(VfpuCtrlToReg)
 			mips->r[inst->dest] = mips->vfpuCtrl[inst->src1];
-			break;
-		case IROp::FRound:
-		{
-			float value = mips->f[inst->src1];
-			if (my_isnanorinf(value)) {
-				mips->fi[inst->dest] = my_isinf(value) && value < 0.0f ? -2147483648LL : 2147483647LL;
-				break;
-			} else {
-				mips->fs[inst->dest] = (int)round_ieee_754(value);
-			}
-			break;
-		}
-		case IROp::FTrunc:
-		{
-			float value = mips->f[inst->src1];
-			if (my_isnanorinf(value)) {
-				mips->fi[inst->dest] = my_isinf(value) && value < 0.0f ? -2147483648LL : 2147483647LL;
-				break;
-			} else {
-				if (value >= 0.0f) {
-					mips->fs[inst->dest] = (int)floorf(value);
-					// Overflow, but it was positive.
-					if (mips->fs[inst->dest] == -2147483648LL) {
-						mips->fs[inst->dest] = 2147483647LL;
-					}
-				} else {
-					// Overflow happens to be the right value anyway.
-					mips->fs[inst->dest] = (int)ceilf(value);
-				}
-				break;
-			}
-		}
-		case IROp::FCeil:
-		{
-			float value = mips->f[inst->src1];
-			if (my_isnanorinf(value)) {
-				mips->fi[inst->dest] = my_isinf(value) && value < 0.0f ? -2147483648LL : 2147483647LL;
-				break;
-			} else {
-				mips->fs[inst->dest] = (int)ceilf(value);
-			}
-			break;
-		}
-		case IROp::FFloor:
-		{
-			float value = mips->f[inst->src1];
-			if (my_isnanorinf(value)) {
-				mips->fi[inst->dest] = my_isinf(value) && value < 0.0f ? -2147483648LL : 2147483647LL;
-				break;
-			} else {
-				mips->fs[inst->dest] = (int)floorf(value);
-			}
-			break;
-		}
-		case IROp::FCmp:
+			IR_NEXT;
+		IR_CASE(FRound)
+			mips->fs[inst->dest] = SaturatedFloatToInt(round_ieee_754(FlushForConversion(mips, mips->f[inst->src1])));
+			IR_NEXT;
+		IR_CASE(FTrunc)
+			mips->fs[inst->dest] = SaturatedFloatToInt(truncf(FlushForConversion(mips, mips->f[inst->src1])));
+			IR_NEXT;
+		IR_CASE(FCeil)
+			mips->fs[inst->dest] = SaturatedFloatToInt(ceilf(FlushForConversion(mips, mips->f[inst->src1])));
+			IR_NEXT;
+		IR_CASE(FFloor)
+			mips->fs[inst->dest] = SaturatedFloatToInt(floorf(FlushForConversion(mips, mips->f[inst->src1])));
+			IR_NEXT;
+		IR_CASE(FCmp)
 			switch (inst->dest) {
 			case IRFpCompareMode::False:
 				mips->fpcond = 0;
@@ -1008,37 +1324,33 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 				mips->fpcond = !(mips->f[inst->src1] >= mips->f[inst->src2]);
 				break;
 			}
-			break;
+			IR_NEXT;
 
-		case IROp::FCvtSW:
+		IR_CASE(FCvtSW)
 			mips->f[inst->dest] = (float)mips->fs[inst->src1];
-			break;
-		case IROp::FCvtWS:
+			IR_NEXT;
+		IR_CASE(FCvtWS)
 		{
-			float src = mips->f[inst->src1];
-			if (my_isnanorinf(src)) {
-				mips->fs[inst->dest] = my_isinf(src) && src < 0.0f ? -2147483648LL : 2147483647LL;
-				break;
-			}
+			float src = FlushForConversion(mips, mips->f[inst->src1]);
 			// TODO: Inline assembly to use here would be better.
 			switch (IRRoundMode(mips->fcr31 & 3)) {
-			case IRRoundMode::RINT_0: mips->fs[inst->dest] = (int)round_ieee_754(src); break;
-			case IRRoundMode::CAST_1: mips->fs[inst->dest] = (int)src; break;
-			case IRRoundMode::CEIL_2: mips->fs[inst->dest] = (int)ceilf(src); break;
-			case IRRoundMode::FLOOR_3: mips->fs[inst->dest] = (int)floorf(src); break;
+			case IRRoundMode::RINT_0: mips->fs[inst->dest] = SaturatedFloatToInt(round_ieee_754(src)); break;
+			case IRRoundMode::CAST_1: mips->fs[inst->dest] = SaturatedFloatToInt(truncf(src)); break;
+			case IRRoundMode::CEIL_2: mips->fs[inst->dest] = SaturatedFloatToInt(ceilf(src)); break;
+			case IRRoundMode::FLOOR_3: mips->fs[inst->dest] = SaturatedFloatToInt(floorf(src)); break;
 			}
-			break; //cvt.w.s
+			IR_NEXT; //cvt.w.s
 		}
-		case IROp::FCvtScaledSW:
+		IR_CASE(FCvtScaledSW)
 			mips->f[inst->dest] = (float)mips->fs[inst->src1] * (1.0f / (1UL << (inst->src2 & 0x1F)));
-			break;
-		case IROp::FCvtScaledWS:
+			IR_NEXT;
+		IR_CASE(FCvtScaledWS)
 		{
 			float src = mips->f[inst->src1];
 			if (my_isnan(src)) {
 				// TODO: True for negatives too?
 				mips->fs[inst->dest] = 2147483647L;
-				break;
+				IR_NEXT;
 			}
 
 			float mult = (float)(1UL << (inst->src2 & 0x1F));
@@ -1056,198 +1368,233 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst) {
 				case IRRoundMode::FLOOR_3: mips->fs[inst->dest] = (int)floor(sv); break;
 				}
 			}
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::FMovFromGPR:
+		IR_CASE(FMovFromGPR)
 			memcpy(&mips->f[inst->dest], &mips->r[inst->src1], 4);
-			break;
-		case IROp::OptFCvtSWFromGPR:
+			IR_NEXT;
+		IR_CASE(OptFCvtSWFromGPR)
 			mips->f[inst->dest] = (float)(int)mips->r[inst->src1];
-			break;
-		case IROp::FMovToGPR:
+			IR_NEXT;
+		IR_CASE(FMovToGPR)
 			memcpy(&mips->r[inst->dest], &mips->f[inst->src1], 4);
-			break;
-		case IROp::OptFMovToGPRShr8:
+			IR_NEXT;
+		IR_CASE(OptFMovToGPRShr8)
 		{
 			u32 temp;
 			memcpy(&temp, &mips->f[inst->src1], 4);
 			mips->r[inst->dest] = temp >> 8;
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::ExitToConst:
-			return inst->constant;
+		IR_CASE(ExitToConst)
+			IR_EXIT(inst->constant);
 
-		case IROp::ExitToReg:
-			return mips->r[inst->src1];
+		IR_CASE(ExitToReg)
+			IR_EXIT(mips->r[inst->src1]);
 
-		case IROp::ExitToConstIfEq:
+		// The next instruction is the ExitToConst to take otherwise, never run itself.
+		IR_CASE(OptExitToConstIfEqElse)
+			IR_EXIT(mips->r[inst->src1] == mips->r[inst->src2] ? inst->constant : inst[1].constant);
+		IR_CASE(OptExitToConstIfNeqElse)
+			IR_EXIT(mips->r[inst->src1] != mips->r[inst->src2] ? inst->constant : inst[1].constant);
+		IR_CASE(OptExitToConstIfGtZElse)
+			IR_EXIT((s32)mips->r[inst->src1] > 0 ? inst->constant : inst[1].constant);
+		IR_CASE(OptExitToConstIfGeZElse)
+			IR_EXIT((s32)mips->r[inst->src1] >= 0 ? inst->constant : inst[1].constant);
+		IR_CASE(OptExitToConstIfLtZElse)
+			IR_EXIT((s32)mips->r[inst->src1] < 0 ? inst->constant : inst[1].constant);
+		IR_CASE(OptExitToConstIfLeZElse)
+			IR_EXIT((s32)mips->r[inst->src1] <= 0 ? inst->constant : inst[1].constant);
+		IR_CASE(ExitToConstIfEq)
 			if (mips->r[inst->src1] == mips->r[inst->src2])
-				return inst->constant;
-			break;
-		case IROp::ExitToConstIfNeq:
+				IR_EXIT(inst->constant);
+			IR_NEXT;
+		IR_CASE(ExitToConstIfNeq)
 			if (mips->r[inst->src1] != mips->r[inst->src2])
-				return inst->constant;
-			break;
-		case IROp::ExitToConstIfGtZ:
+				IR_EXIT(inst->constant);
+			IR_NEXT;
+		IR_CASE(ExitToConstIfGtZ)
 			if ((s32)mips->r[inst->src1] > 0)
-				return inst->constant;
-			break;
-		case IROp::ExitToConstIfGeZ:
+				IR_EXIT(inst->constant);
+			IR_NEXT;
+		IR_CASE(ExitToConstIfGeZ)
 			if ((s32)mips->r[inst->src1] >= 0)
-				return inst->constant;
-			break;
-		case IROp::ExitToConstIfLtZ:
+				IR_EXIT(inst->constant);
+			IR_NEXT;
+		IR_CASE(ExitToConstIfLtZ)
 			if ((s32)mips->r[inst->src1] < 0)
-				return inst->constant;
-			break;
-		case IROp::ExitToConstIfLeZ:
+				IR_EXIT(inst->constant);
+			IR_NEXT;
+		IR_CASE(ExitToConstIfLeZ)
 			if ((s32)mips->r[inst->src1] <= 0)
-				return inst->constant;
-			break;
+				IR_EXIT(inst->constant);
+			IR_NEXT;
 
-		case IROp::Downcount:
+		IR_CASE(Downcount)
 			mips->downcount -= (int)inst->constant;
-			break;
+			IR_NEXT;
 
-		case IROp::SetPC:
+		IR_CASE(SetPC)
 			mips->pc = mips->r[inst->src1];
-			break;
+			IR_NEXT;
 
-		case IROp::SetPCConst:
+		IR_CASE(SetPCConst)
 			mips->pc = inst->constant;
-			break;
+			IR_NEXT;
 
-		case IROp::Syscall:
+		IR_CASE(Syscall)
 			// IROp::SetPC was (hopefully) executed before.
 		{
 			// If we get here, the syscall is valid.
 			MIPSOpcode op(inst->constant);
-			CallSyscall(op);
+			// HLE runs in the host's normal mode, see ApplyHostRoundingMode.
+			RestoreHostRoundingMode();
+			{
+				Memory::IRInterpreterFaultScope outside(false);
+				CallSyscall(mips, op);
+			}
+			ApplyHostRoundingMode(mips);
 			if (coreState != CORE_RUNNING_CPU) {
 				CoreTiming::ForceCheck(mips);
 			}
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::SyscallUnresolved:
+		IR_CASE(SyscallUnresolved)
 		{
 			// If we get here, the syscall is invalid.
 			u32 pc = inst->constant;
-			CallSyscallUnresolvedAtPC(pc);
+			RestoreHostRoundingMode();
+			{
+				Memory::IRInterpreterFaultScope outside(false);
+				CallSyscallUnresolvedAtPC(mips, pc);
+			}
+			ApplyHostRoundingMode(mips);
 			if (coreState != CORE_RUNNING_CPU) {
 				// hm, what's this for?
 				CoreTiming::ForceCheck(mips);
 			}
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::ExitToPC:
-			return mips->pc;
+		IR_CASE(ExitToPC)
+			IR_EXIT(mips->pc);
 
-		case IROp::Interpret:  // SLOW fallback. Can be made faster. Ideally should be removed but may be useful for debugging.
+		IR_CASE(Interpret)  // SLOW fallback. Can be made faster. Ideally should be removed but may be useful for debugging.
 		{
 			MIPSOpcode op(inst->constant);
-			MIPSInterpret(mips, op);
-			break;
+			{
+				Memory::IRInterpreterFaultScope outside(false);
+				MIPSInterpret(mips, op);
+			}
+			IR_NEXT;
 		}
 
-		case IROp::CallReplacement:
+		IR_CASE(CallReplacement)
 		{
 			int funcIndex = inst->constant;
 			const ReplacementTableEntry *f = GetReplacementFunc(funcIndex);
-			int cycles = f->replaceFunc();
+			RestoreHostRoundingMode();
+			int cycles;
+			{
+				Memory::IRInterpreterFaultScope outside(false);
+				cycles = f->replaceFunc(mips);
+			}
+			ApplyHostRoundingMode(mips);
 			mips->r[inst->dest] = cycles < 0 ? -1 : 0;
 			mips->downcount -= cycles < 0 ? -cycles : cycles;
-			break;
+			IR_NEXT;
 		}
 
-		case IROp::SetCtrlVFPU:
+		IR_CASE(SetCtrlVFPU)
 			mips->vfpuCtrl[inst->dest] = inst->constant;
-			break;
+			IR_NEXT;
 
-		case IROp::SetCtrlVFPUReg:
+		IR_CASE(SetCtrlVFPUReg)
 			mips->vfpuCtrl[inst->dest] = mips->r[inst->src1];
-			break;
+			IR_NEXT;
 
-		case IROp::SetCtrlVFPUFReg:
+		IR_CASE(SetCtrlVFPUFReg)
 			memcpy(&mips->vfpuCtrl[inst->dest], &mips->f[inst->src1], 4);
-			break;
+			IR_NEXT;
 
-		case IROp::ApplyRoundingMode:
+		IR_CASE(ApplyRoundingMode)
 			ApplyHostRoundingMode(mips);
-			break;
-		case IROp::RestoreRoundingMode:
-			RestoreHostRoundingMode();
-			break;
-		case IROp::UpdateRoundingMode:
+			IR_NEXT;
+		IR_CASE(RestoreRoundingMode)
+			// Forced: a native backend may get here through its generic fallback, after its own
+			// asm applied the mode.
+			RestoreHostRoundingMode(true);
+			IR_NEXT;
+		IR_CASE(UpdateRoundingMode)
 			// TODO: Implement
-			break;
+			IR_NEXT;
 
-		case IROp::Break:
+		IR_CASE(Break)
 			Core_BreakException(mips->pc);
 			return mips->pc + 4;
 
-		case IROp::Breakpoint:
+		IR_CASE(Breakpoint)
 			if (IRRunBreakpoint(inst->constant)) {
 				CoreTiming::ForceCheck(mips);
 				return mips->pc;
 			}
-			break;
+			IR_NEXT;
 
-		case IROp::MemoryCheck:
+		IR_CASE(MemoryCheck)
 			if (IRRunMemCheck(mips->pc + inst->dest, mips->r[inst->src1] + inst->constant)) {
 				CoreTiming::ForceCheck(mips);
 				return mips->pc;
 			}
-			break;
+			IR_NEXT;
 
-		case IROp::ValidateAddress8:
+		IR_CASE(ValidateAddress8)
 			if (RunValidateAddress<1>(mips->pc, mips->r[inst->src1] + inst->constant, inst->src2)) {
 				CoreTiming::ForceCheck(mips);
 				return mips->pc;
 			}
-			break;
-		case IROp::ValidateAddress16:
+			IR_NEXT;
+		IR_CASE(ValidateAddress16)
 			if (RunValidateAddress<2>(mips->pc, mips->r[inst->src1] + inst->constant, inst->src2)) {
 				CoreTiming::ForceCheck(mips);
 				return mips->pc;
 			}
-			break;
-		case IROp::ValidateAddress32:
+			IR_NEXT;
+		IR_CASE(ValidateAddress32)
 			if (RunValidateAddress<4>(mips->pc, mips->r[inst->src1] + inst->constant, inst->src2)) {
 				CoreTiming::ForceCheck(mips);
 				return mips->pc;
 			}
-			break;
-		case IROp::ValidateAddress128:
+			IR_NEXT;
+		IR_CASE(ValidateAddress128)
 			if (RunValidateAddress<16>(mips->pc, mips->r[inst->src1] + inst->constant, inst->src2)) {
 				CoreTiming::ForceCheck(mips);
 				return mips->pc;
 			}
-			break;
-		case IROp::LogIRBlock:
+			IR_NEXT;
+		IR_CASE(LogIRBlock)
 			if (mipsTracer.tracing_enabled) {
 				mipsTracer.executed_blocks.push_back(inst->constant);
 			}
-			break;
+			IR_NEXT;
 
-		case IROp::Nop:  // Unused, add a break if we start using it to avoid UNREACHABLE.
-		case IROp::Bad:
+		IR_CASE(Nop)  // Unused, add a break if we start using it to avoid UNREACHABLE.
+		IR_CASE(Bad)
 		default:
 			// Unimplemented IR op. Bad. We define it as unreachable so the compiler can optimize better (remove the range check).
 			UNREACHABLE();
-			break;
+			IR_NEXT;
 		}
-
-#ifdef _DEBUG
-		if (mips->r[0] != 0)
-			Crash();
-#endif
-		inst++;
 	}
 
 	// We should not reach here anymore.
 	return 0;
 }
+
+#undef IR_NEXT
+#undef IR_DISPATCH
+#undef IR_EXIT
+#undef IR_CASE
+#undef IR_CHECK_ZERO_REG

@@ -29,6 +29,9 @@
 #include "Common/Data/Collections/CyclicBuffer.h"
 
 
+// Stored in the LogIRBlock instruction's constant field for a block the tracer never recorded.
+constexpr u32 INVALID_TRACE_INDEX = 0xFFFFFFFF;
+
 struct TraceBlockInfo {
 	u32 virt_address;
 	u32 storage_index;
@@ -87,7 +90,8 @@ struct MIPSTracer {
 	void start_tracing();
 	void stop_tracing();
 
-	void prepare_block(const MIPSComp::IRBlock* block, MIPSComp::IRBlockCache& blocks);
+	// Records a block about to be compiled. Returns its trace index, for its LogIRBlock.
+	u32 prepare_block(u32 virt_addr, u32 size);
 	void set_logging_path(std::string path) {
 		logging_path = Path(path);
 	}

@@ -22,6 +22,7 @@
 #include "GPU/GPUCommon.h"
 #include "GPU/Software/SoftGpu.h"
 #include "GPU/Math3D.h"
+#include "GPU/Software/GEMath.h"
 
 using namespace Math3D;
 
@@ -88,9 +89,9 @@ struct ClipVertexData {
 		clippos = ::Lerp(a.clippos, b.clippos, t);
 		// Ignore screenpos because Lerp() is only used pre-calculation of screenpos.
 		v.texturecoords = ::Lerp(a.v.texturecoords, b.v.texturecoords, t);
-		v.fogdepth = ::Lerp(a.v.fogdepth, b.v.fogdepth, t);
-
-		u16 t_int = (u16)(t * 256);
+		// Colors and fog (already 8-bit per vertex) take t rounded to 1/256 (gpu/probe exp136).
+		const int t_int = (int)(t * 256.0f + 0.5f);
+		v.fogdepth = (float)(((int)(a.v.fogdepth * 256.0f) * (256 - t_int) + (int)(b.v.fogdepth * 256.0f) * t_int) >> 8) * (1.0f / 256.0f);
 		v.color0 = LerpInt<Vec4<int>, 256>(Vec4<int>::FromRGBA(a.v.color0), Vec4<int>::FromRGBA(b.v.color0), t_int).ToRGBA();
 		v.color1 = LerpInt<Vec3<int>, 256>(Vec3<int>::FromRGB(a.v.color1), Vec3<int>::FromRGB(b.v.color1), t_int).ToRGB();
 	}
@@ -105,18 +106,22 @@ struct ClipVertexData {
 
 class VertexReader;
 
+
 class SoftwareDrawEngine;
 class SoftwareVertexReader;
 class StringWriter;
 
 class TransformUnit {
 public:
+	TransformUnit(const TransformUnit &) = delete;
+	TransformUnit &operator=(const TransformUnit &) = delete;
 	TransformUnit();
 	~TransformUnit();
 
-	static WorldCoords ModelToWorldNormal(const ModelCoords& coords);
-	static WorldCoords ModelToWorld(const ModelCoords& coords);
 	static ScreenCoords ClipToScreen(const ClipCoords &coords, bool *outsideRangeFlag);
+	// Where an edge from an inside vertex crosses the near plane, as the GE computes it.
+	static float NearPlaneT(const ClipCoords &in, const ClipCoords &out);
+	static ClipCoords NearPlanePoint(const ClipCoords &in, const ClipCoords &out, float t);
 	static inline DrawingCoords ScreenToDrawing(int x, int y) {
 		DrawingCoords ret;
 		// When offset > coord, this is negative and force-scissors.
@@ -129,23 +134,63 @@ public:
 	}
 	static ScreenCoords DrawingToScreen(const DrawingCoords &coords, u16 z);
 
-	void SubmitPrimitive(const void* vertices, const void* indices, GEPrimitiveType prim_type, int vertex_count, u32 vertex_type, int *bytesRead, SoftwareDrawEngine *drawEngine);
+	// runCount: the vertices of this draw and the ones right after it that continue it (SoftGPU::RunVertexCount),
+	// for them to be transformed together, or 0.
+	void SubmitPrimitive(const void* vertices, const void* indices, GEPrimitiveType prim_type, int vertex_count, u32 vertex_type, int *bytesRead, SoftwareDrawEngine *drawEngine, int runCount = 0);
+	// Whether a draw from these vertices continues the run transformed together.
+	bool InRun(const void *vertices, u32 vertexType) const {
+		return runRemaining_ > 0 && vertices == runNext_ && vertexType == runType_;
+	}
 	void SubmitImmVertex(const ClipVertexData &vert, SoftwareDrawEngine *drawEngine);
 
 	void Flush(GPUCommon *common, const char *reason);
 	void FlushIfOverlap(GPUCommon *common, const char *reason, bool modifying, uint32_t addr, uint32_t stride, uint32_t w, uint32_t h);
 	void NotifyClutUpdate(const void *src);
+	void NotifyTexFlush();
 
 	void GetStats(StringWriter &w);
 
 	void SetDirty(SoftDirty flags);
 	SoftDirty GetDirty();
 
+	struct RunJob;
+
+	// ReadVertex's position stage, done ahead for several vertices at once.
+	struct PreparedPosition {
+		ClipCoords clippos;
+		ScreenCoords screenpos;
+		float fogdepth;
+		bool outside;
+		bool valid;
+	};
+
 private:
-	ClipVertexData ReadVertex(const VertexReader &vreader, const TransformState &state);
-	void SendTriangle(CullType cullType, const ClipVertexData *verts, int provoking = 2);
+	// What a vertex format without UVs or a normal reads: the last ones read before it.
+	struct VertexCarry {
+		Vec3Packedf tc{};
+		float normal[4]{};
+	};
+	void ReadVertex(const VertexReader &vreader, const TransformState &state, VertexCarry &carry, ClipVertexData &vertex, const PreparedPosition *prepared = nullptr);
+	bool StartRun(const void *vertices, u32 vertexType, int runCount, VertexDecoder &vdecoder, TransformState &state);
+	void TransformRunChunk(int chunk, const VertexDecoder &vdecoder, const u8 *raw, const TransformState &state, const VertexCarry &carry);
+	void RunNeed(int index);
+	void FinishRun();
+
+	// A run of draws whose vertices are transformed together (StartRun), and the next draw's place in it.
+	std::vector<ClipVertexData> runVerts_;
+	int runCount_ = 0;
+	const u8 *runNext_ = nullptr;
+	u32 runType_ = 0;
+	int runPos_ = 0;
+	int runRemaining_ = 0;
+	// Chunks of the run may still be in progress.
+	bool runActive_ = false;
+	RunJob *runJob_ = nullptr;
+	// orderReversed: verts are in the opposite order of how the GE takes the triangle (matters for clipping).
+	void SendTriangle(CullType cullType, const ClipVertexData *verts, int provoking = 2, bool orderReversed = false);
 
 	u8 *decoded_ = nullptr;
+	VertexCarry carry_;
 	BinManager *binner_ = nullptr;
 
 	// Normally max verts per prim is 3, but we temporarily need 4 to detect rectangles from strips.
@@ -174,6 +219,7 @@ public:
 	void DispatchSubmitPrim(const void *verts, const void *inds, GEPrimitiveType prim, int vertexCount, u32 vertTypeID, bool clockwise, int *bytesRead, ClipInfoFlags clipInfoFlags) override;
 	void DispatchSubmitImm(GEPrimitiveType prim, TransformedVertex *buffer, int vertexCount, int cullMode, bool continuation) override;
 
+	// For TransformUnit, which skins weighted vertices itself (VertexDecoderOptions::callerSkins).
 	VertexDecoder *FindVertexDecoder(u32 vtype);
 
 	TransformUnit transformUnit;
@@ -187,4 +233,8 @@ public:
 		FreeAlignedMemory(p);
 	}
 #endif
+
+private:
+	DenseHashMap<u32, VertexDecoder *> transformDecoders_;
+	void ClearTransformDecoders();
 };

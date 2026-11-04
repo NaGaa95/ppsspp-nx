@@ -27,6 +27,10 @@
 #include <curl/curl.h>
 #endif
 
+#ifdef __FreeBSD__
+#include <curl/curl.h>
+#endif
+
 #if __ANDROID__
 #include <jni.h>
 #include <pthread.h>
@@ -102,7 +106,7 @@ typedef struct {
     pthread_t workerThread;
     int closeRequested;
 #endif
-#if __LINUX__
+#if __LINUX__ || defined(__FreeBSD__)
     struct curl_slist* headerList;
 #endif
 #if __WINDOWS__
@@ -110,6 +114,28 @@ typedef struct {
     size_t bytesLeft;
 #endif
 } InternalResponse;
+
+// PPSSPP: complete is set on a transfer thread and polled on the caller's. Publish it with release
+// semantics and read it with acquire, so that the status code and body written before it are
+// visible once it reads as set. With plain accesses, ARM can reorder them.
+static inline void naettSetComplete(InternalResponse* res) {
+#ifdef _MSC_VER
+    MemoryBarrier();
+    *(volatile int*)&res->complete = 1;
+#else
+    __atomic_store_n(&res->complete, 1, __ATOMIC_RELEASE);
+#endif
+}
+
+static inline int naettLoadComplete(InternalResponse* res) {
+#ifdef _MSC_VER
+    int complete = *(volatile int*)&res->complete;
+    MemoryBarrier();
+    return complete;
+#else
+    return __atomic_load_n(&res->complete, __ATOMIC_ACQUIRE);
+#endif
+}
 
 void naettPlatformInit(naettInitData initData);
 int naettPlatformInitRequest(InternalRequest* req);

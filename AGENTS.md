@@ -12,29 +12,41 @@ for it:
 | Doc | When you need it |
 |---|---|
 | [docs/building.md](docs/building.md) | Build commands for every target (VS/MSBuild, CMake, UWP, legacy Android NDK, libretro), unit tests, pspautotests |
-| [docs/debugging.md](docs/debugging.md) | Driving the WebSocket debugger and PPSSPPHeadless from a script, breakpoint reliability per CPU backend, debugging a game that works on hardware |
+| [docs/android-device-testing.md](docs/android-device-testing.md) | Running a build on a real Android device or a Quest over adb: installing the build you think you are, forcing activity recreates, measuring retained activities, VR |
+| [docs/debugging.md](docs/debugging.md) | Driving the WebSocket debugger and PPSSPPHeadless from a script, measuring a commercial game with headless, comparing binaries' speed (`Tools/headless_bench.py`), finding a game's hot JIT blocks (`--jit-profile`), breakpoint reliability per CPU backend, debugging a game that works on hardware, finding and hashing a game function (like its own `memcpy`) for `ReplaceTables` when hardware backends miss CPU writes to VRAM |
 | [docs/DebuggerThreading.md](docs/DebuggerThreading.md) | `Core_RunOnCPUThread` / `g_frameMutex` / shutdown-lock rules - required reading before touching debugger code |
 | [docs/HLEModules.md](docs/HLEModules.md) | Adding an HLE module or function, and the seven build files a new source file goes in |
 | [docs/translations.md](docs/translations.md) | Translating UI strings with Tools/langtool |
-| [docs/pspautotests.md](docs/pspautotests.md) | Workflow for improving PPSSPP using pspautotests |
+| [docs/pspautotests.md](docs/pspautotests.md) | Workflow for improving PPSSPP using pspautotests, and running the tests that need the real firmware modules (`--disable-hle`, a firmware memstick) |
 | [docs/pspautotests-hardware.md](docs/pspautotests-hardware.md) | Writing a new pspautotest, and running it on a real PSP over PSPLink to record its `.expected` |
-| [docs/frametest.md](docs/frametest.md) | Framedump rendering tests |
+| [docs/adhoc-multiplayer-testing.md](docs/adhoc-multiplayer-testing.md) | Playing a game's ad hoc multiplayer with several headless instances (`Tools/adhoc_session.py`), with and without the relay, and simulating network delay, jitter and loss |
+| [docs/frametest.md](docs/frametest.md) | Framedump rendering tests, and replaying a dump on a real PSP |
+| [docs/sceGe.md](docs/sceGe.md) | How the firmware queues display lists, what SIGNAL and FINISH interrupts do and in which order, and how `ProcessDLQueue()` keeps that order |
 | [docs/sceAudio.md](docs/sceAudio.md) | How the audio output calls block, how deep they buffer, and what each error means |
 | [docs/WebSocketDebugger.md](docs/WebSocketDebugger.md) | WebSocket debugger protocol reference |
 | [docs/reverse-engineering.md](docs/reverse-engineering.md) | Disassembling a firmware PRX with `--re-module`, to find out what the hardware actually does |
+| [docs/adhoc-packet-decryption.md](docs/adhoc-packet-decryption.md) | Decrypting a sniffed capture of real-PSP ad hoc traffic (`Tools/adhoc_decrypt.py`, `adhoc_recover.c`) to compare hardware framing against PPSSPP's HLE-level ad hoc |
 | [docs/command-line.md](docs/command-line.md) | Adding a command-line option - the `g_autoParams` table, per-mode options, `ApplyToConfig()` |
 | [docs/patching-files.md](docs/patching-files.md) | Editing files from a script without wrecking the diff: line endings, and heredoc backslash escaping |
 | [docs/VSHBootInvestigation.md](docs/VSHBootInvestigation.md) | Booting the PSP's Visual Shell with `--vsh` against a real firmware dump |
+| [docs/POPS.md](docs/POPS.md) | PS1 EBOOTs: how the firmware's POPS manager and emulator are booted, and what's patched in them |
 | [docs/PsarFileFormat.md](docs/PsarFileFormat.md) | The PSAR archive inside a firmware updater - the format `Core/Util/PSARUnpack.cpp` walks |
 | [docs/pkg_notes.md](docs/pkg_notes.md) | The NPDRM `.pkg` format PSP game updates ship in, and how PPSSPP installs them |
+| [docs/cpu-equivalence.md](docs/cpu-equivalence.md) | Making the CPU cores agree bit for bit on every host: the `CPUEquivalence` fuzzer, what it found, and the differences still open (several waiting on a hardware test) |
+| [docs/dnas-patches.md](docs/dnas-patches.md) | Game patches installed on a real PSP (Killzone: Liberation's DLC): installing one over PSPLink, and the Fuse-ID-keyed PGD and type 3 PRX that `sceKernelLoadModuleDNAS` decrypts |
 | [docs/kernel-hle-review.md](docs/kernel-hle-review.md) | Findings from a review pass over `Core/HLE/sceKernel*.cpp`, and what was verified clean |
-| [docs/metal-backend.md](docs/metal-backend.md) | What a native Metal backend would take, and why programmable blending is the reason to want one |
+| [docs/shader-compilation.md](docs/shader-compilation.md) | Shader/pipeline compile stutter: where the time goes on MoltenVK (Metal's MSL compile, not glslang), the caches involved, how game-specific shaders are, and how to measure a cold start |
+| [docs/metal-backend.md](docs/metal-backend.md) | The Metal backend: shader translation, the render manager (recording, replay, pass merging), programmable blending, how it was tested against Vulkan, and what isn't done |
+| [docs/async-savestates.md](docs/async-savestates.md) | How savestate compression and file I/O run on a worker thread: the save/load/rewind pipelines, ordering, memory rules, what stays synchronous, and testing slots with the `game.state.*` debugger commands |
 
 ## General instructions
 
 1. Keep style changes minimal unless requested. Follow existing code patterns and conventions.
 2. Keep cross-platform parity in mind when changing shared code. See below for more multiplatform tips
-3. Never `git push` (to any remote) without asking the user first. Committing locally is fine when asked; pushing requires explicit approval.
+3. **Commit freely, push only when asked.** Once a change is done and tested, commit it on its
+   branch without waiting to be told. Never `git push` (to any remote) without the user's explicit
+   approval. The exception is a useful new or re-recorded test in `pspautotests`, which goes
+   straight to its `master` without asking (see [docs/pspautotests-hardware.md](docs/pspautotests-hardware.md#committing)).
 4. **Don't write code on `master`.** When asked to make a code change while on `master`, create an
    appropriately named branch first (`git checkout -b some-descriptive-name`) and do the work there.
    If you're already on a topic branch, just keep working on it.
@@ -48,11 +60,31 @@ for it:
    `newline=''` silently converts the whole file, turning a two-line addition into a 5000-line diff.
    Check `git diff --stat` before committing - a whole-file rewrite is obvious there and invisible in
    the editor. Prefer the Edit tool, which does exact string replacement and can't do this.
+
+   **Don't verify this with `grep -c $'\r$'`** - Git Bash's grep normalises line endings, so it counts
+   a bare-LF line as having a CR and reports any file as clean. The opposite mistake to a whole-file
+   rewrite is inserting a handful of LF lines into a CRLF file (a Python `"""..."""` block written with
+   `newline=''` does exactly this), and that shows in `--stat` only as the lines you meant to add. Check
+   the bytes instead, e.g. `python -c "d=open(F,'rb').read(); print(d.count(b'\r\n'), d.count(b'\n'))"`,
+   and treat git's "LF will be replaced by CRLF the next time Git touches it" as the warning it is
+   rather than autocrlf noise.
 6. **Don't feed Python to `bash -c` via a heredoc when the code needs a literal backslash in its
    *output*.** Git Bash strips one level of escaping on the way in even with a quoted delimiter
    (`<<'PY'`), so `"\\n"` reaches Python as `"\n"` and writes a real newline into the file - no error,
    just a patch that quietly did nothing. Use the Edit tool, or write the script to a file and run it.
    Details and the other two failure shapes: [docs/patching-files.md](docs/patching-files.md).
+
+7. **NEVER run more than one PSP hardware operation at a time.** There is one PSP. Every
+   `gentest.py`, `pspsh` or other PSPLink call gets its own message, containing that one tool call
+   and nothing else, and the next one starts only after the previous one has returned. Never put two
+   of them in the same message as parallel tool calls, never background one and start another, and
+   never loop over tests in one shell command. Re-recording a directory means one test, wait,
+   the next test. Concurrent runs collide in PSPLink and `host0:`: they time out, their results are
+   garbage, and the PSP wedges until someone resets it by hand. This has happened repeatedly; there
+   is no case where it is acceptable.
+8. **Update submodules when you start working.** Run `git submodule update --init --recursive`
+   before anything else, and again after switching or rebasing branches, so that builds and tests
+   use the submodule commits the branch records.
 
 ## Core Safety Checks
 
@@ -65,6 +97,20 @@ for it:
    to forget: put it last in the array even when alphabetical or NID order would put it elsewhere,
    and even when the array is otherwise tidily sorted. The same rule governs the order of
    `Register_*()` calls in `Core/HLE/HLETables.cpp` - new modules go at the very end.
+4. **Changing a shader cache key means bumping `CACHE_VERSION`, in both the OpenGL and Vulkan
+   caches** (`GPU/GLES/ShaderManagerGLES.cpp` and `GPU/Vulkan/ShaderManagerVulkan.cpp`). Their
+   on-disk caches store raw key bits with nothing to tell an old layout from a new one. OpenGL
+   stores `VShaderID`/`FShaderID`, and Vulkan stores those plus `VulkanPipelineKey` (the raster
+   state key and the decoded vertex format ID). So adding, removing, moving or reinterpreting any
+   of those bits needs the bump, or an old cache precompiles shaders for keys that now mean
+   something else, including combinations the generators assert on. D3D11 doesn't store shader IDs
+   on disk. Keys that only live in memory, like `SamplerCacheKey`, don't need a bump.
+5. **"As on hardware" needs a hardware test behind it.** A commit message or comment that says the
+   PSP does something names the pspautotests test that shows it, recorded before the change. And the
+   test has to reach the code path the change is about: when the HLE code handles the same call
+   differently by dialog type, mode or size, cover each of those. A dialog fix once claimed
+   hardware behaviour that the test recorded an hour later contradicted, and the test ran a message
+   dialog, which took a different branch from the savedata dialog that then hung Freak Out.
 
 ## Build and validation
 
@@ -75,14 +121,26 @@ for it:
 ```powershell
 $installPath = & "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
 $msbuild = "$installPath\MSBuild\Current\Bin\MSBuild.exe"
-& $msbuild "Windows\PPSSPP.sln" /t:UnitTest /p:Configuration=Debug /p:Platform=x64 /m
+& $msbuild "Windows\PPSSPP.sln" /t:UnitTest /p:Configuration=Debug /p:Platform=<platform> /m
 ```
 
+- **`<platform>` is whatever the machine is - look it up, don't assume.** It is `ARM64` or `x64`, and
+  the build lands in `Windows\<platform>\<configuration>\` to match, so building one and running the
+  other is easy to do without noticing. On Windows-on-ARM an x64 build runs anyway, under emulation,
+  which is what makes it easy to miss: it works, but it is slower than the native build, it is not
+  the code ARM users get, and any benchmark from it measures the emulator. Get the host from
+  `python -c "import platform; print(platform.machine())"`, not `$PROCESSOR_ARCHITECTURE`, which
+  describes the *shell* and says `AMD64` from an emulated one. The binaries say which they are too -
+  `UnitTest.exe` prints an `ABI:` line at startup.
 - Kill leftover `PPSSPPHeadless.exe`/`PPSSPP*.exe` instances before building - one holding the exe makes
   the link fail with `LNK1168`, which looks like a build problem and isn't.
 - **A stale binary lies consistently.** After a `git stash` cycle that touched a header, do a
   `/t:Rebuild`; when bisecting a behavioural change, confirm the binary actually changed before you
   believe the result.
+- **If a savestate fails to load, first suspect the branch, not the loader.** Either your branch is
+  behind the build that made the state (rebase it on `origin/master` and rebuild), or the state was
+  made on a branch that hasn't been merged yet. Only once you've ruled out both is it a savestate
+  compatibility bug.
 
 UWP, the legacy Android NDK build and the libretro core have their own build systems.
 
@@ -90,7 +148,7 @@ UWP, the legacy Android NDK build and the libretro core have their own build sys
 
 After a chunk of work (not after every edit), run both suites:
 
-- C++ unit tests: build the `UnitTest` project and run `Windows/x64/Debug/UnitTest.exe all`
+- C++ unit tests: build the `UnitTest` project and run `Windows/<platform>/Debug/UnitTest.exe all`
   (Linux/Mac: configure with `-DUNITTEST=ON`, run `build/PPSSPPUnitTest all`). Tests are listed in
   `availableTests` in `unittest/UnitTest.cpp`; pass names instead of `all` to run a subset.
 - pspautotests (HLE coverage) - run them **exactly the way CI does**:
@@ -103,8 +161,44 @@ python test.py -g --graphics=software
   around a hundred failures that mean nothing is wrong. The only meaningful result is `0 tests failed`.
   (The debug-CRT "Detected memory leaks!" dump after the summary line is normal, not a failure.)
 
-New unit tests are added to `availableTests`; large ones go in their own file in `unittest/`, listed in
-both CMakeLists.txt and the Visual Studio project.
+When the thing under test is a commercial game rather than a suite, headless needs `--log` before it prints
+anything (to stderr). On Windows it defaults its memory stick to `<exe dir>/memstick` rather than the app's
+(on Mac and Linux it uses the app's default), so the firmware you installed in the app may not be there.
+`test.py` and `frametests.py` pass `<exe dir>/memstick` everywhere. Pass `--memstick=<the app's memstick>` for any run that is
+meant to exercise a real firmware module. Without it, a library whose HLE the config has disabled has
+nothing left to resolve against, and the game does not fall back to our HLE - it gets unresolved imports and
+dies. The tell is a single line early on, `sceMpeg HLE is disabled, but flash0:/kd/mpeg.prx isn't in the
+firmware and the game didn't bring its own`, followed by a run that logs happily for its whole timeout with
+zero `sceDisplaySetFramebuf` calls and a handful of cached textures. Count flips before concluding anything
+about a game's behaviour. A run configured
+differently from what you asked for, or one that never reached the code, produces the same all-zero counts as
+a clean one, so assert the exit code and a positive "we got here" counter before believing any error count.
+The traps in full: [docs/debugging.md](docs/debugging.md).
+
+Unresolved-import errors early in a game run, for `scePsmfPlayer` in particular, are expected and not a
+problem: many games ship libpsmfplayer (and similar libraries) on the disc, and the imports resolve when the
+game loads the module. Don't change the setup (dropping `--memstick`, turning HLE back on) to make them go
+away; a run should be as close to a real one as possible, with firmware modules running as LLE.
+
+Keep game runs short and fast, so nobody has to watch them: always pass `--timeout-wall=30` (alongside any
+`--timeout-emulated`) unless there's a real reason for longer, use `--graphics=vulkan` rather than
+`--graphics=software` (if Vulkan doesn't work in headless, fix that), prefer a Release build, and leave out
+debug-level `--log` unless you need it. Each of those can cost an order of magnitude: Outrun loading a state
+took minutes with a Debug build, software rendering and a 300MB log, and about a second without them. To
+check that a game renders, `--screenshot-save=FILE.png` beats grepping the log. (pspautotests through
+`test.py` are different: they have their own per-test timeouts and use `--graphics=software` like CI.)
+
+Testing on a real Android device has its own traps, the worst of which is silent: `adb install -r`
+of a shorter branch over a longer one fails with `INSTALL_FAILED_VERSION_DOWNGRADE`, because
+`versionCode` is the commit count. The device keeps running the old build and every measurement after
+that describes the wrong binary. Use `adb install -r -d`, don't swallow the install output, and check
+`adb shell dumpsys package org.ppsspp.ppsspp | grep versionName` afterwards. See
+[docs/android-device-testing.md](docs/android-device-testing.md).
+
+New unit tests are added to `availableTests`; large ones go in their own file in `unittest/`, which has
+to be listed in **three** build files, not two: `CMakeLists.txt`, `unittest/UnitTests.vcxproj` (and its
+`.filters`), and `android/jni/Android.mk`, which builds a unit test executable of its own. Miss the last
+one and it builds everywhere you can easily try it, and fails on Android CI.
 
 ## Multiplatform considerations
 
@@ -170,7 +264,8 @@ writing BMPs (and when reading BMP references). `TranslateDebugBufferToCompare` 
 HLE module implementations live in `Core/HLE/sce<ModuleName>.cpp` / `.h`, as a `const HLEFunction
 <name>[]` table registered via `RegisterHLEModule()`. Both the function table and the `Register_*()`
 calls are append-only - see Core Safety Checks above, which is what breaks old savestates silently
-if ignored.
+if ignored. A kernel/driver function whose NID differs between firmware versions gets one entry
+(the 6.60 NID) plus a row in `hleKernelNids` in `HLETables.cpp`, never one duplicate entry per NID.
 
 Also: a new `.cpp`/`.c` file has to be added to **seven** build files (CMake, Core.vcxproj + filters,
 the two UWP projects, `android/jni/Android.mk`, `libretro/Makefile.common`); headers to the first five.
@@ -196,7 +291,7 @@ state, input injection, log tailing), served at `/debugger` on the Remote ISO po
 Read [docs/WebSocketDebugger.md](docs/WebSocketDebugger.md) before changing the interface, and update
 it when you add a command.
 
-- Breakpoints are most reliable on the interpreter (`-i`): under the JITs, memory breakpoints only work
+- Breakpoints are most reliable on the interpreter (`--cpu=interpreter`): under the JITs, memory breakpoints only work
   for constant addresses and register breakpoints never trip at all.
 - **Debugger code that runs off the CPU thread has a lock order that has deadlocked for real** -
   `Core_RunOnCPUThread()` for mutations, `g_frameMutex` for hot reads. Read
@@ -207,6 +302,22 @@ it when you add a command.
 Keep commit messages focused, not overly long (although sometimes it's motivated if a single commit
 is super complex). Do not report things like 100/100 tests passed - that's a given, if tests break
 you aren't supposed to make a commit.
+
+When a commit fixes a GitHub issue, the title comes first as usual, then a blank line, then
+`- Fixes #N` as the first line of the body, then a blank line and the rest of the summary:
+
+```
+GE: Nest CALLs only two deep, like the hardware
+
+- Fixes #7395
+
+The GE has two return address registers, ...
+```
+
+The blank line after the title matters: without it, git and GitHub treat both lines as the title.
+GitHub shows a reference that stands alone in a list item with the issue's title, so the PR
+(which takes its description from the commit) shows what is being fixed, and the keyword closes the
+issue on merge. Don't repeat the number in the body.
 
 **Never put a session marker in a commit message.** That means any `Claude-Session:` trailer, or a
 bare `https://claude.ai/code/session_...` line. This holds even when your own attribution
@@ -252,12 +363,18 @@ private:
 
 But generally follow the surrounding style. Braces are preferred on the same line. Braces are always used even when they could be omitted due the inner part being just a single line.
 
+If a large `else {}` block can be avoided with an early return when writing new code, do that
+instead. Don't wrap existing code in a new `else` and reindent it, either - it makes the diff
+much bigger than the change.
+
 ### Comments
 
 Keep comments tight. Say the thing once; don't restate what the code already shows, and don't
 allude to a previous, now-corrected version ("eight addresses and nothing else" - the "and nothing
 else" only makes sense against the old wrong layout, which is history). Cut filler like "the two
 are the same shape" down to "(the same shape)".
+
+Avoid AI clichés like "not this, but that".
 
 For a parenthetical aside, prefer parentheses over a pair of spaced dashes: write "the audio thread
 that paces playback", or "the audio thread (which paces playback)", not "the audio thread - which

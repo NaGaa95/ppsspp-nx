@@ -5,14 +5,22 @@
 import sys
 import os
 import subprocess
+import random
 import threading
 import glob
+import platform
+import socket
 
 
 PPSSPP_EXECUTABLES = [
-  # Windows
+  # Windows. The machine's own architecture comes first: an x64 build runs on Windows-on-ARM too,
+  # under emulation, so looking for it first would quietly test the emulated build instead.
   "Windows\\Debug\\PPSSPPHeadless.exe",
   "Windows\\Release\\PPSSPPHeadless.exe",
+] + ([
+  "Windows\\ARM64\\Debug\\PPSSPPHeadless.exe",
+  "Windows\\ARM64\\Release\\PPSSPPHeadless.exe",
+] if platform.machine().lower() in ("arm64", "aarch64") else []) + [
   "Windows\\x64\\Debug\\PPSSPPHeadless.exe",
   "Windows\\x64\\Release\\PPSSPPHeadless.exe",
   "build*/PPSSPPHeadless.exe",
@@ -33,6 +41,18 @@ PPSSPP_EXECUTABLES = [
 PPSSPP_EXE = None
 TEST_ROOT = "pspautotests/tests/"
 TIMEOUT = 5
+
+# The slower CPU backends need a longer wall clock on the CPU-heavy tests - the interpreter runs
+# misc/deadbeef in about 3s. Scale the timeout per backend rather than raising it for everyone, so
+# a genuine hang under the JIT is still caught in five seconds.
+CPU_TIMEOUTS = {
+  'interpreter': 20,
+  'ir': 10,
+  'jit': 5,
+  'jit-ir': 5,
+}
+
+DEBUG_TIMEOUT_SCALE = 3
 
 class Command(object):
   def __init__(self, cmd, data = None):
@@ -67,17 +87,42 @@ class Command(object):
 # These have worked and should keep working always - regression tests.
 # -g flag runs these.
 tests_good = [
+  "cpu/cop0/eret",
   "cpu/cpu_alu/cpu_alu",
   "cpu/cpu_alu/cpu_branch",
+  "cpu/cpu_alu/branch_link_ra",
   "cpu/cpu_alu/cpu_branch2",
+  "cpu/cpu_alu/cpu_div",
+  "cpu/cpu_alu/shift_encodings",
+  "cpu/cpu_alu/allegrex_encodings",
+  "cpu/jump/unaligned",
+  "cpu/vfpu/callout",
   "cpu/vfpu/colors",
   "cpu/vfpu/convert",
+  "cpu/vfpu/convert_scaled",
+  "cpu/vfpu/minmax",
+  "cpu/vfpu/minmax_zero",
+  "cpu/vfpu/minmax_tie",
+  "cpu/vfpu/prefix_branch",
+  "cpu/vfpu/prefix_ctrl",
+  "cpu/vfpu/prefix_lanes",
+  "cpu/vfpu/prefix_load",
+  "cpu/vfpu/vfim",
+  "cpu/vfpu/vbranch",
+  "cpu/vfpu/vrnd",
+  "cpu/vfpu/overlap",
   "cpu/vfpu/gum",
   "cpu/vfpu/matrix",
   "cpu/vfpu/vavg",
+  "cpu/vfpu/exact",
+  "cpu/vfpu/vrot",
   "cpu/icache/icache",
   "cpu/lsu/lsu",
+  "cpu/lsu/llsc",
   "cpu/fpu/fpu",
+  "cpu/fpu/rounding",
+  "cpu/fpu/roundmode",
+  "cpu/fpu/fpu_branch",
 
   "audio/atrac/addstreamdata",
   "audio/atrac/atractest",
@@ -96,6 +141,12 @@ tests_good = [
   "audio/atrac/second/setbuffer",
   "audio/atrac/setdata",
   "audio/atrac/sas",
+  "audio/atrac/c0mono",
+  "audio/atrac/headerfields",
+  "audio/audiocodec/basic",
+  "audio/audiocodec/at3param",
+  "audio/audiocodec/at3errors",
+  "audio/audiocodec/context",
   "audio/mp3/checkneeded",
   "audio/mp3/getbitrate",
   "audio/mp3/getchannel",
@@ -118,10 +169,14 @@ tests_good = [
   "audio/blocking/depth",
   "audio/blocking/errors",
   "audio/blocking/overhead",
+  "audio/blocking/parked",
   "audio/blocking/oneshot",
   "audio/blocking/restlen",
   "audio/blocking/vaudio",
+  "audio/sceaudio/reserve",
   "audio/sceaudio/datalen",
+  "audio/sceaudio/input",
+  "audio/sceaudio/routing",
   "audio/output2/changelength",
   "audio/output2/release",
   "audio/output2/reserve",
@@ -139,12 +194,14 @@ tests_good = [
   "audio/sascore/pcm",
   "audio/sascore/pitch",
   "audio/sascore/vag",
+  "ccc/convertstring",
   "ctrl/ctrl",
   "ctrl/idle/idle",
   "ctrl/sampling/sampling",
   "ctrl/sampling2/sampling2",
   "ctrl/vblank",
   "display/display",
+  "display/hcount",
   "display/vblankmulti",
   "display/isstate",
   "display/setframebuf",
@@ -166,7 +223,10 @@ tests_good = [
   "gpu/bounding/vertexaddr",
   "gpu/bounding/viewport",
   "gpu/callbacks/ge_callbacks",
+  "gpu/callstack/depth",
+  "gpu/clipping/guardband",
   "gpu/clipping/homogeneous",
+  "gpu/clipping/xycull",
   "gpu/clut/address",
   "gpu/clut/masks",
   "gpu/clut/offset",
@@ -177,29 +237,63 @@ tests_good = [
   "gpu/commands/blocktransfer",
   "gpu/commands/cull",
   "gpu/commands/fog",
+  "gpu/commands/light",
   "gpu/commands/material",
   "gpu/complex/complex",
+  "gpu/depth/precision",
+  "gpu/depth/transformprecision",
   "gpu/displaylist/alignment",
   "gpu/dither/dither",
+  "gpu/exact/coverage",
+  "gpu/exact/curves",
+  "gpu/exact/lighting",
+  "gpu/exact/lines",
+  "gpu/exact/nearclip",
+  "gpu/exact/pixel",
+  "gpu/exact/planes",
+  "gpu/exact/texture",
+  "gpu/exact/transform",
+  "gpu/filtering/linear",
   "gpu/filtering/mipmaplinear",
+  "gpu/filtering/nearest",
+  "gpu/filtering/precisionlinear2d",
+  "gpu/filtering/precisionlinear3d",
+  "gpu/filtering/precisionnearest2d",
+  "gpu/filtering/precisionnearest3d",
   "gpu/ge/break",
+  "gpu/ge/breakwait",
+  "gpu/ge/callbackstate",
   "gpu/ge/context",
   "gpu/ge/edram",
   "gpu/ge/enqueueparam",
+  "gpu/ge/get",
+  "gpu/ge/intrsuspend",
   "gpu/ge/queue",
+  "gpu/ge/queue2",
+  "gpu/lighting/shademap",
+  "gpu/lighting/specular",
+  "gpu/primitives/bezier",
+  "gpu/primitives/continue",
+  "gpu/primitives/immediate",
   "gpu/primitives/indices",
   "gpu/primitives/invalidprim",
+  "gpu/primitives/lines",
+  "gpu/primitives/linestrip",
   "gpu/primitives/points",
   "gpu/primitives/rectangles",
+  "gpu/primitives/spline",
   "gpu/primitives/trianglefan",
   "gpu/primitives/trianglestrip",
   "gpu/primitives/triangles",
+  "gpu/reflection/reflection",
   "gpu/rendertarget/copy",
   "gpu/rendertarget/depal",
+  "gpu/rendertarget/rendertarget",
   "gpu/signals/pause",
   "gpu/signals/pause2",
   "gpu/signals/suspend",
   "gpu/signals/sync",
+  "gpu/stencil/writemask",
   "gpu/texcolors/dxt1",
   "gpu/texcolors/dxt3",
   "gpu/texcolors/dxt5",
@@ -211,11 +305,19 @@ tests_good = [
   "gpu/texfunc/decal",
   "gpu/texfunc/modulate",
   "gpu/texfunc/replace",
+  "gpu/texmtx/normals",
+  "gpu/texmtx/prims",
+  "gpu/texmtx/source",
+  "gpu/texmtx/uvs",
+  "gpu/textures/mipinvalid",
   "gpu/textures/mipmap",
   "gpu/textures/rotate",
+  "gpu/textures/size",
   "gpu/transfer/invalid",
   "gpu/transfer/mirrors",
   "gpu/transfer/overlap",
+  "gpu/triangle/triangle",
+  "gpu/vertices/carry",
   "gpu/vertices/colors",
   "gpu/vertices/morph",
   # "gpu/vertices/texcoords",  #  See issue #19093
@@ -225,9 +327,16 @@ tests_good = [
   "hash/sha1ctx",
   "hle/check_not_used_uids",
   "intr/intr",
+  "intr/kernel/intrhandler",
+  "intr/mfic",
   "intr/enablesub",
+  "intr/registersub",
+  "intr/releasesub",
+  "intr/releaseself/releaseself",
+  "intr/disablepending/disablepending",
   "intr/suspended",
   "intr/vblank/vblank",
+  "intr/delays/delays",
   "io/cwd/cwd",
   "io/file/rename",
   "io/directory/directory",
@@ -242,6 +351,31 @@ tests_good = [
   "malloc/malloc",
   "misc/dcache",
   "misc/deadbeef",
+  "modules/cutrel/cutrel",
+  "modules/cutrel/kernel/cutrel",
+  "modules/idlist/idlist",
+  "modules/loadrace/loadrace",
+  "modules/startoptions/startoptions",
+  "modules/unresolved/unresolved",
+  "net/inet/blocking",
+  "net/inet/addr",
+  "net/inet/options",
+  "net/inet/msg",
+  "net/inet/limits",
+  "net/inet/polledge",
+  "net/inet/reuse",
+  "net/inet/errnothread",
+  "net/adhoc/abandon",
+  "net/adhoc/alerts",
+  "net/adhoc/apctlinit",
+  "net/adhoc/discover",
+  "net/adhoc/edges",
+  "net/adhoc/gamemode",
+  "net/adhoc/limits",
+  "net/adhoc/loopback",
+  "net/adhoc/self",
+  "net/adhoc/socketids",
+  "net/adhoc/term",
   "misc/libc",
   "misc/sdkver",
   "misc/testgp",
@@ -250,6 +384,7 @@ tests_good = [
   "mstick/mstick",
   "power/cpu",
   "power/power",
+  "power/freq",
   "power/volatile/lock",
   "power/volatile/trylock",
   "power/volatile/unlock",
@@ -267,14 +402,26 @@ tests_good = [
   "sysmem/volatile",
   "threads/alarm/alarm",
   "threads/alarm/cancel/cancel",
+  "threads/alarm/pending/pending",
   "threads/alarm/refer/refer",
   "threads/alarm/set/set",
+  "threads/callbacks/afterwait",
   "threads/callbacks/callbacks",
+  "threads/callbacks/cancel",
+  "threads/callbacks/cbtimeout",
   "threads/callbacks/check",
+  "threads/callbacks/count",
   "threads/callbacks/create",
   "threads/callbacks/delete",
+  "threads/callbacks/delivery",
   "threads/callbacks/exit",
+  "threads/callbacks/intrnotify",
+  "threads/callbacks/nested",
+  "threads/callbacks/notify",
+  "threads/callbacks/otherthread",
+  "threads/callbacks/recursion",
   "threads/callbacks/refer",
+  "threads/callbacks/waittypes",
   "threads/events/events",
   "threads/events/cancel/cancel",
   "threads/events/clear/clear",
@@ -294,6 +441,7 @@ tests_good = [
   "threads/fpl/refer",
   "threads/fpl/tryallocate",
   "threads/k0/k0",
+  "threads/lwmutex/callbacks",
   "threads/lwmutex/create",
   "threads/lwmutex/delete",
   "threads/lwmutex/lock",
@@ -331,6 +479,14 @@ tests_good = [
   "threads/mutex/try",
   "threads/mutex/unlock",
   "threads/mutex/unlock2",
+  "threads/scheduling/dispatch",
+  "threads/callbacks/combos",
+  "threads/scheduling/delayzero",
+  "threads/scheduling/dispatchwake",
+  "threads/scheduling/mutexhandoff",
+  "threads/scheduling/vblankwake",
+  "threads/scheduling/readyqueue",
+  "threads/scheduling/waittimeouts",
   "threads/semaphores/semaphores",
   "threads/semaphores/cancel",
   "threads/semaphores/create",
@@ -350,20 +506,27 @@ tests_good = [
   "threads/threads/stackfree",
   "threads/threads/start",
   "threads/threads/suspend",
+  "threads/threads/terminate",
+  "threads/threads/termsuspended",
   "threads/threads/threadend",
   "threads/threads/threadmanidlist",
   "threads/threads/threadmanidtype",
   "threads/threads/threads",
+  "threads/tls/allocate",
   "threads/tls/create",
   "threads/tls/partition",
   "threads/tls/kernel/partition",
+  "threads/threads/kernel/priority",
+  "gpu/ge/kernel/edramsize",
   "threads/tls/delete",
   "threads/tls/get",
   "threads/tls/free",
   "threads/tls/priority",
   "threads/tls/refer",
+  "threads/tls/timeout",
   "threads/vpl/allocate",
   "threads/vpl/cancel",
+  "threads/vpl/create",
   "threads/vpl/delete",
   "threads/vpl/fifo",
   "threads/vpl/free",
@@ -379,19 +542,34 @@ tests_good = [
   "threads/vtimers/getbase",
   "threads/vtimers/gettime",
   "threads/vtimers/interrupt",
+  "threads/vtimers/pending/pending",
+  "threads/vtimers/pending/cancelpending",
   "threads/vtimers/refer",
   "threads/vtimers/sethandler",
   "threads/vtimers/settime",
   "threads/vtimers/start",
   "threads/vtimers/stop",
   "threads/wakeup/wakeup",
+  "utility/dialog/abort",
+  "utility/dialog/htmlviewer",
+  "utility/dialog/priority",
+  "utility/dialog/sizes",
+  "utility/dialog/status",
   "utility/msgdialog/abort",
   "utility/savedata/autosave",
+  "utility/savedata/shutdownstatus",
+  "utility/savedata/noupdate",
+  "utility/savedata/initstatus",
   "utility/savedata/filelist",
+  "utility/savedata/getsize",
   "utility/savedata/makedata",
+  "utility/savedata/nomemstick",
   "utility/systemparam/systemparam",
+  "umd/api/api",
   "umd/callbacks/umd",
+  "umd/wait/wait",
   "umd/register",
+  "video/mpeg/cscvme",
   "video/mpeg/ringbuffer/avail",
   "video/mpeg/ringbuffer/construct",
   "video/mpeg/ringbuffer/destruct",
@@ -411,24 +589,112 @@ tests_good = [
   "video/psmfplayer/setpsmf",
   "video/psmfplayer/settempbuf",
   "video/psmfplayer/stop",
+  # Two-console tests: run on two instances, through the built-in relay and in P2P (see run_pair_tests).
+  "net/adhoc/pair/basic",
+  "net/adhoc/pair/listsizes",
+  "net/adhoc/pair/matching",
+  "net/adhoc/pair/matching2",
+  "net/adhoc/pair/matching3",
+  "net/adhoc/pair/matchingorder",
+  "net/adhoc/pair/ptpmsg",
+  "net/adhoc/pair/ptppoll",
+  "net/adhoc/pair/scaninfo",
+  "net/adhoc/pair/vanish",
 ]
 
 # Broken tests
 # -b flag runs these.
+
+# Tests that don't pass yet on an architecture we can only reach through emulation. Pass
+# --known-failures=<arch> to drop them from the run, so CI can still catch anything *new* breaking
+# while these stay outstanding. Keep a reason next to each one, and delete entries as they're fixed
+# rather than letting the list rot.
+known_failures = {
+  "riscv64": [
+    # No flush-to-zero: the ISA has no control for it, so a denormal result survives where the
+    # PSP would have flushed it. Everything else in this test passes.
+    "cpu/fpu/fpu",
+    # The ISA returns the canonical NaN (0x7fc00000) from every operation, never the operand's
+    # NaN, so a negative or signaling NaN input loses its sign and payload. Everything else passes.
+    "cpu/fpu/roundmode",
+  ],
+  "loongarch64": [
+    "cpu/fpu/fpu",
+  ],
+  "armhf": [],
+}
+
+# Two-console tests that don't pass yet in one of the two ways run_pair_tests runs them. Same rules as above.
+pair_known_failures = {
+  "relay": [
+    # A PTP connect to a port nobody listens on isn't refused: the relay holds it while it waits for a
+    # listener, so it times out instead.
+    "net/adhoc/pair/basic",
+  ],
+  "p2p": [],
+}
+if platform.system() == "Windows":
+  # Windows retries a refused TCP connect for about a second before reporting it, which at the tests'
+  # 800% speed is far longer than a PSP's refusal.
+  pair_known_failures["p2p"].append("net/adhoc/pair/basic")
+
+ADHOC_MODES = ["relay", "p2p"]
+
+# Single-console ad hoc tests that don't pass yet in one of the two data modes. Same rules as above.
+adhoc_known_failures = {
+  "relay": [
+    # One console can only talk to itself, which on a PSP never leaves the console: a PTP connect to
+    # itself is up at once. The relay sends it through the server, which takes a round trip.
+    "net/adhoc/alerts",
+  ],
+  "p2p": [],
+}
+
+_relay_ini = None
+
+def relay_ini_path():
+  # A config that makes headless use the built-in server's relay (like Tools/adhoc_multi.py --relay).
+  global _relay_ini
+  if _relay_ini is None:
+    import tempfile
+    f = tempfile.NamedTemporaryFile("w", suffix=".ini", delete=False)
+    f.write("[Network]\nproAdhocServer = 127.0.0.1\nAdhocServerRelayMode = 1\n")
+    f.close()
+    _relay_ini = f.name
+  return _relay_ini
+
+# Tests that exercise HLE code and barely any of the game's, so one CPU backend covers them.
+# --skip-cpu-independent leaves them out of the runs that repeat the suite with each backend, and
+# --only-cpu-independent runs just them.
+CPU_INDEPENDENT_PREFIXES = (
+  "net/",
+)
+
 tests_next = [
 # These are the next tests up for fixing. These run by default.
   "cpu/fpu/fcr",
+  "cpu/vfpu/prefix_consume",  # see the pspautotests commit for what differs per core
+  "cpu/vfpu/prefix_sat",
+  "cpu/vfpu/prefix_unpack",  # an invalid swizzle replays an earlier prefixed value, not emulated
+  "cpu/vfpu/vbranch_hazard",  # VFPU pipeline latencies, which a compiler pads for; not emulated
+  "cpu/vfpu/specials",  # vcmp on denormals, NaN canonicalization and denormal flush in vbfy/vocp/vavg/vfad/vsocp
+  "cpu/vfpu/overlap_vcrsp",  # vcrsp overlapping its source, which the assembler refuses; the hardware doesn't read-before-write
+  "cpu/fpu/fpu_branch_hazard",  # a bc1x right after c.xx.s sees the old condition; the compiler pads for it, not emulated
+  "cpu/fpu/fpu_nan",  # 0/0 and inf-inf give 0x7fc00000; x86 hosts make 0xffc00000, and a check per op isn't worth it
+  "cpu/lsu/cacheop",  # the data cache is write-back and the uncached mirror shows it; not emulated
   "cpu/vfpu/prefixes",
   "cpu/vfpu/vector",
   "cpu/vfpu/vregs",
+  "cpu/fpu/denormal",  # see docs/cpu-equivalence.md for these five
+  "cpu/vfpu/fcr31",
+  "cpu/vfpu/signed_zero",
+  "cpu/vfpu/nan_gen",
+  "cpu/vfpu/undefined",
   "audio/sceaudio/output",
-  "audio/sceaudio/reserve",
   "audio/sascore/setadsr",
   "audio/mp3/init",
   "audio/output2/frequency",
   "audio/output2/rest",
-  "ccc/convertstring",
-  "display/hcount",
   "font/fonttest",
   "font/charinfo",
   "font/newlib",
@@ -438,39 +704,18 @@ tests_next = [
   "font/shadowglyphimage",
   "font/shadowglyphimageclip",
   "font/shadowinfo",
-  "gpu/clipping/guardband",
-  "gpu/commands/light",
-  "gpu/depth/precision",
   "gpu/displaylist/state",
-  "gpu/filtering/linear",
-  "gpu/filtering/nearest",
-  "gpu/filtering/precisionlinear2d",
-  "gpu/filtering/precisionlinear3d",
-  "gpu/filtering/precisionnearest2d",
-  "gpu/filtering/precisionnearest3d",
   "gpu/ge/edramswizzle",
-  "gpu/ge/get",
-  "gpu/primitives/bezier",
-  "gpu/primitives/continue",
-  "gpu/primitives/immediate",
-  "gpu/primitives/lines",
-  "gpu/primitives/linestrip",
-  "gpu/primitives/spline",
-  "gpu/reflection/reflection",
-  "gpu/rendertarget/rendertarget",
+  "gpu/primitives/indices32",
   "gpu/signals/continue",
+  # Old SDK: a stall update from inside a SUSPEND handler is remembered, but not applied to the GE. See docs/sceGe.md.
+  "gpu/signals/handlercalls",
   "gpu/signals/jumps",
   "gpu/signals/simple",
   "gpu/simple/simple",
-  "gpu/texmtx/normals",
-  "gpu/texmtx/prims",
-  "gpu/texmtx/source",
-  "gpu/texmtx/uvs",
-  "gpu/textures/size",
-  "gpu/triangle/triangle",
-  "intr/registersub",
-  "intr/releasesub",
   "intr/waits",
+  "me/audiofifo",  # needs the Media Engine on, and Sony's ME firmware installed
+  "me/vram",  # needs the Media Engine on, and Sony's ME firmware installed
   "sysmem/kernel/heapgrow",
   "io/file/file",
   "io/io/io",
@@ -487,27 +732,38 @@ tests_next = [
   # Doesn't work on a PSP for security reasons, hangs in PPSSPP currently.
   # Commented out to make tests run much faster.
   #"modules/loadexec/loader",
+  "modules/unloadfill/unloadfill",
   "net/http/http",
+  "net/adhoc/adhocctl",  # a second Init fails and leaves adhocctl uninitialized; also the Scan state race below
+  "net/adhoc/ctlinit",  # GetState right after Scan: 2 here, still 0 on a PSP for under 1 ms (net/adhoc/scanstate)
+  "net/adhoc/matching",  # GetHelloOpt reports the hello length + 16; what the 16 bytes are is unknown
+  "net/adhoc/pdp",  # PdpCreate takes any MAC as the local one, for savestates made with another MAC
+  "net/adhoc/poll",  # P2P: a peer's close isn't seen while its data is still unread
+  "net/adhoc/ptp",  # the PdpCreate MAC as in pdp; a self-connect is established at open; through the relay, a refused connect times out instead of CONNECTION_REFUSED
+  "net/inet/bind",
+  "net/inet/poll",
+  "net/inet/errors",
+  "net/inet/states",
+  "net/inet/offline",
+  "net/inet/stats",
+  "net/inet/tcp",
+  "net/inet/udp",
   "net/primary/ether",
-  "power/freq",
+  # Two-console tests: run on two instances, through the built-in relay and in P2P (see run_pair_tests).
+  "net/adhoc/pair/discover",  # sceNetAdhocDiscover isn't implemented
+  "net/adhoc/pair/flow",  # PDP matches; the PTP send and receive windows aren't emulated
+  "net/adhoc/pair/gamemode",
+  "net/adhoc/pair/lifecycle",
   "sysmem/partition",
-  "threads/callbacks/cancel",
-  "threads/callbacks/count",
-  "threads/callbacks/notify",
   # These two mbx tests only appeared to work because they papered over bugs 
 
 
-  "threads/scheduling/dispatch",
   "threads/scheduling/scheduling",
   "threads/threads/create",
-  "threads/threads/terminate",
   "threads/tls/memory",
-  "threads/vpl/create",
   "umd/io/umd_io",
   "umd/raw_access/raw_access",
-  "umd/wait/wait",
   "utility/msgdialog/dialog",
-  "utility/savedata/getsize",
   "utility/savedata/idlist",
   # These tests appear to be broken and just hang.
   #"utility/savedata/deletebroken",
@@ -519,7 +775,10 @@ tests_next = [
   #"utility/savedata/saveemptyfilename",
   "utility/savedata/secureversion",
   "utility/savedata/sizes",
+  "video/mp4/avchold",  # needs Sony's mp4 and mpeg modules: --disable-hle=0x110, see docs/pspautotests.md
   "video/mpeg/basic",
+  "video/mpeg/decodeend",  # needs Sony's mpeg module, as avchold
+  "video/mpeg/deletetiming",
   "video/pmf/pmf",
   "video/pmf_simple/pmf_simple",
   "video/psmfplayer/basic",
@@ -531,6 +790,40 @@ tests_next = [
   "video/psmfplayer/start",
   "video/psmfplayer/update",
 ]
+
+
+# Tests that need extra headless flags, so they run in a headless process of their own. The flags
+# have to match how the .expected was recorded.
+test_flags = {
+  "utility/savedata/nomemstick": ["--no-memstick"],
+}
+
+# The ad hoc tests create groups, so they need a server to log in to, and they wait for its replies
+# in real time.
+# They run faster than PSP speed: timeouts and delays are in emulated time, and only the local network
+# round trips stay real. The instances of a pair test keep in step in emulated time (Tools/adhoc_multi.py),
+# so one a busy machine runs slower holds the other back instead of falling behind it. Every hop through
+# the relay waits a millisecond or so of real time, which the speed multiplies, so relay mode runs slower
+# (it hardly gains above 8x anyway). The single-console tests run at 8x too: the first login to the
+# server they start takes real time, a few hundred ms on a Windows runner, and a group request gives up
+# after 5 emulated seconds. ADHOC_SPEED overrides all of them.
+ADHOC_SPEEDS = {"relay": os.environ.get("ADHOC_SPEED", "800"), "p2p": os.environ.get("ADHOC_SPEED", "1600")}
+ADHOC_SINGLE_SPEED = os.environ.get("ADHOC_SPEED", "800")
+ADHOC_FLAGS = ["--adhoc-server", "--realtime", "--timeout-wall=60"]
+
+def flags_for(test):
+  if test in test_flags:
+    return test_flags[test]
+  if test.startswith("net/adhoc/"):
+    # A new port offset each run: a connection the last run made with the same ports is still in TCP
+    # TIME_WAIT for a while, and connecting again fails. The tests' ports go up to 31000 (game mode's), and
+    # have to stay below Linux's ephemeral ports (32768 and up), which outgoing connections hold.
+    return ADHOC_FLAGS + ["--port-offset=%d" % random.randrange(1, 1700)]
+  return None
+
+def is_pair_test(test):
+  # A two-console test is a set of programs, NAME_host.prx and NAME_client.prx.
+  return os.path.exists(TEST_ROOT + test + "_host.prx")
 
 
 # These are the tests we ignore (not important, or impossible to run)
@@ -567,9 +860,26 @@ def init():
     print("PPSSPPHeadless executable missing, please build one.")
     sys.exit(1)
 
+def cpu_backend(args):
+  # Which backend headless will end up on, given the args we hand through to it. Headless defaults
+  # to the JIT, and a later flag overrides an earlier one, like its own parsing in Core/CmdLine.cpp.
+  backend = 'jit'
+  for arg in args:
+    if arg.startswith('--cpu='):
+      backend = arg[len('--cpu='):]
+  return backend
+
 def run_tests(test_list, args):
   global PPSSPP_EXE, TIMEOUT
   returncode = 0
+  timeout = CPU_TIMEOUTS.get(cpu_backend(args), TIMEOUT)
+  # Debug builds are several times slower, enough for the heavier tests to brush the limit.
+  if 'Debug' in os.path.normpath(PPSSPP_EXE).split(os.sep):
+    timeout *= DEBUG_TIMEOUT_SCALE
+  # Tests that need longer bring their own.
+  for arg in args:
+    if arg.startswith('--timeout-wall='):
+      timeout = int(arg[len('--timeout-wall='):])
 
   test_filenames = []
   for test in test_list:
@@ -583,14 +893,69 @@ def run_tests(test_list, args):
 
   if len(test_filenames):
     # TODO: Maybe --compare should detect --graphics?
-    cmdline = [PPSSPP_EXE, '--root', TEST_ROOT + '../', '--compare', '--timeout-wall=' + str(TIMEOUT), '@-']
-    cmdline.extend([i for i in args if i not in ['-g', '-m', '-b']])
+    cmdline = [PPSSPP_EXE, '--root', TEST_ROOT + '../', '--compare', '--timeout-wall=' + str(timeout), '@-']
+    cmdline.extend([i for i in args if i not in ['-g', '-m', '-b'] and not i.startswith('--timeout-wall=')])
+    # A memory stick of the tests' own, so they neither write into the user's nor see its firmware.
+    if not any(i.startswith('--memstick') for i in cmdline):
+      cmdline.append('--memstick=' + os.path.join(os.path.dirname(os.path.abspath(PPSSPP_EXE)), 'memstick'))
 
     c = Command(cmdline, '\n'.join(test_filenames))
-    returncode = c.run(TIMEOUT * len(test_filenames))
+    returncode = c.run(timeout * len(test_filenames))
 
     print("Ran " + ' '.join(cmdline))
 
+  return returncode
+
+def pair_instances(test):
+  # The host, the client, and client2, client3... if there are more.
+  n = 2
+  while os.path.exists(TEST_ROOT + test + "_client%d.prx" % n):
+    n += 1
+  return n
+
+def missing_loopback_addresses(count):
+  # In P2P mode instance N binds to 127.0.0.N. Linux and Windows route all of 127/8 to the loopback;
+  # macOS only has the addresses that were added.
+  missing = []
+  for n in range(2, count + 1):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+      s.bind(("127.0.0.%d" % n, 0))
+    except OSError:
+      missing.append("127.0.0.%d" % n)
+    finally:
+      s.close()
+  return missing
+
+# P2P tests that couldn't run for want of a loopback address, reported as a failure at the end.
+pair_tests_without_loopback = []
+
+def run_pair_tests(test_list, args, modes):
+  # Each instance needs its own process, so Tools/adhoc_multi.py starts them, the host running the
+  # built-in ad hoc server. Each test runs through the server's relay (aemu_postoffice) and in P2P,
+  # where the instances talk to each other directly from 127.0.0.1, 127.0.0.2 and so on.
+  returncode = 0
+  for mode in modes:
+    tests = [t for t in test_list if t not in pair_known_failures[mode]]
+    skipped = [t for t in test_list if t in pair_known_failures[mode]]
+    if skipped:
+      print("Skipping %d known failures in %s mode: %s" % (len(skipped), mode, ", ".join(skipped)), flush=True)
+    if mode == "p2p":
+      runnable = [t for t in tests if not missing_loopback_addresses(pair_instances(t))]
+      pair_tests_without_loopback.extend(t for t in tests if t not in runnable)
+      if len(runnable) < len(tests):
+        print("WARNING: skipping %d P2P tests, which need loopback addresses this machine doesn't have." % (len(tests) - len(runnable)), flush=True)
+      tests = runnable
+    if not tests:
+      continue
+    cmdline = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Tools', 'adhoc_multi.py'), '--headless', PPSSPP_EXE]
+    if mode == "relay":
+      cmdline.append('--relay')
+    cmdline.extend([i for i in args if i not in ['-g', '-m', '-b', '--teamcity']])
+    cmdline.append("--speed=" + ADHOC_SPEEDS[mode])
+    cmdline.extend(tests)
+    returncode = subprocess.call(cmdline) or returncode
+    print("Ran " + ' '.join(cmdline))
   return returncode
 
 def main():
@@ -598,10 +963,30 @@ def main():
   tests = []
   args = []
   teamcity = False
+  skip_arch = None
+  adhoc_modes = ADHOC_MODES
+  # Ours: None runs everything, "skip" or "only" leaves out or keeps just the CPU-independent tests.
+  cpu_independent = None
   for arg in sys.argv[1:]:
     if arg == '--teamcity':
       args.append(arg)
       teamcity = True
+    elif arg == '--skip-cpu-independent':
+      cpu_independent = "skip"
+    elif arg == '--only-cpu-independent':
+      cpu_independent = "only"
+    elif arg.startswith('--known-failures='):
+      # Ours, not headless's - don't pass it through.
+      skip_arch = arg[len('--known-failures='):]
+      if skip_arch not in known_failures:
+        print("Unknown architecture for --known-failures: " + skip_arch)
+        sys.exit(1)
+    elif arg.startswith('--adhoc-mode='):
+      # Ours: which of relay and p2p the two-console tests run in (both by default).
+      adhoc_modes = [arg[len('--adhoc-mode='):]]
+      if adhoc_modes[0] not in ADHOC_MODES:
+        print("Unknown --adhoc-mode: " + adhoc_modes[0])
+        sys.exit(1)
     elif arg[0] == '-':
       args.append(arg)
     else:
@@ -621,7 +1006,46 @@ def main():
   elif '-m' in args:
     tests = [i for i in tests_next + tests_good if i.startswith(tests[0])]
 
-  returncode = run_tests(tests, args)
+  if skip_arch:
+    skipped = [t for t in tests if t in known_failures[skip_arch]]
+    tests = [t for t in tests if t not in known_failures[skip_arch]]
+    if skipped:
+      print("Skipping %d known failures on %s: %s" % (len(skipped), skip_arch, ", ".join(skipped)))
+
+  if cpu_independent:
+    independent = [t for t in tests if t.startswith(CPU_INDEPENDENT_PREFIXES)]
+    if cpu_independent == "skip":
+      tests = [t for t in tests if t not in independent]
+      print("Skipping %d tests that don't depend on the CPU backend" % len(independent))
+    else:
+      print("Skipping %d tests that depend on the CPU backend" % (len(tests) - len(independent)))
+      tests = independent
+
+  pair =[t for t in tests if is_pair_test(t)]
+  tests = [t for t in tests if t not in pair]
+  plain = [t for t in tests if flags_for(t) is None]
+  returncode = run_tests(plain, args)
+  for test in tests:
+    if flags_for(test) is None:
+      continue
+    if not test.startswith("net/adhoc/"):
+      returncode = run_tests([test], args + flags_for(test)) or returncode
+      continue
+    # The ad hoc tests talk through the built-in server, in both data modes, like run_pair_tests.
+    for mode in adhoc_modes:
+      if test in adhoc_known_failures[mode]:
+        print("Skipping known failure in %s mode: %s" % (mode, test), flush=True)
+        continue
+      print("%s mode:" % mode, flush=True)
+      mode_flags = ["--speed=" + ADHOC_SINGLE_SPEED] + (["--appendconfig=" + relay_ini_path()] if mode == "relay" else [])
+      returncode = run_tests([test], args + flags_for(test) + mode_flags) or returncode
+  if pair:
+    returncode = run_pair_tests(pair, args, adhoc_modes) or returncode
+  if pair_tests_without_loopback:
+    missing = missing_loopback_addresses(max(pair_instances(t) for t in pair_tests_without_loopback))
+    print("FAILED: %d P2P tests didn't run, for want of %s: %s" % (len(pair_tests_without_loopback), ", ".join(missing), ", ".join(pair_tests_without_loopback)))
+    print("Add the addresses with: " + "; ".join("sudo ifconfig lo0 alias %s up" % a for a in missing))
+    returncode = 1
   if teamcity:
     return 0
   return returncode

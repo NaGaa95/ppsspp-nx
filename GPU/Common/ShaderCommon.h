@@ -123,6 +123,8 @@ enum : uint64_t {
 
 class ShaderManagerCommon {
 public:
+	ShaderManagerCommon(const ShaderManagerCommon &) = delete;
+	ShaderManagerCommon &operator=(const ShaderManagerCommon &) = delete;
 	ShaderManagerCommon(Draw::DrawContext *draw) : draw_(draw) {}
 	virtual ~ShaderManagerCommon() {}
 
@@ -169,3 +171,11 @@ enum {
 
 	ATTR_COUNT,
 };
+
+class Path;
+
+// The shader caches end in a checksum of everything before it, so a damaged file gets rebuilt instead of loaded.
+// Appends it to a cache that has just been written and closed.
+bool AppendShaderCacheChecksum(const Path &filename);
+// False if the file or its checksum is missing, or the checksum doesn't match.
+bool VerifyShaderCacheChecksum(const Path &filename);

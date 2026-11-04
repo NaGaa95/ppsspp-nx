@@ -45,6 +45,7 @@
 #include "get_bits.h"
 
 #include "atrac.h"
+#include "at3_decoders.h"
 #include "atrac3data.h"
 
 #define FFALIGN(x, a) (((x)+(a)-1)&~((a)-1))
@@ -580,7 +581,7 @@ static int decode_channel_sound_unit(ATRAC3Context *q, GetBitContext *gb,
         int bits = get_bits(gb, 2);
         if (bits != 3) {
             av_log(AV_LOG_ERROR,"Joint Stereo mono Sound Unit id %d != 3.", bits);
-            return AVERROR_INVALIDDATA;
+            return ATRAC3_ERROR_JOINT_STEREO_MARKER;
         }
     } else {
         int bits = get_bits(gb, 6);
@@ -902,7 +903,9 @@ ATRAC3Context *atrac3_alloc(int channels, int *block_align, const uint8_t *extra
     q->decoded_bytes_buffer = (uint8_t *)av_mallocz(FFALIGN(q->block_align, 4) + AV_INPUT_BUFFER_PADDING_SIZE);
 
     /* initialize the MDCT transform */
-    if ((ret = ff_mdct_init(&q->mdct_ctx, 9, 1, 1.0 / 32768)) < 0) {
+    /* Negative scale: the PSP's decoder outputs the opposite polarity to ffmpeg's, in mono,
+     * stereo and joint stereo alike (compared on hardware through sceAudiocodec). */
+    if ((ret = ff_mdct_init(&q->mdct_ctx, 9, 1, -1.0 / 32768)) < 0) {
         av_log(AV_LOG_ERROR, "Error initializing MDCT");
         av_freep(&q->decoded_bytes_buffer);
 

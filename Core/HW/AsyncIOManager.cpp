@@ -156,7 +156,8 @@ void AsyncIOManager::DoState(PointerWrap &p) {
 	if (!s)
 		return;
 
-	SyncThread();
+	// Even while stepping, an operation in flight could write into the memory being loaded.
+	SyncThread(true);
 	std::lock_guard<std::mutex> guard(resultsLock_);
 	Do(p, resultsPending_);
 	if (s >= 2) {
@@ -164,6 +165,7 @@ void AsyncIOManager::DoState(PointerWrap &p) {
 	} else {
 		std::map<u32, size_t> oldResults;
 		Do(p, oldResults);
+		results_.clear();
 		for (auto it = oldResults.begin(), end = oldResults.end(); it != end; ++it) {
 			results_[it->first] = AsyncIOResult(it->second);
 		}

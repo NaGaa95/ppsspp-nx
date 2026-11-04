@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <array>
 #include <cmath>
 #include <string>
 #include "Common/CommonTypes.h"
@@ -51,8 +52,19 @@ inline int Xpose(int v) {
 extern float vfpu_sin(float);
 extern float vfpu_cos(float);
 extern void vfpu_sincos(float, float&, float&);
+// vfpu_sincos with the sine in the low 32 bits of the result and the cosine in the high, for the JITs.
+extern double vfpu_sincos_packed(float);
 
 extern float vfpu_asin(float);
+
+// vmin and vmax order values by this key: zeros and denormals are all equal (0), and otherwise
+// -NaN < -inf < negative < positive < inf < NaN, larger mantissas farther from zero. A tie returns
+// the second operand, and the result keeps its bits (cpu/vfpu/minmax_zero, minmax_tie).
+inline int32_t vfpu_minmax_key(uint32_t x) {
+	if ((x & 0x7F800000) == 0)
+		return 0;
+	return (int32_t)(x ^ ((uint32_t)((int32_t)x >> 31) >> 1));
+}
 
 inline float vfpu_clamp(float v, float min, float max) {
 	// Note: NAN is preserved, and -0.0 becomes +0.0 if min=+0.0.
@@ -60,8 +72,43 @@ inline float vfpu_clamp(float v, float min, float max) {
 }
 
 float vfpu_dot(const float a[4], const float b[4]);
+// The portable version vfpu_dot is checked against.
+float vfpu_dot_reference(const float a[4], const float b[4]);
+// vfpu_dot on hosts with no SIMD version.
+float vfpu_dot_scalar(const float a[4], const float b[4]);
+// Four vfpu_dot()s against v, over the first terms lanes: out[k] uses block[4 * i + k] for lane i,
+// or block[4 * k + i] if transposed (see IROp::Vec4VfpuMultiDot).
+void vfpu_multi_dot(float out[4], const float block[16], const float v[4], int terms, bool transposed);
 float vfpu_sqrt(float a);
 float vfpu_rsqrt(float a);
+
+// vfpu_rcp, vfpu_rsqrt and vfpu_sqrt have a fast path. A segment and a
+// 16-bit x2 come from w, which is the input's bits for rcp and (bits + 0x00800000) >> 1 for the
+// square roots:
+//   rcp    (k - (bits & 0xFF800000) + linear + square) & ~3
+//   rsqrt  (k - (w & 0x7F800000) + linear + square) & ~3
+//   sqrt   (k + (w & 0x7F800000) + linear + square) & ~3
+// with linear = (m * x2) >> 17 (a 64-bit product), square = (n * ((t * t + 255) >> 8)) >> 9 and
+// t = |(x2 >> 6) - 512|. The results are float bits, and the shifts are arithmetic.
+struct VFPUFastSegment {
+	uint32_t k;  // c0 plus the exponent bits of the result
+	int32_t m;
+	int32_t n;
+	int32_t pad;  // makes the stride 16 bytes
+};
+extern const std::array<VFPUFastSegment, 128> vfpu_rcp_fast;
+extern const std::array<VFPUFastSegment, 128> vfpu_rsqrt_fast;
+extern const std::array<VFPUFastSegment, 128> vfpu_sqrt_fast;
+
+// |x| in [2^-126, 2^126].
+inline bool vfpu_rcp_is_fast(uint32_t bits) {
+	return (bits << 1) - 0x01000000u <= 0xFC000000u;
+}
+
+// Positive, normal and finite, for both square roots.
+inline bool vfpu_sqrt_is_fast(uint32_t bits) {
+	return bits - 0x00800000u < 0x7F000000u;
+}
 
 extern float vfpu_exp2(float);
 extern float vfpu_rexp2(float);
@@ -177,6 +224,9 @@ void WriteVector(MIPSState *mips, const float *rs, VectorSize N, int reg);
 
 void GetVectorRegs(u8 regs[4], VectorSize N, int vectorReg);
 void GetMatrixRegs(u8 regs[16], MatrixSize N, int matrixReg);
+// True if the matrix's row or column offset makes it wrap around the end of the 4x4 block (like a
+// 4x4 E623), which GetMatrixRegs handles but code that assumes whole columns doesn't.
+bool MatrixWrapsAround(int matrixReg, MatrixSize N);
  
 // Translate between vector and matrix size. Possibly we should simply
 // join the two enums, but the type safety is kind of nice.
@@ -256,6 +306,32 @@ static inline int TransposeMatrixReg(int matrixReg) {
 int GetVectorOverlap(int reg1, VectorSize size1, int reg2, VectorSize size2);
 
 bool GetVFPUCtrlMask(int reg, u32 *mask);
+// Bits a write to the register always sets, on top of the mask: the RNG state registers keep
+// 0x3F800000 in their top bits whatever is written (cpu/vfpu/vrnd).
+u32 GetVFPUCtrlSetBits(int reg);
 
 float Float16ToFloat32(unsigned short l);
-void InitVFPU();
+
+// vh2f and vf2h, bit-exact to the hardware (cpu/vfpu/specials). vf2h truncates the mantissa,
+// flushes below 2^-14 to zero and keeps the low ten mantissa bits of a NaN; vh2f flushes
+// subnormal halves and keeps inf/NaN mantissa bits unshifted.
+u32 vfpu_h2f(u16 h);
+// The same, as a float (vfim).
+float vfpu_h2f_float(u16 h);
+
+// How the debuggers show a VFPU register. The multi-part modes list the lowest part first.
+enum class VFPUDisplayMode {
+	Float,
+	HalfFloat,
+	Hex,
+	Bytes,
+	Shorts,
+	Ints,
+	COUNT,
+};
+extern const char *const g_vfpuDisplayModeNames[(int)VFPUDisplayMode::COUNT];
+void FormatVFPUValue(char *out, size_t outSize, u32 value, VFPUDisplayMode mode);
+// vh2f of the lower or upper half of a word, with the word and result as float bits. For the JITs.
+float vfpu_h2f_lower(float word);
+float vfpu_h2f_upper(float word);
+u16 vfpu_f2h(u32 f);

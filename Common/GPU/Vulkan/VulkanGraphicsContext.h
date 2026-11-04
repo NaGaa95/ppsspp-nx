@@ -27,6 +27,14 @@ class VulkanGraphicsContext : public GraphicsContext {
 public:
 	VulkanGraphicsContext() : draw_(nullptr) {}
 	~VulkanGraphicsContext() override { ShutdownAPI(); }
+
+	// Renders into images of this size instead of a window's swapchain, for when there's nothing to
+	// present to (headless). Call before InitAPI. InitSurface then ignores the window system.
+	void SetOffscreen(int width, int height) {
+		offscreenWidth_ = width;
+		offscreenHeight_ = height;
+	}
+
 	bool InitAPI(void *wnd, std::string *deviceName, std::string *errorMessage) override;
 	bool InitSurface(WindowSystem winsys, void *data1, void *data2, std::string *errorMessage) override;
 	void ShutdownSurface() override;
@@ -47,4 +55,6 @@ private:
 	VulkanRenderManager *renderManager_ = nullptr;
 	bool windowRestored_ = false;
 	bool glslangInitialized_ = false;
+	int offscreenWidth_ = 0;
+	int offscreenHeight_ = 0;
 };

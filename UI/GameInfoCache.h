@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <ctime>
 #include <string>
 #include <map>
 #include <memory>
@@ -25,6 +26,7 @@
 #include <condition_variable>
 
 #include "Common/Thread/Event.h"
+#include "Common/Thread/ThreadManager.h"
 #include "Core/ELF/ParamSFO.h"
 #include "Core/Util/PSARUnpack.h"
 #include "Common/File/Path.h"
@@ -96,9 +98,10 @@ public:
 	u64 GetGameSavedataSizeInBytes() const;  // For games
 	u64 GetInstallDataSizeInBytes() const;
 
-	// For various kinds of savedata, mainly.
-	// NOTE: This one actually performs I/O directly, not cached.
+	// For various kinds of savedata, mainly. Read along with SIZE, empty before that.
 	std::string GetMTime() const;
+	// The file whose modification time GetMTime() shows.
+	Path GetMTimePath() const;
 
 	void ParseParamSFO(IdentifiedFileType type);
 	const ParamSFOData &GetParamSFO() const {
@@ -189,6 +192,9 @@ public:
 	u64 gameSizeOnDisk = 0;  // compressed size, in case of CSO
 	u64 saveDataSize = 0;
 	u64 installDataSize = 0;
+	// With SIZE.
+	bool hasMTime = false;
+	tm mtime{};
 
 	// The firmware updater bundled on the disc, if any - see GameInfoFlags::BUNDLED_UPDATE_INFO.
 	// Always left empty for anything that isn't an ISO.
@@ -227,7 +233,11 @@ public:
 	// because they're big. bgTextures and sound may be discarded over time as well.
 	// NOTE: This never returns null, so you don't need to check for that. Do check Ready() flags though.
 	// It's OK to pass in nullptr for draw if you don't need the actual texture right now.
-	std::shared_ptr<GameInfo> GetInfo(Draw::DrawContext *draw, const Path &gamePath, GameInfoFlags wantFlags, GameInfoFlags *outHasFlags = nullptr, GameInfoFlags refetchFlags = GameInfoFlags::EMPTY);
+	// priority orders the background loads: NORMAL for what's on screen, LOW for speculative work like
+	// search. HIGH is for a one-off request you're about to block on: it doesn't wait behind a
+	// lower-priority load that's already queued for the same data, it queues its own - so don't use it
+	// every frame.
+	std::shared_ptr<GameInfo> GetInfo(Draw::DrawContext *draw, const Path &gamePath, GameInfoFlags wantFlags, GameInfoFlags *outHasFlags = nullptr, GameInfoFlags refetchFlags = GameInfoFlags::EMPTY, TaskPriority priority = TaskPriority::NORMAL);
 	void FlushBGs();  // Gets rid of all BG textures. Also gets rid of bg sounds.
 
 	void CancelAll();

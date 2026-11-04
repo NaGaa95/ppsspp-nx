@@ -35,7 +35,10 @@ LoongArch64RegCache::LoongArch64RegCache(MIPSComp::JitOptions *jo)
 	config_.totalNativeRegs = NUM_LAGPR + NUM_LAFPR;
 	// F regs are used for both FPU and Vec, so we don't need VREGs.
 	config_.mapUseVRegs = false;
-	config_.mapFPUSIMD = true;
+	// Every compiler in this backend picks its path from cpu_info.LOONGARCH_LSX, so the mapping
+	// has to agree with it. Claiming SIMD here while the scalar paths run leaves them addressing
+	// lanes with F(reg + n) against a mapping that has no per-lane registers.
+	config_.mapFPUSIMD = cpu_info.LOONGARCH_LSX;
 }
 
 void LoongArch64RegCache::Init(LoongArch64Emitter *emitter) {
@@ -140,6 +143,21 @@ void LoongArch64RegCache::FlushBeforeCall() {
 	}
 	for (int i = 0; i <= 23; ++i) {
 		FlushNativeReg(F0 + i);
+	}
+	// F24-F31 are preserved, but only their low 64 bits, so an LSX vector there has to go.
+	for (int i = 24; i <= 31; ++i) {
+		IRNativeReg nreg = F0 + i;
+		if (nr[nreg].mipsReg != IRREG_INVALID && GetFPRLaneCount(nr[nreg].mipsReg - 32) > 2)
+			FlushNativeReg(nreg);
+	}
+}
+
+void LoongArch64RegCache::FlushHostRegs(std::initializer_list<LoongArch64Reg> regs) {
+	for (LoongArch64Reg r : regs) {
+		if (r >= V0)
+			FlushNativeReg(NUM_LAGPR + (r - V0));
+		else
+			FlushNativeReg(r);
 	}
 }
 
@@ -417,6 +435,8 @@ bool LoongArch64RegCache::TransferNativeReg(IRNativeReg nreg, IRNativeReg dest, 
 			return true;
 		if (oldlanes == 1 && Transfer1ToVec(nreg, dest, first, lanes))
 			return true;
+		if (oldlanes == 2 && lanes == 4 && Transfer2ToVec4(nreg, dest, first))
+			return true;
 	}
 
 	return IRNativeRegCacheBase::TransferNativeReg(nreg, dest, type, first, lanes, flags);
@@ -672,13 +692,73 @@ bool LoongArch64RegCache::Transfer1ToVec(IRNativeReg nreg, IRNativeReg dest, IRR
 	return true;
 }
 
+// Two pairs into a quad, like after two vs2i.p into the halves of one. Either half may be in memory.
+bool LoongArch64RegCache::Transfer2ToVec4(IRNativeReg nreg, IRNativeReg dest, IRReg first) {
+	if ((first & 3) != 0)
+		return false;
+
+	// Each half: the native reg holding just that pair, or -1 for in memory.
+	IRNativeReg half[2];
+	for (int h = 0; h < 2; ++h) {
+		const IRReg m = first + h * 2;
+		const IRNativeReg r = mr[m].nReg;
+		if (r == -1) {
+			if (mr[m].loc != MIPSLoc::MEM || mr[m + 1].loc != MIPSLoc::MEM)
+				return false;
+		} else if (nr[r].mipsReg != m || mr[m].lane != 0 || mr[m + 1].nReg != r || mr[m + 1].lane != 1 || (h == 0 && mr[m + 2].nReg == r)) {
+			return false;
+		}
+		// The other half, if this instruction maps it separately.
+		if (r != nreg && mr[m].spillLockIRIndex >= irIndex_)
+			return false;
+		half[h] = r;
+	}
+	if (half[0] != nreg && half[1] != nreg)
+		return false;
+
+	const LoongArch64Reg destReg = EncodeRegToV(FromNativeReg(dest));
+	auto V = [&](IRNativeReg r) { return EncodeRegToV(FromNativeReg(r)); };
+	if (half[0] != -1 && half[1] != -1) {
+		emit_->VILVL_D(destReg, V(half[1]), V(half[0]));
+	} else {
+		const int inReg = half[0] != -1 ? 0 : 1;
+		if (dest != half[inReg]) {
+			emit_->VLD(destReg, CTXREG, GetMipsRegOffset(first));
+			emit_->VEXTRINS_D(destReg, V(half[inReg]), inReg << 4);
+		} else {
+			emit_->FLD_D(SCRATCHF1, CTXREG, GetMipsRegOffset(first + (1 - inReg) * 2));
+			if (inReg == 0)
+				emit_->VEXTRINS_D(destReg, EncodeRegToV(SCRATCHF1), 1 << 4);
+			else
+				emit_->VILVL_D(destReg, destReg, EncodeRegToV(SCRATCHF1));
+		}
+	}
+
+	bool dirty = false;
+	for (int h = 0; h < 2; ++h) {
+		if (half[h] == -1)
+			continue;
+		dirty = dirty || nr[half[h]].isDirty;
+		if (half[h] != dest)
+			DiscardNativeReg(half[h]);
+	}
+	for (int i = 0; i < 4; ++i) {
+		mr[first + i].lane = i;
+		mr[first + i].loc = MIPSLoc::FREG;
+		mr[first + i].nReg = dest;
+	}
+	nr[dest].mipsReg = first;
+	nr[dest].isDirty = dirty;
+	return true;
+}
+
 LoongArch64Reg LoongArch64RegCache::R(IRReg mipsReg) {
 	_dbg_assert_(IsValidGPR(mipsReg));
 	_dbg_assert_(mr[mipsReg].loc == MIPSLoc::REG || mr[mipsReg].loc == MIPSLoc::REG_IMM);
 	if (mr[mipsReg].loc == MIPSLoc::REG || mr[mipsReg].loc == MIPSLoc::REG_IMM) {
 		return (LoongArch64Reg)mr[mipsReg].nReg;
 	} else {
-		ERROR_LOG_REPORT(Log::JIT, "Reg %i not in LoongArch64 reg", mipsReg);
+		ERROR_LOG(Log::JIT, "Reg %i not in LoongArch64 reg", mipsReg);
 		return INVALID_REG;  // BAAAD
 	}
 }
@@ -698,7 +778,7 @@ LoongArch64Reg LoongArch64RegCache::RPtr(IRReg mipsReg) {
 			return INVALID_REG;
 		}
 	} else {
-		ERROR_LOG_REPORT(Log::JIT, "Reg %i not in LoongArch64 reg", mipsReg);
+		ERROR_LOG(Log::JIT, "Reg %i not in LoongArch64 reg", mipsReg);
 		return INVALID_REG;  // BAAAD
 	}
 }
@@ -709,7 +789,7 @@ LoongArch64Reg LoongArch64RegCache::F(IRReg mipsReg) {
 	if (mr[mipsReg + 32].loc == MIPSLoc::FREG) {
 		return (LoongArch64Reg)mr[mipsReg + 32].nReg;
 	} else {
-		ERROR_LOG_REPORT(Log::JIT, "Reg %i not in LoongArch64 reg", mipsReg);
+		ERROR_LOG(Log::JIT, "Reg %i not in LoongArch64 reg", mipsReg);
 		return INVALID_REG;  // BAAAD
 	}
 }

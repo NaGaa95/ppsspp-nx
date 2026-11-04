@@ -23,6 +23,8 @@ namespace http {
 
 struct NaettBodySink;
 
+void HTTPSShutdown();
+
 // Really an asynchronous request.
 class HTTPSRequest : public Request {
 public:

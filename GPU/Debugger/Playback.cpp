@@ -16,9 +16,11 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include <algorithm>
+#include <climits>
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <map>
 #include <condition_variable>
 #include <vector>
 #include <thread>
@@ -40,10 +42,12 @@
 #include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceKernelMemory.h"
 #include "Core/MemMap.h"
+#include "Core/MemMapHelpers.h"
 #include "Core/MIPS/MIPS.h"
 #include "Core/MIPS/MIPSCodeUtils.h"
 #include "Core/System.h"
 #include "Core/Util/GameDB.h"
+#include "Core/Util/PathUtil.h"
 #include "GPU/GPUCommon.h"
 #include "GPU/GPUState.h"
 #include "GPU/ge_constants.h"
@@ -100,6 +104,11 @@ static Operation g_opToExec;
 static u32 g_retVal;
 static bool g_opDone = true;
 static bool g_cancelled = false;
+static int g_drawLimit = 0;
+
+void SetReplayDrawLimit(int lastPrim) {
+	g_drawLimit = lastPrim;
+}
 
 // Runs on operation thread
 u32 ExecuteOnMain(Operation opToExec) {
@@ -131,8 +140,8 @@ public:
 	BufMapping(const std::vector<u8> &pushbuf) : pushbuf_(pushbuf) {
 	}
 
-	// Returns a pointer to contiguous memory for this access, or else 0 (failure).
-	u32 Map(u32 bufpos, u32 sz, const std::function<void()> &flush);
+	// Returns a pointer to contiguous memory for this access, aligned to align bytes, or else 0 (failure).
+	u32 Map(u32 bufpos, u32 sz, const std::function<void()> &flush, u32 align = 1);
 
 	// Clear and reset allocations made.
 	void Reset() {
@@ -220,9 +229,14 @@ protected:
 	const std::vector<u8> &pushbuf_;
 };
 
-u32 BufMapping::Map(u32 bufpos, u32 sz, const std::function<void()> &flush) {
+u32 BufMapping::Map(u32 bufpos, u32 sz, const std::function<void()> &flush, u32 align) {
 	int slab1 = bufpos / SLAB_SIZE;
 	int slab2 = (bufpos + sz - 1) / SLAB_SIZE;
+
+	// Older recorders could reuse data at any offset (a CLUT found one byte into another), but the GE
+	// ignores the low bits of a CLUT or texture address. The extra mappings are separate, aligned copies.
+	if ((bufpos & (align - 1)) != 0)
+		return MapExtra(bufpos, sz, flush);
 
 	if (slab1 == slab2) {
 		// Shortcut in case it's simply the most recent slab.
@@ -355,6 +369,7 @@ class DumpExecute {
 public:
 	DumpExecute(const std::vector<u8> &pushbuf, const std::vector<Command> &commands, uint32_t version)
 		: pushbuf_(pushbuf), commands_(commands), mapping_(pushbuf), version_(version) {
+		MarkNeededTargets();
 	}
 	~DumpExecute();
 
@@ -375,7 +390,7 @@ private:
 	void MemcpyDest(u32 ptr, u32 sz);
 	void Memcpy(u32 ptr, u32 sz);
 	void Texture(int level, u32 ptr, u32 sz);
-	void Framebuf(int level, u32 ptr, u32 sz);
+	void Framebuf(int level, u32 ptr, u32 sz, bool needed);
 	void Display(u32 ptr, u32 sz, bool allowFlip);
 	void EdramTrans(u32 ptr, u32 sz);
 
@@ -389,7 +404,46 @@ private:
 	std::vector<u32> execListQueue;
 	u16 lastBufw_[8]{};
 	u32 lastTex_[8]{};
+	int prims_ = 0;
 	u32 lastBase_ = 0;
+	// The framebuffers drawn to so far by VRAM offset, with the areas the draws could reach, and the
+	// current one's registers.
+	struct DrawnRect {
+		int x1, y1, x2, y2;
+		bool Contains(int x, int y) const {
+			return x >= x1 && x <= x2 && y >= y1 && y <= y2;
+		}
+	};
+	struct DrawnTarget {
+		u32 strideBytes;
+		u32 bpp;
+		std::vector<DrawnRect> rects;
+	};
+	std::map<u32, DrawnTarget> drawnTargets_;
+	u32 fbPtr_ = 0;
+	u32 fbWidth_ = 0;
+	u32 fbFormat_ = 0;
+	u32 region2_ = 0;
+	u32 scissor2_ = 0;
+	u32 vertType_ = 0;
+	u32 zbPtr_ = 0;
+	u32 zbWidth_ = 0;
+	bool zTest_ = false;
+	bool zWriteDisable_ = false;
+	u32 clearMode_ = 0;
+	// Right after INIT, where a CLUT command is the CLUT the GE had loaded.
+	bool initialClut_ = false;
+	// Whether the last DISPLAY showed something (address 0 turns the display off).
+	bool haveDisplay_ = false;
+	// The vertices recorded for the next draw.
+	u32 lastVertsPtr_ = 0;
+	u32 lastVertsSize_ = 0;
+
+	void MarkDrawn(u32 prim);
+	void CopyAroundDrawn(u32 addr, const u8 *data, u32 size, bool linear);
+	void MarkNeededTargets();
+	// By command: the render target snapshots holding data that a later snapshot leaves out as unchanged.
+	std::vector<bool> neededTargets_;
 
 	const std::vector<u8> &pushbuf_;
 	const std::vector<Command> &commands_;
@@ -422,6 +476,16 @@ void DumpExecute::SyncStall() {
 }
 
 void DumpExecute::Registers(u32 ptr, u32 sz) {
+	// Whole commands only, and a block too big for the list buffer goes in pieces.
+	sz &= ~3;
+	const u32 maxChunk = LIST_BUF_SIZE / 2;
+	while (sz > maxChunk) {
+		Registers(ptr, maxChunk);
+		ptr += maxChunk;
+		sz -= maxChunk;
+	}
+
+	initialClut_ = false;
 	if (execListBuf == 0) {
 		u32 allocSize = LIST_BUF_SIZE;
 		execListBuf = userMemory.Alloc(allocSize, true, "List buf");
@@ -443,19 +507,30 @@ void DumpExecute::Registers(u32 ptr, u32 sz) {
 		gpu->EnableInterrupts(true);
 	}
 
+	// Only a crafted dump queues this much between two register blocks.
+	if (execListQueue.size() * sizeof(u32) + sz + 12 > (size_t)LIST_BUF_SIZE) {
+		ERROR_LOG(Log::GeDebugger, "Too many queued commands (%d), dropping them", (int)execListQueue.size());
+		execListQueue.clear();
+	}
 	u32 pendingSize = (u32)execListQueue.size() * sizeof(u32);
 	// Validate space for jump.
 	u32 allocSize = pendingSize + sz + 8;
 	if (execListPos + allocSize >= execListBuf + LIST_BUF_SIZE) {
-		Memory::WriteUnchecked_U32((GE_CMD_BASE << 24) | ((execListBuf >> 8) & 0x00FF0000), execListPos);
-		Memory::WriteUnchecked_U32((GE_CMD_JUMP << 24) | (execListBuf & 0x00FFFFFF), execListPos + 4);
+		// Finish this list, wait for the GE to run it, and start a new one at the buffer's start. Jumping
+		// back instead let the next lap overwrite commands the GE hadn't reached yet: Warriors (14660) lost
+		// half its draws. The PSP replayer does the same. GE state, BASE included, carries over.
+		Memory::WriteUnchecked_U32(GE_CMD_FINISH << 24, execListPos);
+		Memory::WriteUnchecked_U32(GE_CMD_END << 24, execListPos + 4);
+		execListPos += 8;
+		SyncStall();
+		ExecuteOnMain(Operation{ OpType::ListSync, execListID });
 
 		execListPos = execListBuf;
-		lastBase_ = execListBuf & 0xFF000000;
-
-		// Don't continue until we've stalled.
-		// TODO: Is this really needed? It seems fine without it.
-		SyncStall();
+		Memory::WriteUnchecked_U32(GE_CMD_NOP << 24, execListPos);
+		execListPos += 4;
+		gpu->EnableInterrupts(false);
+		execListID = ExecuteOnMain(Operation{ OpType::EnqueueList, execListBuf, execListPos });
+		gpu->EnableInterrupts(true);
 	}
 
 	Memory::MemcpyUnchecked(execListPos, execListQueue.data(), pendingSize);
@@ -485,6 +560,39 @@ void DumpExecute::Registers(u32 ptr, u32 sz) {
 			else
 				ops[i] = lastTexHigh[level] | bufw;
 			lastBufw_[level] = bufw;
+		}
+
+		if (cmd == GE_CMD_FRAMEBUFPTR)
+			fbPtr_ = ops[i] & 0x00FFFFFF;
+		if (cmd == GE_CMD_FRAMEBUFWIDTH)
+			fbWidth_ = ops[i] & 0x00FFFFFF;
+		if (cmd == GE_CMD_FRAMEBUFPIXFORMAT)
+			fbFormat_ = ops[i] & 3;
+		if (cmd == GE_CMD_REGION2)
+			region2_ = ops[i] & 0x000FFFFF;
+		if (cmd == GE_CMD_SCISSOR2)
+			scissor2_ = ops[i] & 0x000FFFFF;
+		if (cmd == GE_CMD_VERTEXTYPE)
+			vertType_ = ops[i] & 0x00FFFFFF;
+		if (cmd == GE_CMD_ZBUFPTR)
+			zbPtr_ = ops[i] & 0x00FFFFFF;
+		if (cmd == GE_CMD_ZBUFWIDTH)
+			zbWidth_ = ops[i] & 0x00FFFFFF;
+		if (cmd == GE_CMD_ZTESTENABLE)
+			zTest_ = (ops[i] & 1) != 0;
+		if (cmd == GE_CMD_ZWRITEDISABLE)
+			zWriteDisable_ = (ops[i] & 1) != 0;
+		if (cmd == GE_CMD_CLEARMODE)
+			clearMode_ = ops[i] & 0xFFFF;
+		if (cmd == GE_CMD_PRIM || cmd == GE_CMD_BEZIER || cmd == GE_CMD_SPLINE) {
+			MarkDrawn(cmd == GE_CMD_PRIM ? ops[i] & 0x00FFFFFF : 0);
+			prims_++;
+			if (g_drawLimit > 0 && prims_ > g_drawLimit)
+				ops[i] = GE_CMD_NOP << 24;
+		}
+		// Past the limit, keep the render target too, for --screenshot-render-target.
+		if (g_drawLimit > 0 && prims_ >= g_drawLimit && (cmd == GE_CMD_FRAMEBUFPTR || cmd == GE_CMD_FRAMEBUFWIDTH || cmd == GE_CMD_FRAMEBUFPIXFORMAT)) {
+			ops[i] = GE_CMD_NOP << 24;
 		}
 
 		// Since we're here anyway, also NOP out texture addresses.
@@ -519,8 +627,30 @@ void DumpExecute::SubmitListEnd() {
 }
 
 void DumpExecute::Init(u32 ptr, u32 sz) {
-	gstate.Restore((u32_le *)(pushbuf_.data() + ptr));
+	// Dumps from before savedContextVersion 1 hold PPSSPP's old context layout, with the matrices as raw
+	// floats; the new one ends its commands with an END. Restoring an old one as new turned its matrices
+	// into garbage and the scene disappeared (4140). The PSP replayer tells them apart the same way.
+	const u32_le *context = (const u32_le *)(pushbuf_.data() + ptr);
+	bool oldLayout = true;
+	for (int i = 17; i < 512; ++i) {
+		if (context[i] == GE_CMD_END << 24) {
+			oldLayout = false;
+			break;
+		}
+	}
+	gstate.Restore(context, oldLayout);
 	ExecuteOnMain(Operation{ OpType::ReapplyGfxState });
+	fbPtr_ = gstate.fbptr & 0x00FFFFFF;
+	fbWidth_ = gstate.fbwidth & 0x00FFFFFF;
+	fbFormat_ = gstate.framebufpixformat & 3;
+	region2_ = gstate.region2 & 0x000FFFFF;
+	scissor2_ = gstate.scissor2 & 0x000FFFFF;
+	vertType_ = gstate.vertType & 0x00FFFFFF;
+	zbPtr_ = gstate.zbptr & 0x00FFFFFF;
+	zbWidth_ = gstate.zbwidth & 0x00FFFFFF;
+	zTest_ = (gstate.zTestEnable & 1) != 0;
+	zWriteDisable_ = (gstate.zmsk & 1) != 0;
+	clearMode_ = gstate.clearmode & 0xFFFF;
 
 	// Hm, why are we doing this here? Should it be before?
 	for (int i = 0; i < 8; ++i) {
@@ -528,9 +658,110 @@ void DumpExecute::Init(u32 ptr, u32 sz) {
 		lastTex_[i] = 0;
 	}
 	lastBase_ = 0xFFFFFFFF;
+	initialClut_ = true;
+}
+
+// The drawing-space bounds of a through mode draw's vertices, or false if they aren't simple to read
+// (indexed, morphed, or not through mode).
+static bool ThroughModeBounds(u32 vtype, const u8 *data, u32 size, u32 count, int &x1, int &y1, int &x2, int &y2) {
+	if ((vtype & GE_VTYPE_THROUGH) == 0 || (vtype & GE_VTYPE_IDX_MASK) != 0 || (vtype & GE_VTYPE_MORPHCOUNT_MASK) != 0 || count == 0)
+		return false;
+
+	// Each component is aligned to its own size, and the vertex to the largest.
+	static const u8 compSizes[4] = { 0, 1, 2, 4 };
+	static const u8 colorSizes[8] = { 0, 0, 0, 0, 2, 2, 2, 4 };
+	u32 offset = 0, align = 1;
+	auto add = [&](u32 elemSize, u32 n) {
+		if (elemSize == 0)
+			return;
+		offset = (offset + elemSize - 1) & ~(elemSize - 1);
+		offset += elemSize * n;
+		align = std::max(align, elemSize);
+	};
+	add(compSizes[(vtype & GE_VTYPE_WEIGHT_MASK) >> GE_VTYPE_WEIGHT_SHIFT], ((vtype & GE_VTYPE_WEIGHTCOUNT_MASK) >> GE_VTYPE_WEIGHTCOUNT_SHIFT) + 1);
+	add(compSizes[(vtype & GE_VTYPE_TC_MASK) >> GE_VTYPE_TC_SHIFT], 2);
+	add(colorSizes[(vtype & GE_VTYPE_COL_MASK) >> GE_VTYPE_COL_SHIFT], 1);
+	add(compSizes[(vtype & GE_VTYPE_NRM_MASK) >> GE_VTYPE_NRM_SHIFT], 3);
+	const u32 posSize = compSizes[(vtype & GE_VTYPE_POS_MASK) >> GE_VTYPE_POS_SHIFT];
+	if (posSize == 0)
+		return false;
+	offset = (offset + posSize - 1) & ~(posSize - 1);
+	const u32 posOffset = offset;
+	add(posSize, 3);
+	const u32 stride = (offset + align - 1) & ~(align - 1);
+	if (stride * count > size)
+		return false;
+
+	x1 = y1 = INT_MAX;
+	x2 = y2 = INT_MIN;
+	for (u32 i = 0; i < count; ++i) {
+		const u8 *p = data + i * stride + posOffset;
+		int x, y;
+		if (posSize == 4) {
+			float fx, fy;
+			memcpy(&fx, p, 4);
+			memcpy(&fy, p + 4, 4);
+			if (!(fx >= -4096.0f && fx <= 4096.0f && fy >= -4096.0f && fy <= 4096.0f))
+				return false;
+			x = (int)fx;
+			y = (int)fy;
+		} else if (posSize == 2) {
+			x = (s16)(p[0] | (p[1] << 8));
+			y = (s16)(p[2] | (p[3] << 8));
+		} else {
+			x = (s8)p[0];
+			y = (s8)p[1];
+		}
+		// Truncation can be a pixel short at either end; the bounds only need to be generous.
+		x1 = std::min(x1, x - 1);
+		y1 = std::min(y1, y - 1);
+		x2 = std::max(x2, x + 1);
+		y2 = std::max(y2, y + 1);
+	}
+	return true;
+}
+
+void DumpExecute::MarkDrawn(u32 prim) {
+	const u32 start = ((fbPtr_ & 0xFFFFF0) | ((fbWidth_ & 0xFF0000) << 8)) & 0x001FFFFF;
+	const u32 bpp = fbFormat_ == GE_FORMAT_8888 ? 4 : 2;
+	int x1 = 0, y1 = 0;
+	int x2 = std::min(region2_ & 0x3FF, scissor2_ & 0x3FF);
+	int y2 = std::min((region2_ >> 10) & 0x3FF, (scissor2_ >> 10) & 0x3FF);
+	// A 2D draw (a sprite into a small buffer whose nominal area overlaps textures, Burnout) can say where
+	// it is exactly.
+	int vx1, vy1, vx2, vy2;
+	if (prim != 0 && lastVertsSize_ != 0 && ThroughModeBounds(vertType_, pushbuf_.data() + lastVertsPtr_, lastVertsSize_, prim & 0xFFFF, vx1, vy1, vx2, vy2)) {
+		x1 = std::max(x1, vx1);
+		y1 = std::max(y1, vy1);
+		x2 = std::min(x2, vx2);
+		y2 = std::min(y2, vy2);
+		if (x1 > x2 || y1 > y2)
+			return;
+	}
+
+	auto add = [&](u32 base, u32 strideBytes, u32 bytesPerPixel, const DrawnRect &rect) {
+		DrawnTarget &t = drawnTargets_[base];
+		t.strideBytes = strideBytes;
+		t.bpp = bytesPerPixel;
+		for (const DrawnRect &r : t.rects) {
+			if (r.Contains(rect.x1, rect.y1) && r.Contains(rect.x2, rect.y2))
+				return;
+		}
+		t.rects.push_back(rect);
+	};
+	add(start, (fbWidth_ & 0x07FC) * bpp, bpp, DrawnRect{ x1, y1, x2, y2 });
+	const bool writesDepth = (clearMode_ & 1) ? (clearMode_ & 0x400) != 0 : (zTest_ && !zWriteDisable_);
+	const int zbw = zbWidth_ & 0x07FC;
+	if (writesDepth && zbw != 0) {
+		// The PSP stores depth swizzled, so what lands in a drawn area is spread over whole rows in bands
+		// (SOCOM's frame texture copy ran into its depth buffer's columns 480-511).
+		add(zbPtr_ & 0x001FFFF0, zbw * 2, 2, DrawnRect{ 0, y1 & ~7, zbw - 1, y2 | 7 });
+	}
 }
 
 void DumpExecute::Vertices(u32 ptr, u32 sz) {
+	lastVertsPtr_ = ptr;
+	lastVertsSize_ = sz;
 	u32 psp = mapping_.Map(ptr, sz, std::bind(&DumpExecute::SyncStall, this));
 	if (psp == 0) {
 		ERROR_LOG(Log::GeDebugger, "Unable to allocate for vertices");
@@ -582,7 +813,7 @@ void DumpExecute::Clut(u32 ptr, u32 sz) {
 
 		execClutAddr = 0;
 	} else {
-		u32 psp = mapping_.Map(ptr, sz, std::bind(&DumpExecute::SyncStall, this));
+		u32 psp = mapping_.Map(ptr, sz, std::bind(&DumpExecute::SyncStall, this), 16);
 		if (psp == 0) {
 			ERROR_LOG(Log::GeDebugger, "Unable to allocate for clut");
 			return;
@@ -590,11 +821,21 @@ void DumpExecute::Clut(u32 ptr, u32 sz) {
 
 		execListQueue.push_back((GE_CMD_CLUTADDRUPPER << 24) | ((psp >> 8) & 0x00FF0000));
 		execListQueue.push_back((GE_CMD_CLUTADDR << 24) | (psp & 0x00FFFFFF));
+		if (initialClut_) {
+			// The CLUT the GE had loaded when the recording started (the recorder saves it right after
+			// INIT), with no LOADCLUT to follow, unlike the CLUTs recorded at a LOADCLUT: load it here,
+			// then put the game's CLUT address back. Without this, draws used whatever CLUT was loaded
+			// before (HotBrain 16131, ULUS10268, drew its save screen background black).
+			execListQueue.push_back((GE_CMD_LOADCLUT << 24) | ((sz / 32) & 0x3F));
+			execListQueue.push_back(gstate.clutaddrupper);
+			execListQueue.push_back(gstate.clutaddr);
+			initialClut_ = false;
+		}
 	}
 }
 
 void DumpExecute::TransferSrc(u32 ptr, u32 sz) {
-	u32 psp = mapping_.Map(ptr, sz, std::bind(&DumpExecute::SyncStall, this));
+	u32 psp = mapping_.Map(ptr, sz, std::bind(&DumpExecute::SyncStall, this), 16);
 	if (psp == 0) {
 		ERROR_LOG(Log::GeDebugger, "Unable to allocate for transfer");
 		return;
@@ -607,6 +848,36 @@ void DumpExecute::TransferSrc(u32 ptr, u32 sz) {
 	execListQueue.push_back(((GE_CMD_TRANSFERSRC) << 24) | (psp & 0x00FFFFFF));
 }
 
+// The PSP replayer writes recorded memory with the CPU, and the PSP sends every CPU access to VRAM's 0x04200000 and
+// 0x04600000 mirrors through the depth layout. With the software renderer PPSSPP's mirrors do that for 16-bit
+// accesses only, so a write into one goes a run of 32 aligned bytes at a time, which the layout keeps together.
+// IL-2's depth texture at 0x04710000 is recorded as the game sampled it, and only comes back so.
+static void CopyToMemory(u32 addr, const u8 *data, u32 size) {
+	if (!Memory::DepthMirrorsActive() || !Memory::IsDepthTexVRAMAddress(addr)) {
+		Memory::MemcpyUnchecked(addr, data, size);
+		return;
+	}
+	for (u32 pos = 0; pos < size; ) {
+		const u32 a = addr + pos;
+		const u32 n = std::min(32 - (a & 31), size - pos);
+		Memory::MemcpyUnchecked(Memory::DepthMirrored16(a), data + pos, n);
+		pos += n;
+	}
+}
+
+static void SetMemory(u32 addr, u8 value, u32 size) {
+	if (!Memory::DepthMirrorsActive() || !Memory::IsDepthTexVRAMAddress(addr)) {
+		Memory::Memset(addr, value, size);
+		return;
+	}
+	for (u32 pos = 0; pos < size; ) {
+		const u32 a = addr + pos;
+		const u32 n = std::min(32 - (a & 31), size - pos);
+		Memory::Memset(Memory::DepthMirrored16(a), value, n);
+		pos += n;
+	}
+}
+
 void DumpExecute::Memset(u32 ptr, u32 sz) {
 	PROFILE_THIS_SCOPE("ReplayMemset");
 	struct MemsetCommand {
@@ -617,10 +888,15 @@ void DumpExecute::Memset(u32 ptr, u32 sz) {
 
 	const MemsetCommand *data = (const MemsetCommand *)(pushbuf_.data() + ptr);
 
-	if (Memory::IsVRAMAddress(data->dest)) {
+	const u32 size = Memory::ClampValidSizeAt(data->dest, data->sz);
+	if (Memory::IsVRAMAddress(data->dest) && size != 0) {
 		SyncStall();
+		// Draws the software renderer still has queued come before the write.
+		gpu->Flush();
 		// TODO: should probably do this as an operation.
-		gpu->PerformMemorySet(data->dest, (u8)data->value, data->sz);
+		// The software renderer leaves the memset to the caller, like sceKernelMemset does.
+		if (!gpu->PerformMemorySet(data->dest, (u8)data->value, size))
+			SetMemory(data->dest, (u8)data->value, size);
 	}
 }
 
@@ -630,16 +906,18 @@ void DumpExecute::MemcpyDest(u32 ptr, u32 sz) {
 
 void DumpExecute::Memcpy(u32 ptr, u32 sz) {
 	PROFILE_THIS_SCOPE("ReplayMemcpy");
-	if (Memory::IsVRAMAddress(execMemcpyDest)) {
+	sz = Memory::ClampValidSizeAt(execMemcpyDest, sz);
+	if (Memory::IsVRAMAddress(execMemcpyDest) && sz != 0) {
 		SyncStall();
-		Memory::MemcpyUnchecked(execMemcpyDest, pushbuf_.data() + ptr, sz);
+		gpu->Flush();
+		CopyToMemory(execMemcpyDest, pushbuf_.data() + ptr, sz);
 		NotifyMemInfo(MemBlockFlags::WRITE, execMemcpyDest, sz, "ReplayMemcpy");
 		gpu->PerformWriteColorFromMemory(execMemcpyDest, sz);
 	}
 }
 
 void DumpExecute::Texture(int level, u32 ptr, u32 sz) {
-	u32 psp = mapping_.Map(ptr, sz, std::bind(&DumpExecute::SyncStall, this));
+	u32 psp = mapping_.Map(ptr, sz, std::bind(&DumpExecute::SyncStall, this), 16);
 	if (psp == 0) {
 		ERROR_LOG(Log::GeDebugger, "Unable to allocate for texture");
 		return;
@@ -654,7 +932,7 @@ void DumpExecute::Texture(int level, u32 ptr, u32 sz) {
 	}
 }
 
-void DumpExecute::Framebuf(int level, u32 ptr, u32 sz) {
+void DumpExecute::Framebuf(int level, u32 ptr, u32 sz, bool needed) {
 	PROFILE_THIS_SCOPE("ReplayFramebuf");
 	struct FramebufData {
 		u32 addr;
@@ -681,11 +959,106 @@ void DumpExecute::Framebuf(int level, u32 ptr, u32 sz) {
 	const bool unchangedVRAM = version_ >= 6 && (framebuf->flags & 2) != 0;
 	// TODO: Could use drawnVRAM flag, but it can be wrong.
 	// Could potentially always skip if !isTarget, but playing it safe for offset texture behavior.
-	if (Memory::IsValidRange(framebuf->addr, pspSize) && !unchangedVRAM && (!isTarget || !g_Config.bSoftwareRendering)) {
+	// The software renderer skips a render target's unless something later relies on it: one drawn before the
+	// dump started holds data no other snapshot brings in (Madden's field logo, Need for Speed ProStreet).
+	if (Memory::IsValidRange(framebuf->addr, pspSize) && !unchangedVRAM && (!isTarget || !g_Config.bSoftwareRendering || needed)) {
+		// After the draws before it, which the software renderer may still have queued.
+		SyncStall();
+		gpu->Flush();
 		// Intentionally don't trigger an upload here.
-		Memory::MemcpyUnchecked(framebuf->addr, pushbuf_.data() + ptr + headerSize, pspSize);
-		NotifyMemInfo(MemBlockFlags::WRITE, framebuf->addr, pspSize, "ReplayTex");
+		CopyAroundDrawn(framebuf->addr, pushbuf_.data() + ptr + headerSize, pspSize, needed);
 	}
+}
+
+// The recorder leaves VRAM out of a snapshot as unchanged when an earlier snapshot had it. Marks the render
+// target snapshots that were that earlier one, by 256-byte block as the recorder tracks it.
+void DumpExecute::MarkNeededTargets() {
+	neededTargets_.assign(commands_.size(), false);
+	if (version_ < 6) {
+		return;
+	}
+	const u32 BLOCK_SHIFT = 8;
+	const u32 VRAM_SIZE = 0x00200000;
+	// For each block, the command whose snapshot last brought data there, and whether it was a render target's.
+	std::vector<int> lastSource(VRAM_SIZE >> BLOCK_SHIFT, -1);
+	std::vector<bool> lastIsTarget(lastSource.size(), false);
+	for (size_t i = 0; i < commands_.size(); i++) {
+		const Command &cmd = commands_[i];
+		if (cmd.type < CommandType::FRAMEBUF0 || cmd.type > CommandType::FRAMEBUF7 || cmd.sz < 16) {
+			continue;
+		}
+		const u32 *header = (const u32 *)(pushbuf_.data() + cmd.ptr);
+		if (!Memory::IsVRAMAddress(header[0])) {
+			continue;
+		}
+		const bool isTarget = (header[2] & 1) != 0;
+		const bool unchangedVRAM = (header[2] & 2) != 0;
+		const u32 start = header[0] & (VRAM_SIZE - 1);
+		const u32 end = start + std::min(cmd.sz - 16, VRAM_SIZE - start);
+		for (u32 b = start >> BLOCK_SHIFT; b < (end + (1 << BLOCK_SHIFT) - 1) >> BLOCK_SHIFT; b++) {
+			if (unchangedVRAM) {
+				if (lastSource[b] >= 0 && lastIsTarget[b]) {
+					neededTargets_[lastSource[b]] = true;
+				}
+			} else {
+				lastSource[b] = (int)i;
+				lastIsTarget[b] = isTarget;
+			}
+		}
+	}
+}
+
+// The software renderer has the real contents of what this replay drew, while the dump's copy can be stale
+// (a hardware backend that didn't read it back, GTA LCS). So a copy leaves out the areas the replay's draws
+// could reach: a texture inside one (Princess Maker 5 textures from the right half of its 1024 wide
+// framebuffer), or one whose recorded size runs over a buffer drawn next to it (Rainbow Six copies its
+// 512x512 frame texture before each strip it draws into the display buffer inside that range). A texture
+// beside the drawn area still comes through (Burnout keeps one in columns 480-511).
+void DumpExecute::CopyAroundDrawn(u32 addr, const u8 *data, u32 size, bool linear) {
+	// A texture recorded at its full size can run past the end of VRAM, into the depth swizzle mirror
+	// (Princess Maker 5's 1024x1024 one at 0x04000400). That isn't the game's data.
+	if (Memory::IsVRAMAddress(addr))
+		size = std::min(size, 0x00200000 - (addr & 0x001FFFFF));
+	std::vector<std::pair<int64_t, int64_t>> skip;
+	const int64_t start = addr & 0x001FFFFF, end = start + size;
+	// A snapshot at a depth mirror holds what the game saw through it (PPSSPP stored depth that way), so it goes
+	// back through the mirror. Except a render target's that later snapshots rely on: those read its data at
+	// linear addresses (Me & My Katamari textures a 512x512 one through 0x04288000, past its depth buffer).
+	linear = linear && Memory::IsVRAMAddress(addr);
+	if (g_Config.bSoftwareRendering) {
+		for (const auto &it : drawnTargets_) {
+			const DrawnTarget &t = it.second;
+			if (t.strideBytes == 0)
+				continue;
+			for (const DrawnRect &r : t.rects) {
+				for (int y = std::max(r.y1, 0); y <= r.y2; ++y) {
+					const int64_t row = (int64_t)it.first + (int64_t)y * t.strideBytes;
+					const int64_t a = row + (int64_t)std::max(r.x1, 0) * t.bpp;
+					const int64_t b = row + (int64_t)(r.x2 + 1) * t.bpp;
+					if (b > start && a < end)
+						skip.emplace_back(std::max(a, start), std::min(b, end));
+				}
+			}
+		}
+		std::sort(skip.begin(), skip.end());
+	}
+
+	int64_t pos = start;
+	auto copyTo = [&](int64_t until) {
+		if (until > pos) {
+			if (linear) {
+				Memory::MemcpyUnchecked(0x04000000 + (u32)pos, data + (pos - start), (u32)(until - pos));
+			} else {
+				CopyToMemory(addr + (u32)(pos - start), data + (pos - start), (u32)(until - pos));
+			}
+			NotifyMemInfo(MemBlockFlags::WRITE, addr + (u32)(pos - start), (u32)(until - pos), "ReplayTex");
+		}
+	};
+	for (const auto &s : skip) {
+		copyTo(s.first);
+		pos = std::max(pos, s.second);
+	}
+	copyTo(end);
 }
 
 void DumpExecute::Display(u32 ptr, u32 sz, bool allowFlip) {
@@ -699,6 +1072,11 @@ void DumpExecute::Display(u32 ptr, u32 sz, bool allowFlip) {
 	// Sync up drawing.
 	SyncStall();
 
+	// A display turned off shows nothing to compare, so the result falls back to the last framebuffer
+	// drawn to, as for a dump without a DISPLAY (Auditorium 9213). The PSP replayer does the same.
+	haveDisplay_ = disp->topaddr.ptr != 0;
+	if (!haveDisplay_)
+		return;
 	__DisplaySetFramebuf(disp->topaddr.ptr, disp->linesize, disp->pixelFormat, 1);
 	if (allowFlip) {
 		__DisplaySetFramebuf(disp->topaddr.ptr, disp->linesize, disp->pixelFormat, 0);
@@ -742,6 +1120,15 @@ ReplayResult DumpExecute::Run() {
 		}
 
 		const Command &cmd = commands_[i];
+		// Only the first INIT is real. Before 71210f3fa2 a second dump request during a recording started
+		// it again, writing another INIT (and initial CLUT) into the dump: the GE state of that moment,
+		// which already includes register writes the dump only has after it. Applied, it ran the last
+		// draws with the wrong state (GOD EATER BURST 13950 came out black, Street Riders 14746 garbled).
+		if (cmd.type == CommandType::INIT && i != 0) {
+			if (i + 1 < commands_.size() && commands_[i + 1].type == CommandType::CLUT)
+				++i;
+			continue;
+		}
 		switch (cmd.type) {
 		case CommandType::INIT:
 			Init(cmd.ptr, cmd.sz);
@@ -806,7 +1193,7 @@ ReplayResult DumpExecute::Run() {
 		case CommandType::FRAMEBUF5:
 		case CommandType::FRAMEBUF6:
 		case CommandType::FRAMEBUF7:
-			Framebuf((int)cmd.type - (int)CommandType::FRAMEBUF0, cmd.ptr, cmd.sz);
+			Framebuf((int)cmd.type - (int)CommandType::FRAMEBUF0, cmd.ptr, cmd.sz, neededTargets_[i]);
 			break;
 
 		case CommandType::DISPLAY:
@@ -820,29 +1207,123 @@ ReplayResult DumpExecute::Run() {
 	}
 
 	SubmitListEnd();
+	if (!haveDisplay_ && fbWidth_ != 0) {
+		SyncStall();
+		const u32 addr = 0x04000000 | (fbPtr_ & 0x001FFFF0);
+		__DisplaySetFramebuf(addr, fbWidth_ & 0x07FC, fbFormat_, 1);
+		__DisplaySetFramebuf(addr, fbWidth_ & 0x07FC, fbFormat_, 0);
+	}
 	return ReplayResult::Done;
 }
 
-static bool ReadCompressed(u32 fp, void *dest, size_t sz, uint32_t version) {
+// Reads count items, checking the sizes the file declares against the file and each other before
+// allocating for them.
+template <typename T>
+static bool ReadCompressed(u32 fp, u64 fileSize, std::vector<T> &dest, u32 count, uint32_t version) {
 	u32 compressed_size = 0;
 	if (pspFileSystem.ReadFile(fp, (u8 *)&compressed_size, sizeof(compressed_size)) != sizeof(compressed_size)) {
 		return false;
 	}
-
-	u8 *compressed = new u8[compressed_size];
-	if (pspFileSystem.ReadFile(fp, compressed, compressed_size) != compressed_size) {
-		delete[] compressed;
+	const u64 pos = pspFileSystem.GetSeekPos(fp);
+	if (pos > fileSize || compressed_size > fileSize - pos) {
 		return false;
 	}
 
-	size_t real_size = sz;
-	if (version < 5)
-		snappy_uncompress((const char *)compressed, compressed_size, (char *)dest, &real_size);
-	else
-		real_size = ZSTD_decompress(dest, real_size, compressed, compressed_size);
-	delete[] compressed;
+	std::vector<u8> compressed(compressed_size);
+	if (pspFileSystem.ReadFile(fp, compressed.data(), compressed_size) != compressed_size) {
+		return false;
+	}
 
+	// Far beyond any real dump. A zstd frame doesn't always say how big it is, and a small one can
+	// expand to gigabytes, so this is what keeps a crafted one from exhausting memory.
+	const u64 MAX_SIZE = 1024 * 1024 * 1024;
+	const u64 sz = (u64)count * sizeof(T);
+	if (sz > MAX_SIZE) {
+		ERROR_LOG(Log::GeDebugger, "GE dump section too large: %llu bytes", (unsigned long long)sz);
+		return false;
+	} else if (version < 5) {
+		size_t declared = 0;
+		if (snappy_uncompressed_length((const char *)compressed.data(), compressed_size, &declared) != SNAPPY_OK || declared != sz) {
+			return false;
+		}
+	} else {
+		// Some older recorders left the size out of the frame.
+		const unsigned long long declared = ZSTD_getFrameContentSize(compressed.data(), compressed_size);
+		if (declared != ZSTD_CONTENTSIZE_UNKNOWN && declared != sz) {
+			return false;
+		}
+	}
+
+	dest.resize(count);
+	size_t real_size = (size_t)sz;
+	if (version < 5) {
+		if (snappy_uncompress((const char *)compressed.data(), compressed_size, (char *)dest.data(), &real_size) != SNAPPY_OK)
+			return false;
+	} else {
+		real_size = ZSTD_decompress(dest.data(), real_size, compressed.data(), compressed_size);
+	}
 	return real_size == sz;
+}
+
+static bool ValidateReplayCommands(const std::vector<Command> &commands, const std::vector<u8> &pushbuf) {
+	for (size_t i = 0; i < commands.size(); ++i) {
+		const Command &cmd = commands[i];
+		u32 minSize;
+		switch (cmd.type) {
+		case CommandType::INIT:
+			minSize = 512 * sizeof(u32);
+			break;
+		case CommandType::CLUTADDR:
+			minSize = 2 * sizeof(u32);
+			break;
+		case CommandType::MEMSET:
+		case CommandType::DISPLAY:
+			minSize = 3 * sizeof(u32);
+			break;
+		case CommandType::MEMCPYDEST:
+		case CommandType::EDRAMTRANS:
+			minSize = sizeof(u32);
+			break;
+		case CommandType::FRAMEBUF0:
+		case CommandType::FRAMEBUF1:
+		case CommandType::FRAMEBUF2:
+		case CommandType::FRAMEBUF3:
+		case CommandType::FRAMEBUF4:
+		case CommandType::FRAMEBUF5:
+		case CommandType::FRAMEBUF6:
+		case CommandType::FRAMEBUF7:
+			minSize = 4 * sizeof(u32);
+			break;
+		// Any size, including none (version 2 dumps have empty VERTICES and CLUT commands).
+		case CommandType::REGISTERS:
+		case CommandType::VERTICES:
+		case CommandType::INDICES:
+		case CommandType::CLUT:
+		case CommandType::TRANSFERSRC:
+		case CommandType::MEMCPYDATA:
+		case CommandType::TEXTURE0:
+		case CommandType::TEXTURE1:
+		case CommandType::TEXTURE2:
+		case CommandType::TEXTURE3:
+		case CommandType::TEXTURE4:
+		case CommandType::TEXTURE5:
+		case CommandType::TEXTURE6:
+		case CommandType::TEXTURE7:
+			minSize = 0;
+			break;
+		default:
+			ERROR_LOG(Log::GeDebugger, "Unsupported GE dump command: %d", (int)cmd.type);
+			return false;
+		}
+
+		// Old recorders didn't align anything, so only the range and size are checked.
+		if (cmd.ptr > pushbuf.size() || cmd.sz > pushbuf.size() - cmd.ptr || cmd.sz < minSize) {
+			ERROR_LOG(Log::GeDebugger, "Invalid GE dump command %d: type %d, offset %u, size %u",
+				(int)i, (int)cmd.type, cmd.ptr, cmd.sz);
+			return false;
+		}
+	}
+	return true;
 }
 
 static u32 LoadReplay(const std::string &filename) {
@@ -853,11 +1334,12 @@ static u32 LoadReplay(const std::string &filename) {
 	g_cancelled = false;
 
 	u32 fp = pspFileSystem.OpenFile(filename, FILEACCESS_READ);
-	Header header;
-	pspFileSystem.ReadFile(fp, (u8 *)&header, sizeof(header));
+	const u64 fileSize = pspFileSystem.GetFileInfoByHandle(fp).size;
+	Header header{};
+	const size_t headerRead = pspFileSystem.ReadFile(fp, (u8 *)&header, sizeof(header));
 	u32 version = header.version;
 
-	if (memcmp(header.magic, HEADER_MAGIC, sizeof(header.magic)) != 0 || header.version > VERSION || header.version < MIN_VERSION) {
+	if (headerRead != sizeof(header) || memcmp(header.magic, HEADER_MAGIC, sizeof(header.magic)) != 0 || header.version > VERSION || header.version < MIN_VERSION) {
 		ERROR_LOG(Log::GeDebugger, "Invalid GE dump or unsupported version");
 		pspFileSystem.CloseFile(fp);
 		return 0;
@@ -867,13 +1349,14 @@ static u32 LoadReplay(const std::string &filename) {
 		memset(header.gameID, 0, sizeof(header.gameID));
 	}
 
-	size_t gameIDLength = strnlen(header.gameID, sizeof(header.gameID));
-	if (gameIDLength != 0) {
-		g_paramSFO.SetValue("DISC_ID", std::string(header.gameID, gameIDLength), (int)sizeof(header.gameID));
+	const std::string gameID(header.gameID, strnlen(header.gameID, sizeof(header.gameID)));
+	// The ID picks the texture pack directory, among other things.
+	if (IsSafePathComponent(gameID)) {
+		g_paramSFO.SetValue("DISC_ID", gameID, (int)sizeof(header.gameID));
 		std::vector<GameDBInfo> info;
 		std::string gameTitle = "(unknown title)";
 #if !defined(__LIBRETRO__)
-		if (g_gameDB.GetGameInfos(header.gameID, &info)) {
+		if (g_gameDB.GetGameInfos(gameID, &info)) {
 			gameTitle = info[0].title;
 			g_paramSFO.SetValue("TITLE", gameTitle, (int)gameTitle.size());
 		}
@@ -888,17 +1371,18 @@ static u32 LoadReplay(const std::string &filename) {
 	u32 bufsz = 0;
 	pspFileSystem.ReadFile(fp, (u8 *)&bufsz, sizeof(bufsz));
 
-	lastExecCommands.resize(sz);
-	lastExecPushbuf.resize(bufsz);
-
 	bool truncated = false;
-	truncated = truncated || !ReadCompressed(fp, lastExecCommands.data(), sizeof(Command) * sz, header.version);
-	truncated = truncated || !ReadCompressed(fp, lastExecPushbuf.data(), bufsz, header.version);
+	truncated = truncated || !ReadCompressed(fp, fileSize, lastExecCommands, sz, header.version);
+	truncated = truncated || !ReadCompressed(fp, fileSize, lastExecPushbuf, bufsz, header.version);
 
 	pspFileSystem.CloseFile(fp);
 
 	if (truncated) {
 		ERROR_LOG(Log::GeDebugger, "Truncated GE dump detected - can't replay");
+		return 0;
+	}
+	if (!ValidateReplayCommands(lastExecCommands, lastExecPushbuf)) {
+		ERROR_LOG(Log::GeDebugger, "Invalid GE dump commands detected - can't replay");
 		return 0;
 	}
 

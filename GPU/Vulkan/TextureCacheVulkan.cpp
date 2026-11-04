@@ -55,60 +55,6 @@ using namespace PPSSPP_VK;
 #define TEXCACHE_MAX_SLAB_SIZE (32 * 1024 * 1024)
 #define TEXCACHE_SLAB_PRESSURE 4
 
-const char *uploadShader = R"(
-#version 450
-#extension GL_ARB_separate_shader_objects : enable
-
-// 8x8 is the most common compute shader workgroup size, and works great on all major
-// hardware vendors. TODO: However, we should probably change to 16x16, as Qualcomm now has
-// support for bigger groups...
-layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
-
-uniform layout(set = 0, binding = 0, rgba8) writeonly image2D img;
-
-layout(std430, set = 0, binding = 1) buffer Buf {
-	uint data[];
-} buf;
-
-layout(push_constant) uniform Params {
-	int width;
-	int height;
-} params;
-
-// The cbuffer, if present, is self-declared for layout flexibility
-#define CBUFFER_SET 0
-#define CBUFFER_BINDING 4
-
-uint readColoru(uvec2 p) {
-	return buf.data[p.y * params.width + p.x];
-}
-
-vec4 readColorf(uvec2 p) {
-	// Unpack the color (we could look it up in a CLUT here if we wanted...)
-	// The imageStore repack is free.
-	return unpackUnorm4x8(readColoru(p));
-}
-
-void writeColorf(ivec2 p, vec4 c) {
-	imageStore(img, p, c);
-}
-
-%s
-
-// Note that main runs once per INPUT pixel, unlike the old model.
-void main() {
-	uvec2 xy = gl_GlobalInvocationID.xy;
-	// Kill off any out-of-image threads to avoid stray writes.
-	// Should only happen on the tiniest mipmaps as PSP textures are power-of-2,
-	// and we use a 8x8 workgroup size. Probably not really necessary.
-	if (xy.x >= params.width || xy.y >= params.height)
-		return;
-	// applyScaling will write the upscaled pixels, using writeColorf above.
-	// It's expected to write a square of scale*scale pixels, at the location xy*scale.
-	applyScaling(xy);
-}
-
-)";
 
 static int VkFormatBytesPerPixel(VkFormat format) {
 	switch (format) {
@@ -143,7 +89,7 @@ VkSampler SamplerCache::GetOrCreateSampler(const SamplerCacheKey &key) {
 
 	if (key.aniso) {
 		// Docs say the min of this value and the supported max are used.
-		samp.maxAnisotropy = 1 << g_Config.iAnisotropyLevel;
+		samp.maxAnisotropy = 1 << key.anisoLevel;
 		samp.anisotropyEnable = true;
 	} else {
 		samp.maxAnisotropy = 1.0f;
@@ -301,31 +247,7 @@ bool TextureCacheVulkan::CompileMultipassShader(VulkanContext *vulkan, const Tex
 	if (!shaderInfo.computeShaderFiles.empty()) {
 		shaderFiles = shaderInfo.computeShaderFiles;
 	}
-	if (shaderInfo.scaleFactor == 2) {
-		multipassScratchDescs_ = {
-			{ "nnedi3_vertical", 1, 2 },
-			{ "nnedi3_horizontal", 2, 2 },
-		};
-		multipassStageDescs_ = {
-			{ 0, -1, 0, 1, 1, 1, 2, false },
-			{ 1, 0, 1, 1, 2, 2, 2, false },
-			{ 2, 1, -1, 2, 2, 2, 2, false },
-		};
-	} else if (shaderInfo.scaleFactor == 4) {
-		multipassScratchDescs_ = {
-			{ "nnedi3_vertical", 1, 2 },
-			{ "nnedi3_horizontal", 2, 2 },
-			{ "nnedi3_vertical2", 2, 4 },
-			{ "nnedi3_horizontal2", 4, 4 },
-		};
-		multipassStageDescs_ = {
-			{ 0, -1, 0, 1, 1, 1, 2, false },
-			{ 2, 0, 1, 1, 2, 2, 2, false },
-			{ 1, 1, 2, 2, 2, 2, 4, false },
-			{ 2, 2, 3, 2, 4, 4, 4, false },
-			{ 3, 3, -1, 4, 4, 4, 4, true },
-		};
-	} else {
+	if (!GetTextureScaleMultipassLayout(shaderInfo.scaleFactor, &multipassScratchDescs_, &multipassStageDescs_)) {
 		ERROR_LOG(Log::G3D, "Unsupported multipass scale factor %d in section '%s'", shaderInfo.scaleFactor, shaderInfo.section.c_str());
 		return false;
 	}
@@ -395,7 +317,7 @@ void TextureCacheVulkan::CompileScalingShader() {
 		}
 	} else {
 		std::string shaderSource = ReadShaderSrc(shaderInfo->computeShaderFiles[0]);
-		std::string fullUploadShader = StringFromFormat(uploadShader, shaderSource.c_str());
+		std::string fullUploadShader = StringFromFormat(textureScaleUploadShader, shaderSource.c_str());
 		singlePassCS_ = CompileShaderModule(vulkan, VK_SHADER_STAGE_COMPUTE_BIT, fullUploadShader.c_str(), &error);
 		_dbg_assert_msg_(singlePassCS_ != VK_NULL_HANDLE, "failed to compile upload shader");
 		if (singlePassCS_ == VK_NULL_HANDLE)
@@ -685,7 +607,8 @@ void TextureCacheVulkan::BuildTexture(TexCacheEntry *const entry) {
 	VkFormat actualFmt = plan.scaleFactor > 1 ? VULKAN_8888_FORMAT : dstFmt;
 	bool bcFormat = false;
 	int bcAlign = 0;
-	if (plan.doReplace) {
+	// A replacement of indices for the GPU is uploaded as the CLUT8 format that dstFmt already is.
+	if (plan.doReplace && !plan.decodeToClut8) {
 		Draw::DataFormat fmt = plan.replaced->Format();
 		bcFormat = Draw::DataFormatIsBlockCompressed(fmt, &bcAlign);
 		actualFmt = ToVulkanFormat(fmt);
@@ -831,13 +754,16 @@ void TextureCacheVulkan::BuildTexture(TexCacheEntry *const entry) {
 			int rowLength = pixelStride;
 			if (bcFormat) {
 				// For block compressed formats, we just set the upload size to the data size..
-				uploadSize = plan.replaced->GetLevelDataSizeAfterCopy(plan.baseLevelSrc + i);
+				uploadSize = plan.replaced->GetLevelDataSizeAfterCopy(i);
 				rowLength = (mipWidth + 3) & ~3;
 			}
 			// Directly load the replaced image.
 			data = pushBuffer->Allocate(uploadSize, pushAlignment, &texBuf, &bufferOffset);
 			double replaceStart = time_now_d();
-			if (!plan.replaced->CopyLevelTo(plan.baseLevelSrc + i, (uint8_t *)data, uploadSize, byteStride)) {  // If plan.doReplace, this shouldn't fail.
+			const bool copied = plan.decodeToClut8 ?
+				plan.replaced->CopyIndexLevelToPitched(i, (uint8_t *)data, uploadSize, byteStride) :
+				plan.replaced->CopyLevelTo(i, (uint8_t *)data, uploadSize, byteStride);
+			if (!copied) {  // If plan.doReplace, this shouldn't fail.
 				WARN_LOG(Log::G3D, "Failed to copy replaced texture level");
 				// TODO: Fill with some pattern?
 			}
@@ -858,7 +784,18 @@ void TextureCacheVulkan::BuildTexture(TexCacheEntry *const entry) {
 				VkImageView view = entry->vkTex->CreateViewForMip(i);
 				VK_PROFILE_BEGIN(vulkan, cmdInit, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
 					"Compute Upload: %dx%d->%dx%d", mipUnscaledWidth, mipUnscaledHeight, mipWidth, mipHeight);
-				ScaleBufferToImage(vulkan, cmdInit, view, texBuf, bufferOffset, srcSize, mipUnscaledWidth, mipUnscaledHeight, mipWidth, mipHeight);
+				if (!ScaleBufferToImage(vulkan, cmdInit, view, texBuf, bufferOffset, srcSize, mipUnscaledWidth, mipUnscaledHeight, mipWidth, mipHeight)) {
+					// Nothing was written to this level. Clear it rather than leave garbage in it.
+					WARN_LOG_ONCE(vkscalefail, Log::G3D, "Hardware texture scaling failed, clearing the texture");
+					VkClearColorValue clear{};
+					VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)i, 1, 0, 1 };
+					vkCmdClearColorImage(cmdInit, entry->vkTex->GetImage(), VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+					// The barrier at the end of the upload waits on compute, so order the clear before that.
+					VkMemoryBarrier barrier{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+					barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+					barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+					vkCmdPipelineBarrier(cmdInit, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+				}
 				VK_PROFILE_END(vulkan, cmdInit, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 				vulkan->Delete().QueueDeleteImageView(view);
 			} else {
@@ -878,7 +815,7 @@ void TextureCacheVulkan::BuildTexture(TexCacheEntry *const entry) {
 				replacedInfo.isVideo = IsVideo(entry->addr);
 				replacedInfo.isFinal = (entry->status & TexStatus::TO_SCALE) == 0;
 				replacedInfo.fmt = FromVulkanFormat(actualFmt);
-				replacer_.NotifyTextureDecoded(plan.replaced, replacedInfo, data, stride, plan.baseLevelSrc + i, mipUnscaledWidth, mipUnscaledHeight, w, h);
+				replacer_.NotifyTextureDecoded(plan.replaced, replacedInfo, data, stride, i, mipUnscaledWidth, mipUnscaledHeight, w, h);
 			}
 		}
 	}
@@ -903,7 +840,7 @@ void TextureCacheVulkan::BuildTexture(TexCacheEntry *const entry) {
 		VK_PROFILE_END(vulkan, cmdInit, VK_PIPELINE_STAGE_TRANSFER_BIT);
 	}
 
-	entry->vkTex->EndCreate(cmdInit, false, prevStage, layout);
+	entry->vkTex->EndCreate(cmdInit, prevStage, layout);
 	VK_PROFILE_END(vulkan, cmdInit, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
 
 	// Signal that we support depth textures so use it as one.

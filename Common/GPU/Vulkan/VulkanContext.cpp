@@ -15,7 +15,10 @@
 #if PPSSPP_PLATFORM(SWITCH)
 #include "Common/GPU/Vulkan/SwitchLSFG.h"
 #endif
+#include "Common/GPU/Vulkan/FixedSPIRVCache.h"
 #include "Common/StringUtils.h"
+#include "Common/File/FileUtil.h"
+#include "ext/xxhash.h"
 
 #ifdef USE_CRT_DBG
 #undef new
@@ -240,8 +243,17 @@ VkResult VulkanContext::CreateInstance(const CreateInfo &info) {
 	inst_info.enabledExtensionCount = (uint32_t)instance_extensions_enabled_.size();
 	inst_info.ppEnabledExtensionNames = instance_extensions_enabled_.size() ? instance_extensions_enabled_.data() : nullptr;
 
-#if PPSSPP_PLATFORM(IOS_APP_STORE)
+#if PPSSPP_VK_STATIC
 	inst_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#elif PPSSPP_PLATFORM(MAC)
+	// Through the Khronos loader (like the SDK's, for the validation layers), MoltenVK is only
+	// listed if we ask for portability drivers.
+	if (IsInstanceExtensionAvailable(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+		instance_extensions_enabled_.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+		inst_info.enabledExtensionCount = (uint32_t)instance_extensions_enabled_.size();
+		inst_info.ppEnabledExtensionNames = instance_extensions_enabled_.data();
+		inst_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+	}
 #endif
 
 #if SIMULATE_VULKAN_FAILURE == 2
@@ -469,6 +481,7 @@ void VulkanContext::DestroySwapchain() {
 		swapchain_ = VK_NULL_HANDLE;
 	}
 	swapchainInited_ = false;
+	swapchainTransformMismatch_ = false;
 }
 
 void VulkanContext::DestroySurface() {
@@ -761,6 +774,8 @@ VkResult VulkanContext::CreateDevice(int physical_device, const std::vector<cons
 	}
 
 	extensionsLookup_.EXT_provoking_vertex = EnableDeviceExtension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, 0);
+	// Required to be enabled where it exists (MoltenVK). Tells what Metal can't do.
+	extensionsLookup_.KHR_portability_subset = EnableDeviceExtension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME, 0);
 	if (extensionsLookup_.KHR_get_surface_capabilities2) {
 #ifdef VK_EXT_full_screen_exclusive
 		extensionsLookup_.EXT_full_screen_exclusive = EnableDeviceExtension(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME, 0);
@@ -782,6 +797,7 @@ VkResult VulkanContext::CreateDevice(int physical_device, const std::vector<cons
 		VkPhysicalDeviceProvokingVertexFeaturesEXT provokingVertexFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROVOKING_VERTEX_FEATURES_EXT };
 		VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR presentModeFifoProps{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR};
 		VkPhysicalDeviceScalarBlockLayoutFeatures scalarBlockLayoutFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES};
+		VkPhysicalDevicePortabilitySubsetFeaturesKHR portabilitySubsetFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR };
 
 		ChainStruct(features2, &multiViewFeatures);
 		if (extensionsLookup_.KHR_present_wait) {
@@ -798,6 +814,9 @@ VkResult VulkanContext::CreateDevice(int physical_device, const std::vector<cons
 		}
 		if (extensionsLookup_.EXT_scalar_block_layout) {
 			ChainStruct(features2, &scalarBlockLayoutFeatures);
+		}
+		if (extensionsLookup_.KHR_portability_subset) {
+			ChainStruct(features2, &portabilitySubsetFeatures);
 		}
 		vkGetPhysicalDeviceFeatures2(physical_devices_[physical_device_], &features2);
 		deviceFeatures_.available.standard = features2.features;
@@ -816,6 +835,9 @@ VkResult VulkanContext::CreateDevice(int physical_device, const std::vector<cons
 		}
 		if (extensionsLookup_.KHR_present_mode_fifo_latest_ready) {
 			deviceFeatures_.available.presentModeFifoProps = presentModeFifoProps;
+		}
+		if (extensionsLookup_.KHR_portability_subset) {
+			deviceFeatures_.available.portabilitySubset = portabilitySubsetFeatures;
 		}
 	} else {
 		vkGetPhysicalDeviceFeatures(physical_devices_[physical_device_], &deviceFeatures_.available.standard);
@@ -876,6 +898,13 @@ VkResult VulkanContext::CreateDevice(int physical_device, const std::vector<cons
 		deviceFeatures_.enabled.scalarBlockLayout.scalarBlockLayout = deviceFeatures_.available.scalarBlockLayout.scalarBlockLayout;
 	}
 
+	// What MoltenVK can do of what full Vulkan can (like image view swizzles). Using any of it needs it enabled.
+	deviceFeatures_.enabled.portabilitySubset = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR };
+	if (extensionsLookup_.KHR_portability_subset) {
+		deviceFeatures_.enabled.portabilitySubset = deviceFeatures_.available.portabilitySubset;
+		deviceFeatures_.enabled.portabilitySubset.pNext = nullptr;
+	}
+
 	// deviceFeatures_.enabled.multiview.multiviewGeometryShader = deviceFeatures_.available.multiview.multiviewGeometryShader;
 
 	VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
@@ -913,6 +942,9 @@ VkResult VulkanContext::CreateDevice(int physical_device, const std::vector<cons
 		SwitchLSFG_PrepareDeviceFeatures(physical_devices_[physical_device_], featureChain, lsfgTimelineFeature);
 		features2.pNext = featureChain;
 #endif
+		if (extensionsLookup_.KHR_portability_subset) {
+			ChainStruct(features2, &deviceFeatures_.enabled.portabilitySubset);
+		}
 	} else {
 		device_info.pEnabledFeatures = &deviceFeatures_.enabled.standard;
 	}
@@ -1061,37 +1093,29 @@ VkResult VulkanContext::InitSurface(WindowSystem winsys, void *data1, void *data
 	return ReinitSurface();
 }
 
-VkResult VulkanContext::ReinitSurface() {
-	if (surface_ != VK_NULL_HANDLE) {
-		INFO_LOG(Log::G3D, "Destroying Vulkan surface (%d, %d)", swapChainExtent_.width, swapChainExtent_.height);
-		vkDestroySurfaceKHR(instance_, surface_, nullptr);
-		surface_ = VK_NULL_HANDLE;
-	}
+VkResult VulkanContext::CreateSurface(WindowSystem winsys, void *data1, void *data2, VkSurfaceKHR *surface) {
+	VkResult retval = VK_SUCCESS;
 
-	INFO_LOG(Log::G3D, "Creating Vulkan surface for window (winsys=%s data1=%p data2=%p)", WindowSystemToString(winsys_), winsysData1_, winsysData2_);
-
-		VkResult retval = VK_SUCCESS;
-
-	switch (winsys_) {
+	switch (winsys) {
 #ifdef _WIN32
 	case WINDOWSYSTEM_WIN32:
 	{
 		VkWin32SurfaceCreateInfoKHR win32{ VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
 		win32.flags = 0;
-		win32.hinstance = (HINSTANCE)winsysData1_;
-		win32.hwnd = (HWND)winsysData2_;
-		retval = vkCreateWin32SurfaceKHR(instance_, &win32, nullptr, &surface_);
+		win32.hinstance = (HINSTANCE)data1;
+		win32.hwnd = (HWND)data2;
+		retval = vkCreateWin32SurfaceKHR(instance_, &win32, nullptr, surface);
 		break;
 	}
 #endif
 #if defined(__ANDROID__)
 	case WINDOWSYSTEM_ANDROID:
 	{
-		ANativeWindow *wnd = (ANativeWindow *)winsysData1_;
+		ANativeWindow *wnd = (ANativeWindow *)data1;
 		VkAndroidSurfaceCreateInfoKHR android{ VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
 		android.flags = 0;
 		android.window = wnd;
-		retval = vkCreateAndroidSurfaceKHR(instance_, &android, nullptr, &surface_);
+		retval = vkCreateAndroidSurfaceKHR(instance_, &android, nullptr, surface);
 		break;
 	}
 #endif
@@ -1117,9 +1141,9 @@ VkResult VulkanContext::ReinitSurface() {
 	{
 		VkMetalSurfaceCreateInfoEXT metal{ VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT };
 		metal.flags = 0;
-		metal.pLayer = winsysData1_;
-		metal.pNext = winsysData2_;
-		retval = vkCreateMetalSurfaceEXT(instance_, &metal, nullptr, &surface_);
+		metal.pLayer = data1;
+		metal.pNext = data2;
+		retval = vkCreateMetalSurfaceEXT(instance_, &metal, nullptr, surface);
 		break;
 	}
 #endif
@@ -1128,9 +1152,9 @@ VkResult VulkanContext::ReinitSurface() {
 	{
 		VkXlibSurfaceCreateInfoKHR xlib{ VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR };
 		xlib.flags = 0;
-		xlib.dpy = (Display *)winsysData1_;
-		xlib.window = (Window)winsysData2_;
-		retval = vkCreateXlibSurfaceKHR(instance_, &xlib, nullptr, &surface_);
+		xlib.dpy = (Display *)data1;
+		xlib.window = (Window)data2;
+		retval = vkCreateXlibSurfaceKHR(instance_, &xlib, nullptr, surface);
 		break;
 	}
 #endif
@@ -1139,9 +1163,9 @@ VkResult VulkanContext::ReinitSurface() {
 	{
 		VkXCBSurfaceCreateInfoKHR xcb{ VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR };
 		xcb.flags = 0;
-		xcb.connection = (Connection *)winsysData1_;
-		xcb.window = (Window)(uintptr_t)winsysData2_;
-		retval = vkCreateXcbSurfaceKHR(instance_, &xcb, nullptr, &surface_);
+		xcb.connection = (Connection *)data1;
+		xcb.window = (Window)(uintptr_t)data2;
+		retval = vkCreateXcbSurfaceKHR(instance_, &xcb, nullptr, surface);
 		break;
 	}
 #endif
@@ -1150,9 +1174,9 @@ VkResult VulkanContext::ReinitSurface() {
 	{
 		VkWaylandSurfaceCreateInfoKHR wayland{ VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR };
 		wayland.flags = 0;
-		wayland.display = (wl_display *)winsysData1_;
-		wayland.surface = (wl_surface *)winsysData2_;
-		retval = vkCreateWaylandSurfaceKHR(instance_, &wayland, nullptr, &surface_);
+		wayland.display = (wl_display *)data1;
+		wayland.surface = (wl_surface *)data2;
+		retval = vkCreateWaylandSurfaceKHR(instance_, &wayland, nullptr, surface);
 		break;
 	}
 #endif
@@ -1342,15 +1366,28 @@ VkResult VulkanContext::ReinitSurface() {
 		delete [] plane_props;
 #endif
 		display.flags = 0;
-		retval = vkCreateDisplayPlaneSurfaceKHR(instance_, &display, nullptr, &surface_);
+		retval = vkCreateDisplayPlaneSurfaceKHR(instance_, &display, nullptr, surface);
 		break;
 	}
 #endif
 
 	default:
-		_assert_msg_(false, "Vulkan support for chosen window system (%s) not implemented", WindowSystemToString(winsys_));
+		_assert_msg_(false, "Vulkan support for chosen window system (%s) not implemented", WindowSystemToString(winsys));
 		return VK_ERROR_INITIALIZATION_FAILED;
 	}
+	return retval;
+}
+
+VkResult VulkanContext::ReinitSurface() {
+	if (surface_ != VK_NULL_HANDLE) {
+		INFO_LOG(Log::G3D, "Destroying Vulkan surface (%d, %d)", swapChainExtent_.width, swapChainExtent_.height);
+		vkDestroySurfaceKHR(instance_, surface_, nullptr);
+		surface_ = VK_NULL_HANDLE;
+	}
+
+	INFO_LOG(Log::G3D, "Creating Vulkan surface for window (winsys=%s data1=%p data2=%p)", WindowSystemToString(winsys_), winsysData1_, winsysData2_);
+
+	VkResult retval = CreateSurface(winsys_, winsysData1_, winsysData2_, &surface_);
 
 	if (retval != VK_SUCCESS) {
 		init_error_ = StringFromFormat("Failed to create a Vulkan surface for window system %s: %s", WindowSystemToString(winsys_), VulkanResultToString(retval));
@@ -1563,6 +1600,21 @@ bool VulkanContext::InitSwapchain(VkPresentModeKHR desiredPresentMode) {
 		}
 	}
 
+#if PPSSPP_PLATFORM(ANDROID)
+	// After an in-place rotation, the surface can report the new transform together with the previous
+	// orientation's extent. A Redmi 9A (PowerVR, Android 11) keeps doing it after surfaceChanged has given us the
+	// new size, so the swapchain stays wrong until the next rotation. The latest window size from surfaceChanged
+	// is current (g_display can lag behind it, until the render thread applies the resize), so if the extent is
+	// exactly that transposed, it's stale.
+	const VkExtent2D windowSize = cbGetDrawSize_ ? cbGetDrawSize_() : VkExtent2D{};
+	if (windowSize.width > 0 && windowSize.height > 0 && windowSize.width != windowSize.height &&
+		currentExtent.width == windowSize.height && currentExtent.height == windowSize.width) {
+		WARN_LOG(Log::G3D, "Surface extent %dx%d is the window transposed, probably stale after a rotation. Using %dx%d.",
+			currentExtent.width, currentExtent.height, windowSize.width, windowSize.height);
+		std::swap(currentExtent.width, currentExtent.height);
+	}
+#endif
+
 	swapChainExtent_.width = clamp(currentExtent.width, surfCapabilities_.minImageExtent.width, surfCapabilities_.maxImageExtent.width);
 	swapChainExtent_.height = clamp(currentExtent.height, surfCapabilities_.minImageExtent.height, surfCapabilities_.maxImageExtent.height);
 
@@ -1617,13 +1669,9 @@ bool VulkanContext::InitSwapchain(VkPresentModeKHR desiredPresentMode) {
 	g_display.rotation = DisplayRotation::ROTATE_0;
 	g_display.rot_matrix.setIdentity();
 
-	uint32_t allowedRotations = VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
-	// Hack: Don't allow 270 degrees pretransform (inverse landscape), it creates bizarre issues on some devices (see #15773).
-	allowedRotations &= ~VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR;
-
 	if (surfCapabilities_.currentTransform & (VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR | VK_SURFACE_TRANSFORM_INHERIT_BIT_KHR)) {
 		preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-	} else if (surfCapabilities_.currentTransform & allowedRotations) {
+	} else if (surfCapabilities_.currentTransform & (VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_180_BIT_KHR | VK_SURFACE_TRANSFORM_ROTATE_270_BIT_KHR)) {
 		// Normal, sensible rotations. Let's handle it.
 		preTransform = surfCapabilities_.currentTransform;
 		g_display.rot_matrix.setIdentity();
@@ -1649,6 +1697,8 @@ bool VulkanContext::InitSwapchain(VkPresentModeKHR desiredPresentMode) {
 		// Let the OS rotate the image (potentially slower on many Android devices)
 		preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 	}
+
+	swapchainTransformMismatch_ = preTransform != surfCapabilities_.currentTransform;
 
 	// Only log transforms if relevant.
 	if (surfCapabilities_.supportedTransforms != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
@@ -1842,8 +1892,188 @@ EShLanguage FindLanguage(const VkShaderStageFlagBits shader_type) {
 
 // Compile a given string containing GLSL into SPV for use by VK
 // Return value of false means an error was encountered.
+// Bump when glslang or its options change, so that nothing it compiled differently is used.
+static const uint32_t SPIRV_CACHE_VERSION = 2;
+static const uint32_t SPIRV_CACHE_MAGIC = 0x43565053;  // "SPVC"
+static const uint32_t SPIRV_MAGIC = 0x07230203;
+
+struct SPIRVCacheHeader {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t count;
+};
+
+struct SPIRVCacheEntryHeader {
+	uint32_t keyHash;
+	uint32_t keyLength;
+	uint32_t numWords;
+	uint32_t checksum;
+};
+
+SPIRVCache g_spirvCache;
+
+void SetFixedSPIRVCachePath(const Path &path, int maxEntries) {
+	g_spirvCache.SetPath(path, maxEntries);
+}
+
+void SaveFixedSPIRVCache() {
+	g_spirvCache.SaveIfDirty();
+}
+
+SPIRVCache::Key SPIRVCache::MakeKey(VkShaderStageFlagBits stage, GLSLVariant variant, const char *source) {
+	const size_t length = strlen(source);
+	const uint32_t seed = (SPIRV_CACHE_VERSION << 16) | ((uint32_t)stage << 4) | (uint32_t)variant;
+	return Key{ XXH32(source, length, seed), (uint32_t)length };
+}
+
+bool SPIRVCache::Lookup(VkShaderStageFlagBits stage, GLSLVariant variant, const char *source, std::vector<uint32_t> *spirv) {
+	const Key key = MakeKey(stage, variant, source);
+	std::lock_guard<std::mutex> guard(mutex_);
+	LoadIfNeededLocked();
+	auto iter = entries_.find(key);
+	if (iter == entries_.end()) {
+		return false;
+	}
+	iter->second.used = true;
+	*spirv = iter->second.spirv;
+	return true;
+}
+
+void SPIRVCache::Insert(VkShaderStageFlagBits stage, GLSLVariant variant, const char *source, const std::vector<uint32_t> &spirv) {
+	const Key key = MakeKey(stage, variant, source);
+	std::lock_guard<std::mutex> guard(mutex_);
+	Entry &entry = entries_[key];
+	entry.spirv = spirv;
+	entry.used = true;
+	dirty_ = true;
+}
+
+void SPIRVCache::Clear() {
+	std::lock_guard<std::mutex> guard(mutex_);
+	entries_.clear();
+	dirty_ = false;
+}
+
+bool SPIRVCache::Read(FILE *f) {
+	std::lock_guard<std::mutex> guard(mutex_);
+	return ReadLocked(f);
+}
+
+// A bad entry is dropped rather than failing the whole read: it's only a cache, and the shader
+// gets compiled again. A truncated file keeps what came before the damage.
+bool SPIRVCache::ReadLocked(FILE *f) {
+	entries_.clear();
+	dirty_ = false;
+	SPIRVCacheHeader header{};
+	if (fread(&header, sizeof(header), 1, f) != 1 || header.magic != SPIRV_CACHE_MAGIC) {
+		return false;
+	}
+	if (header.version != SPIRV_CACHE_VERSION) {
+		INFO_LOG(Log::G3D, "SPIR-V cache version %d, expected %d - starting over", header.version, SPIRV_CACHE_VERSION);
+		return false;
+	}
+	for (uint32_t i = 0; i < header.count; i++) {
+		SPIRVCacheEntryHeader entryHeader{};
+		if (fread(&entryHeader, sizeof(entryHeader), 1, f) != 1 || entryHeader.numWords == 0 || entryHeader.numWords > 1024 * 1024) {
+			WARN_LOG(Log::G3D, "SPIR-V cache truncated or damaged after %d entries", i);
+			return false;
+		}
+		std::vector<uint32_t> spirv(entryHeader.numWords);
+		if (fread(spirv.data(), sizeof(uint32_t), spirv.size(), f) != spirv.size()) {
+			WARN_LOG(Log::G3D, "SPIR-V cache truncated after %d entries", i);
+			return false;
+		}
+		if (spirv[0] != SPIRV_MAGIC || (uint32_t)XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t)) != entryHeader.checksum) {
+			WARN_LOG(Log::G3D, "Bad entry in SPIR-V cache, skipping");
+			continue;
+		}
+		entries_[Key{ entryHeader.keyHash, entryHeader.keyLength }].spirv = std::move(spirv);
+	}
+	return true;
+}
+
+bool SPIRVCache::Write(FILE *f, bool onlyUsed) {
+	std::lock_guard<std::mutex> guard(mutex_);
+	SPIRVCacheHeader header{ SPIRV_CACHE_MAGIC, SPIRV_CACHE_VERSION, 0 };
+	for (const auto &[key, entry] : entries_) {
+		if (entry.used || !onlyUsed) {
+			header.count++;
+		}
+	}
+	bool ok = fwrite(&header, sizeof(header), 1, f) == 1;
+	for (const auto &[key, entry] : entries_) {
+		if (!ok) {
+			break;
+		}
+		if (!entry.used && onlyUsed) {
+			continue;
+		}
+		SPIRVCacheEntryHeader entryHeader{};
+		entryHeader.keyHash = key.hash;
+		entryHeader.keyLength = key.length;
+		entryHeader.numWords = (uint32_t)entry.spirv.size();
+		entryHeader.checksum = (uint32_t)XXH3_64bits(entry.spirv.data(), entry.spirv.size() * sizeof(uint32_t));
+		ok = fwrite(&entryHeader, sizeof(entryHeader), 1, f) == 1 &&
+			fwrite(entry.spirv.data(), sizeof(uint32_t), entry.spirv.size(), f) == entry.spirv.size();
+	}
+	if (ok) {
+		dirty_ = false;
+	}
+	return ok;
+}
+
+void SPIRVCache::SetPath(const Path &path, int maxEntries) {
+	std::lock_guard<std::mutex> guard(mutex_);
+	path_ = path;
+	maxEntries_ = maxEntries;
+	loaded_ = false;
+}
+
+void SPIRVCache::LoadIfNeededLocked() {
+	if (loaded_ || path_.empty()) {
+		return;
+	}
+	loaded_ = true;
+	FILE *f = File::OpenCFile(path_, "rb");
+	if (f) {
+		ReadLocked(f);
+		fclose(f);
+		INFO_LOG(Log::G3D, "Loaded %d shaders from the SPIR-V cache", (int)entries_.size());
+	}
+	// Entries for shaders that have since changed pile up, so start over once there are a lot of
+	// them. A few shaders compiling once more doesn't matter.
+	if (maxEntries_ > 0 && (int)entries_.size() >= maxEntries_) {
+		INFO_LOG(Log::G3D, "SPIR-V cache has %d entries, flushing it", (int)entries_.size());
+		entries_.clear();
+		dirty_ = true;
+	}
+}
+
+void SPIRVCache::SaveIfDirty() {
+	Path path;
+	{
+		std::lock_guard<std::mutex> guard(mutex_);
+		if (!dirty_ || path_.empty()) {
+			return;
+		}
+		path = path_;
+	}
+	FILE *f = File::OpenCFile(path, "wb");
+	if (!f) {
+		return;
+	}
+	// A small fixed set of shaders, so keep everything - including ones this run didn't need.
+	if (!Write(f, false)) {
+		ERROR_LOG(Log::G3D, "Failed to write the SPIR-V cache, disk full?");
+	}
+	fclose(f);
+}
+
 bool GLSLtoSPV(const VkShaderStageFlagBits shader_type, const char *sourceCode, GLSLVariant variant,
-			   std::vector<unsigned int> &spirv, std::string *errorMessage) {
+			   std::vector<unsigned int> &spirv, std::string *errorMessage, SPIRVCache *cache) {
+	if (cache && cache->Lookup(shader_type, variant, sourceCode, &spirv)) {
+		return true;
+	}
 
 	glslang::TProgram program;
 	const char *shaderStrings[1];
@@ -1912,6 +2142,9 @@ bool GLSLtoSPV(const VkShaderStageFlagBits shader_type, const char *sourceCode, 
 	options.optimizeSize = false;
 	options.generateDebugInfo = false;
 	glslang::GlslangToSpv(*program.getIntermediate(stage), spirv, &options);
+	if (cache && !spirv.empty()) {
+		cache->Insert(shader_type, variant, sourceCode, spirv);
+	}
 	return true;
 }
 

@@ -78,7 +78,7 @@ static const IRMeta irMeta[] = {
 	{ IROp::Ext16to32, "Ext16to32", "GG" },
 	{ IROp::ReverseBits, "ReverseBits", "GG" },
 	{ IROp::Load8, "Load8", "GGC" },
-	{ IROp::Load8Ext, "Load8", "GGC" },
+	{ IROp::Load8Ext, "Load8Ext", "GGC" },
 	{ IROp::Load16, "Load16", "GGC" },
 	{ IROp::Load16Ext, "Load16Ext", "GGC" },
 	{ IROp::Load32, "Load32", "GGC" },
@@ -95,6 +95,15 @@ static const IRMeta irMeta[] = {
 	{ IROp::Store32Conditional, "Store32Conditional", "GGC", IRFLAG_SRC3DST },
 	{ IROp::StoreFloat, "StoreFloat", "FGC", IRFLAG_SRC3 },
 	{ IROp::StoreVec4, "StoreVec4", "VGC", IRFLAG_SRC3 },
+	// Barriers: a hardware register access has side effects, and mustn't move or merge.
+	{ IROp::LoadKernel8, "LoadKernel8", "GGC", IRFLAG_BARRIER },
+	{ IROp::LoadKernel8Ext, "LoadKernel8Ext", "GGC", IRFLAG_BARRIER },
+	{ IROp::LoadKernel16, "LoadKernel16", "GGC", IRFLAG_BARRIER },
+	{ IROp::LoadKernel16Ext, "LoadKernel16Ext", "GGC", IRFLAG_BARRIER },
+	{ IROp::LoadKernel32, "LoadKernel32", "GGC", IRFLAG_BARRIER },
+	{ IROp::StoreKernel8, "StoreKernel8", "GGC", IRFLAG_SRC3 | IRFLAG_BARRIER },
+	{ IROp::StoreKernel16, "StoreKernel16", "GGC", IRFLAG_SRC3 | IRFLAG_BARRIER },
+	{ IROp::StoreKernel32, "StoreKernel32", "GGC", IRFLAG_SRC3 | IRFLAG_BARRIER },
 	{ IROp::FAdd, "FAdd", "FFF" },
 	{ IROp::FSub, "FSub", "FFF" },
 	{ IROp::FMul, "FMul", "FFF" },
@@ -105,10 +114,14 @@ static const IRMeta irMeta[] = {
 	{ IROp::FSqrt, "FSqrt", "FF" },
 	{ IROp::FSin, "FSin", "FF" },
 	{ IROp::FCos, "FCos", "FF" },
-	{ IROp::FSqrt, "FSqrt", "FF" },
 	{ IROp::FRSqrt, "FRSqrt", "FF" },
 	{ IROp::FRecip, "FRecip", "FF" },
 	{ IROp::FAsin, "FAsin", "FF" },
+	{ IROp::FVSqrt, "FVSqrt", "FF" },
+	{ IROp::FExp2, "FExp2", "FF" },
+	{ IROp::FLog2, "FLog2", "FF" },
+	{ IROp::FHalfToFloat, "FHalfToFloat", "FFI" },
+	{ IROp::FSinCos, "FSinCos", "2F" },
 	{ IROp::FNeg, "FNeg", "FF" },
 	{ IROp::FSign, "FSign", "FF" },
 	{ IROp::FAbs, "FAbs", "FF" },
@@ -127,6 +140,12 @@ static const IRMeta irMeta[] = {
 	{ IROp::FMovToGPR, "FMovToGPR", "GF" },
 	{ IROp::OptFMovToGPRShr8, "OptFMovToGPRShr8", "GF" },
 	{ IROp::OptFCvtSWFromGPR, "OptFCvtSWFromGPR", "FG" },
+	{ IROp::OptExitToConstIfEqElse, "OptExitIfEqElse", "CGG", IRFLAG_EXIT },
+	{ IROp::OptExitToConstIfNeqElse, "OptExitIfNeqElse", "CGG", IRFLAG_EXIT },
+	{ IROp::OptExitToConstIfGtZElse, "OptExitIfGtZElse", "CG", IRFLAG_EXIT },
+	{ IROp::OptExitToConstIfGeZElse, "OptExitIfGeZElse", "CG", IRFLAG_EXIT },
+	{ IROp::OptExitToConstIfLtZElse, "OptExitIfLtZElse", "CG", IRFLAG_EXIT },
+	{ IROp::OptExitToConstIfLeZElse, "OptExitIfLeZElse", "CG", IRFLAG_EXIT },
 	{ IROp::FpCondFromReg, "FpCondFromReg", "_G" },
 	{ IROp::FpCondToReg, "FpCondToReg", "G" },
 	{ IROp::FpCtrlFromReg, "FpCtrlFromReg", "_G" },
@@ -147,9 +166,15 @@ static const IRMeta irMeta[] = {
 	{ IROp::Vec4Div, "Vec4Div", "VVV" },
 	{ IROp::Vec4Mul, "Vec4Mul", "VVV" },
 	{ IROp::Vec4Scale, "Vec4Scale", "VVF" },
-	{ IROp::Vec4Dot, "Vec4Dot", "FVV" },
+	{ IROp::Vec4VfpuDot, "Vec4VfpuDot", "FVV" },
+	{ IROp::Vec4VfpuMultiDot, "Vec4VfpuMultiDot", "VMVc" },
 	{ IROp::Vec4Neg, "Vec4Neg", "VV" },
 	{ IROp::Vec4Abs, "Vec4Abs", "VV" },
+	{ IROp::Vec4Min, "Vec4Min", "VVV" },
+	{ IROp::Vec4Max, "Vec4Max", "VVV" },
+	{ IROp::Vec4Slt, "Vec4Slt", "VVV" },
+	{ IROp::Vec4Sge, "Vec4Sge", "VVV" },
+	{ IROp::Vec4CvtScaledSW, "Vec4CvtScaledSW", "VVI" },
 
 		// Pack/Unpack
 	{ IROp::Vec2Unpack16To31, "Vec2Unpack16To31", "2F" },  // Note that the result is shifted down by 1, hence 31
@@ -157,8 +182,6 @@ static const IRMeta irMeta[] = {
 	{ IROp::Vec4Unpack8To32, "Vec4Unpack8To32", "VF" },
 	{ IROp::Vec4DuplicateUpperBitsAndShift1, "Vec4DuplicateUpperBitsAndShift1", "VV" },
 
-	{ IROp::Vec4ClampToZero, "Vec4ClampToZero", "VV" },
-	{ IROp::Vec2ClampToZero, "Vec2ClampToZero", "22" },
 	{ IROp::Vec4Pack32To8, "Vec4Pack32To8", "FV" },
 	{ IROp::Vec4Pack31To8, "Vec4Pack31To8", "FV" },
 	{ IROp::Vec2Pack32To16, "Vec2Pack32To16", "F2" },
@@ -309,6 +332,9 @@ void DisassembleParam(char *buf, int bufSize, u8 param, char type, u32 constant)
 		} else {
 			snprintf(buf, bufSize, "f%d..f%d", param, param + 3);
 		}
+		break;
+	case 'M':
+		snprintf(buf, bufSize, "vf%d..vf%d", param - 32, param - 32 + 15);
 		break;
 	case '2':
 		if (param >= 32) {

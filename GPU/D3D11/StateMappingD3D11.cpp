@@ -140,10 +140,7 @@ void DrawEngineD3D11::ApplyDrawState(int prim) {
 			keys_.blend.value = 0;  // full wipe
 			keys_.blend.blendEnable = false;
 			dynState_.useBlendColor = false;
-			// Color Test
-			bool alphaMask = gstate.isClearModeAlphaMask();
-			bool colorMask = gstate.isClearModeColorMask();
-			keys_.blend.colorWriteMask = (colorMask ? (1 | 2 | 4) : 0) | (alphaMask ? 8 : 0);
+			keys_.blend.colorWriteMask = ClearModeChannelMask();
 		} else {
 			keys_.blend.value = 0;
 
@@ -159,7 +156,7 @@ void DrawEngineD3D11::ApplyDrawState(int prim) {
 				ApplyStencilReplaceAndLogicOpIgnoreBlend(blendState.replaceAlphaWithStencil, blendState);
 
 				if (fboTexBindState == FBO_TEX_COPY_BIND_TEX) {
-					framebufferManager_->BindFramebufferAsColorTexture(1, framebufferManager_->GetCurrentRenderVFB(), BINDFBCOLOR_MAY_COPY | BINDFBCOLOR_UNCACHED, 0);
+					framebufferManager_->BindFramebufferAsColorTexture(1, framebufferManager_->GetCurrentRenderVFB(), ShaderReadBindFlags(), 0);
 					// No sampler required, we do a plain Load in the pixel shader.
 					fboTexBound_ = true;
 					fboTexBindState = FBO_TEX_NONE;
@@ -195,7 +192,7 @@ void DrawEngineD3D11::ApplyDrawState(int prim) {
 				}
 				dynState_.useBlendColor = blendState.useBlendColor;
 				if (blendState.useBlendColor) {
-					dynState_.blendColor = blendState.blendColor;
+					blendState.blendColorToFloat4(dynState_.blendColor);
 				}
 			} else {
 				keys_.blend.blendEnable = false;
@@ -440,13 +437,10 @@ void DrawEngineD3D11::ApplyDrawStateLate(bool applyStencilRef, uint8_t stencilRe
 	}
 	if (gstate_c.IsDirty(DIRTY_BLEND_STATE)) {
 		// Need to do this AFTER ApplyTexture because the process of depalettization can ruin the blend state.
-		float blendColor[4];
-		Uint8x4ToFloat4(blendColor, dynState_.blendColor);
-		if (device1_) {
-			context1_->OMSetBlendState(blendState1_, blendColor, 0xFFFFFFFF);
-		} else {
-			context_->OMSetBlendState(blendState_, blendColor, 0xFFFFFFFF);
-		}
+		const float *blendColor = dynState_.blendColor;
+		// ID3D11BlendState1 is an ID3D11BlendState, so the base context binds either.
+		ID3D11BlendState *bs = device1_ ? (ID3D11BlendState *)blendState1_ : blendState_;
+		context_->OMSetBlendState(bs, blendColor, 0xFFFFFFFF);
 	}
 	if (gstate_c.IsDirty(DIRTY_DEPTHSTENCIL_STATE) || applyStencilRef) {
 		context_->OMSetDepthStencilState(depthStencilState_, applyStencilRef ? stencilRef : dynState_.stencilRef);

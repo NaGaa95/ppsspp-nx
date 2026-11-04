@@ -703,7 +703,9 @@ bool CreateDir(const Path &path, bool quiet) {
 	}
 	return false;
 #else
-	if (mkdir(path.ToString().c_str(), 0755) == 0) {
+	if (mkdir(path.ToString().c_str(), 0775) == 0) {
+		// mkdir's mode is masked by the umask, chmod's isn't.
+		chmod(path.ToString().c_str(), 0775);
 		return true;
 	}
 
@@ -712,6 +714,8 @@ bool CreateDir(const Path &path, bool quiet) {
 		if (!quiet) {
 			DEBUG_LOG(Log::IO, "CreateDir: mkdir failed on %s: already exists", path.c_str());
 		}
+		// Don't touch the permissions of existing directories: CreateFullPath calls this
+		// on every component of a path, including the user's home directory.
 		return true;
 	}
 
@@ -726,6 +730,14 @@ bool CreateDir(const Path &path, bool quiet) {
 bool CreateFullPath(const Path &path) {
 	if (File::Exists(path)) {
 		VERBOSE_LOG(Log::IO, "CreateFullPath: path exists %s", path.ToVisualString().c_str());
+#if !defined(HAVE_LIBRETRO_VFS) && !defined(_WIN32)
+		// Repair directories created with older, narrower permissions. Only the last
+		// component, the parents can be anything (like the user's home directory).
+		struct stat info;
+		if (path.Type() == PathType::NATIVE && stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode)) {
+			chmod(path.c_str(), 0775);
+		}
+#endif
 		return true;
 	}
 
@@ -745,11 +757,17 @@ bool CreateFullPath(const Path &path) {
 
 	// The below code is entirely agnostic of path format.
 
-	Path root = path.GetRootVolume();
-
 	std::string diff;
-	if (!root.ComputePathTo(path, diff)) {
-		return false;
+	Path curPath;
+	if (path.IsAbsolute()) {
+		curPath = path.GetRootVolume();
+		if (!curPath.ComputePathTo(path, diff)) {
+			return false;
+		}
+	} else {
+		// Relative to the current directory, so every component may need creating. GetRootVolume()
+		// can't help here: it hands back the whole path, which left nothing to create.
+		diff = path.ToString();
 	}
 
 	std::vector<std::string_view> parts;
@@ -763,9 +781,9 @@ bool CreateFullPath(const Path &path) {
 		return false;
 	}
 
-	Path curPath = root;
 	for (auto part : parts) {
-		curPath /= part;
+		// Path("") / "a" would be "/a".
+		curPath = curPath.empty() ? Path(std::string(part)) : curPath / part;
 		File::CreateDir(curPath);
 	}
 
@@ -1529,6 +1547,38 @@ bool WriteDataToFile(bool text_file, const void* data, size_t size, const Path &
 	}
 	fclose(f);
 	return true;
+}
+
+bool WriteDataToNewFile(const void *data, size_t size, const Path &filename) {
+#if PPSSPP_PLATFORM(ANDROID) && !defined(HAVE_LIBRETRO_VFS)
+	if (filename.Type() == PathType::CONTENT_URI) {
+		if (!filename.CanNavigateUp() || Android_CreateFile(filename.NavigateUp().ToString(), filename.GetFilename()) != StorageError::SUCCESS) {
+			return false;
+		}
+		const int fd = Android_OpenContentUriFd(filename.ToString(), Android_OpenContentUriMode::READ_WRITE_TRUNCATE);
+		if (fd < 0) {
+			return false;
+		}
+		const u8 *p = (const u8 *)data;
+		size_t left = size;
+		int interrupts = 0;
+		while (left > 0) {
+			const ssize_t written = write(fd, p, left);
+			if (written < 0 && errno == EINTR && ++interrupts < 100) {
+				continue;
+			}
+			if (written <= 0) {
+				close(fd);
+				return false;
+			}
+			p += written;
+			left -= written;
+			interrupts = 0;
+		}
+		return close(fd) == 0;
+	}
+#endif
+	return WriteDataToFile(false, data, size, filename);
 }
 
 void ChangeMTime(const Path &path, time_t mtime) {

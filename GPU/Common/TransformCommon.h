@@ -17,11 +17,13 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstring>
 
 #include "Common/CommonTypes.h"
 #include "GPU/Math3D.h"
 #include "GPU/GPU.h"
+#include "GPU/GPUState.h"
 
 struct Color4 {
 	float r, g, b, a;
@@ -60,6 +62,66 @@ struct Color4 {
 	}
 };
 
+// The GE's pow() for specular, powered diffuse and the spot exponent: 1 for e <= 0, else 0 for
+// x <= 0. Otherwise exp2(e * log2(x)) with log2 and exp2 each a straight line between powers of two
+// (Mitchell's approximation), which is what reading a float's bits as an integer gives: exponent
+// plus mantissa, scaled by 2^23. Matches hardware within one step of 255 (gpu/lighting/specular).
+inline float PSPLightPow(float x, float e) {
+	if (!(x > 0.0f)) {
+		return e > 0.0f ? 0.0f : 1.0f;
+	}
+	int32_t ix;
+	memcpy(&ix, &x, sizeof(ix));
+	float t = (e > 0.0f ? e : 0.0f) * (float)(ix - 0x3F800000) + 1065353216.0f;
+	// Also turns NaN into 0, and stays below infinity's bits.
+	t = t >= 0.0f ? (t < 2139095039.0f ? t : 2139095039.0f) : 0.0f;
+	int32_t iy = (int32_t)t;
+	float y;
+	memcpy(&y, &iy, sizeof(y));
+	return y;
+}
+
+// The exponent of the GE's lighting pow (specular and spot): the top 4 bits of the mantissa, truncated, and
+// saturated below 512, so 512 and up, infinity and NaN all act as 496 (gpu/probe exp221-223).
+inline float PSPLightExponent(float e) {
+	if (std::isnan(e)) {
+		return std::signbit(e) ? 0.0f : 496.0f;
+	}
+	if (e >= 512.0f) {
+		return 496.0f;
+	}
+	u32 bits;
+	memcpy(&bits, &e, sizeof(bits));
+	bits &= 0xFFF80000;
+	memcpy(&e, &bits, sizeof(bits));
+	return e;
+}
+
+// The viewer is at infinity along view space +z, so in world space it's the view matrix's third column.
+inline Vec3f PSPViewDirection(const float viewMatrix[12]) {
+	return Vec3f(viewMatrix[2], viewMatrix[5], viewMatrix[8]).NormalizedOr001(false);
+}
+
+inline Vec3f NormalizedOr000(const Vec3f &v) {
+	float len2 = v.Length2();
+	return len2 > 0.0f ? v * (1.0f / sqrtf(len2)) : Vec3f(0.0f, 0.0f, 0.0f);
+}
+
+// Shade mapping (environment map UV gen) coordinate from light l: (N.L + 1) / 2, with L the light's
+// direction as lighting sees it (a zero vector stays zero), or the half vector if the light does
+// specular. Lighting and light enables don't matter (gpu/lighting/shademap).
+inline float PSPShadeMapCoord(int l, const Vec3f &worldpos, const Vec3f &worldnormal, const Vec3f &viewDir) {
+	Vec3f L(getFloat24(gstate.lpos[l * 3]), getFloat24(gstate.lpos[l * 3 + 1]), getFloat24(gstate.lpos[l * 3 + 2]));
+	if (gstate.getLightType(l) != GE_LIGHTTYPE_DIRECTIONAL) {
+		L -= worldpos;
+	}
+	L = NormalizedOr000(L);
+	if (gstate.isUsingSpecularLight(l)) {
+		L = NormalizedOr000(L + viewDir);
+	}
+	return (Dot(L, worldnormal) + 1.0f) * 0.5f;
+}
+
 // Convenient way to do precomputation to save the parts of the lighting calculation
 // that's common between the many vertices of a draw call.
 class Lighter {
@@ -81,7 +143,7 @@ private:
 	Color4 materialDiffuse;
 	Color4 materialSpecular;
 	float specCoef_;
-	// Vec3f viewer_;
+	Vec3f viewDir_;
 	bool doShadeMapping_;
 	int materialUpdate_;
 
@@ -105,3 +167,19 @@ struct SimpleVertex {
 	Vec3Packedf nrm;
 	Vec3Packedf pos;
 };
+
+// The GE converts the fog factor to 8 bits per vertex, min(floor(256 * f), 255), and interpolates that
+// linearly in screen space. NaN and inf go by sign, like other values (measured with gpu/probe).
+inline int GEFogFactor(float f) {
+	uint32_t bits;
+	memcpy(&bits, &f, sizeof(bits));
+	const uint32_t exp = bits >> 23;
+	if ((bits & 0x80000000) != 0 || exp <= 126 - 8) {
+		return 0;
+	}
+	if (exp > 126) {
+		return 255;
+	}
+	const uint32_t mantissa = (bits & 0x007FFFFF) | 0x00800000;
+	return mantissa >> (16 + 126 - exp);
+}

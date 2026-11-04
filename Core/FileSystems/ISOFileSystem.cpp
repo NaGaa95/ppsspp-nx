@@ -493,7 +493,7 @@ int ISOFileSystem::Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u32 outd
 		}
 
 		if (!Memory::IsValidRange(outdataPtr, 0x800) || outlen < 0x800) {
-			WARN_LOG_REPORT(Log::FileSystem, "sceIoIoctl: Invalid out pointer %08x while reading ISO9660 volume descriptor", outdataPtr);
+			WARN_LOG(Log::FileSystem, "sceIoIoctl: Invalid out pointer %08x while reading ISO9660 volume descriptor", outdataPtr);
 			return SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
 		}
 
@@ -857,6 +857,12 @@ void ISOFileSystem::DoState(PointerWrap &p) {
 				std::string path;
 				Do(p, path);
 				of.file = GetFromPath(path);
+				if (!of.file) {
+					// Loaded against a different image. Like a file that's gone from a directory,
+					// drop the handle rather than keep one that points at nothing.
+					ERROR_LOG(Log::FileSystem, "Failed to reopen file while loading state: %s", path.c_str());
+					continue;
+				}
 			} else {
 				of.file = NULL;
 			}

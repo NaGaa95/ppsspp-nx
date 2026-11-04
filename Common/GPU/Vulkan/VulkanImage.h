@@ -22,6 +22,8 @@ struct TextureCopyBatch {
 // ALWAYS use an allocator when calling CreateDirect.
 class VulkanTexture {
 public:
+	VulkanTexture(const VulkanTexture &) = delete;
+	VulkanTexture &operator=(const VulkanTexture &) = delete;
 	VulkanTexture(VulkanContext *vulkan, const char *tag);
 	~VulkanTexture() {
 		Destroy();
@@ -41,7 +43,7 @@ public:
 	void FinishCopyBatch(VkCommandBuffer cmd, TextureCopyBatch *copyBatch);
 
 	void GenerateMips(VkCommandBuffer cmd, int firstMipToGenerate, bool fromCompute);
-	void EndCreate(VkCommandBuffer cmd, bool vertexTexture, VkPipelineStageFlags prevStage, VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+	void EndCreate(VkCommandBuffer cmd, VkPipelineStageFlags prevStage, VkImageLayout layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
 	// For updating levels after creation. Careful with the timelines!
 	void PrepareForTransferDst(VkCommandBuffer cmd, int levels);

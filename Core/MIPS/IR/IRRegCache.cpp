@@ -30,13 +30,10 @@
 #include "Core/MIPS/JitCommon/JitState.h"
 
 void IRImmRegCache::Flush(IRReg rd) {
-	if (isImm_[rd]) {
-		if (rd == 0) {
-			return;
-		}
+	if (isImm_[rd] && !isWritten_[rd]) {
 		_assert_((rd > 0 && rd < 32) || (rd >= IRTEMP_0 && rd < IRREG_VFPU_CTRL_BASE));
 		ir_->WriteSetConstant(rd, immVal_[rd]);
-		isImm_[rd] = false;
+		isWritten_[rd] = true;
 	}
 }
 
@@ -49,19 +46,23 @@ void IRImmRegCache::Discard(IRReg rd) {
 
 IRImmRegCache::IRImmRegCache(IRWriter *ir) : ir_(ir) {
 	memset(&isImm_, 0, sizeof(isImm_));
+	memset(&isWritten_, 0, sizeof(isWritten_));
 	memset(&immVal_, 0, sizeof(immVal_));
 	isImm_[0] = true;
+	isWritten_[0] = true;
 	ir_ = ir;
 }
 
-void IRImmRegCache::FlushAll() {
+void IRImmRegCache::FlushAll(bool keepKnown) {
 	for (int i = 1; i < TOTAL_MAPPABLE_IRREGS; ) {
 		if (isImm_[i]) {
 			Flush(i);
+			if (!keepKnown)
+				isImm_[i] = false;
 		}
 
 		// Most of the time, lots are not.  This speeds it up a lot.
-		bool *next = (bool *)memchr(&isImm_[i], 1, TOTAL_MAPPABLE_IRREGS - i);
+		bool *next = (bool *)memchr(&isImm_[i + 1], 1, TOTAL_MAPPABLE_IRREGS - i - 1);
 		if (!next)
 			break;
 		i = (int)(next - &isImm_[0]);
@@ -88,24 +89,25 @@ void IRImmRegCache::MapInInIn(IRReg rd, IRReg rs, IRReg rt) {
 }
 
 void IRImmRegCache::MapDirtyIn(IRReg rd, IRReg rs) {
-	if (rs != rd) {
-		Discard(rd);
-	}
 	Flush(rs);
+	Discard(rd);
 }
 
 void IRImmRegCache::MapDirtyInIn(IRReg rd, IRReg rs, IRReg rt) {
-	if (rs != rd && rt != rd) {
-		Discard(rd);
-	}
 	Flush(rs);
 	Flush(rt);
+	Discard(rd);
 }
 
 IRNativeRegCacheBase::IRNativeRegCacheBase(MIPSComp::JitOptions *jo)
 	: jo_(jo) {}
 
-void IRNativeRegCacheBase::Start(MIPSComp::IRBlockCache *irBlockCache, int blockNum) {
+void IRNativeRegCacheBase::Start(u32 startPC, const IRInst *instructions, int count) {
+	irStartPC_ = startPC;
+	irInsts_ = instructions;
+	irCount_ = count;
+	irIndex_ = 0;
+
 	if (!initialReady_) {
 		SetupInitialRegs();
 		initialReady_ = true;
@@ -113,8 +115,6 @@ void IRNativeRegCacheBase::Start(MIPSComp::IRBlockCache *irBlockCache, int block
 
 	memcpy(nr, nrInitial_, sizeof(nr[0]) * config_.totalNativeRegs);
 	memcpy(mr, mrInitial_, sizeof(mr));
-
-	irBlock_ = irBlockCache->GetBlock(blockNum);
 
 	int numStatics;
 	const StaticAllocation *statics = GetStaticAllocations(numStatics);
@@ -126,12 +126,8 @@ void IRNativeRegCacheBase::Start(MIPSComp::IRBlockCache *irBlockCache, int block
 		mr[statics[i].mr].nReg = statics[i].nr;
 		mr[statics[i].mr].isStatic = true;
 		// Lock it until the very end.
-		mr[statics[i].mr].spillLockIRIndex = irBlock_->GetNumIRInstructions();
+		mr[statics[i].mr].spillLockIRIndex = irCount_;
 	}
-
-	irBlockNum_ = blockNum;
-	irBlockCache_ = irBlockCache;
-	irIndex_ = 0;
 }
 
 void IRNativeRegCacheBase::SetupInitialRegs() {
@@ -387,7 +383,7 @@ IRNativeReg IRNativeRegCacheBase::AllocateReg(MIPSLoc type, MIPSMap flags) {
 	}
 
 	// Uh oh, we have all of them spilllocked....
-	ERROR_LOG_REPORT(Log::JIT, "Out of spillable registers in block PC %08x, index %d", irBlock_->GetOriginalStart(), irIndex_);
+	ERROR_LOG_REPORT(Log::JIT, "Out of spillable registers in block PC %08x, index %d", irStartPC_, irIndex_);
 	_assert_(bestToSpill != -1);
 	return -1;
 }
@@ -433,8 +429,8 @@ bool IRNativeRegCacheBase::IsRegClobbered(MIPSLoc type, IRReg r) const {
 	info.lookaheadCount = UNUSED_LOOKAHEAD_OPS;
 	// We look starting one ahead, unlike spilling.  We want to know if it clobbers later.
 	info.currentIndex = irIndex_ + 1;
-	info.instructions = irBlockCache_->GetBlockInstructionPtr(irBlockNum_);
-	info.numInstructions = irBlock_->GetNumIRInstructions();
+	info.instructions = irInsts_;
+	info.numInstructions = irCount_;
 
 	// Make sure we're on the first one if this is multi-lane.
 	IRReg first = r;
@@ -460,8 +456,8 @@ bool IRNativeRegCacheBase::IsRegRead(MIPSLoc type, IRReg first) const {
 	info.lookaheadCount = UNUSED_LOOKAHEAD_OPS;
 	// We look starting one ahead, unlike spilling.
 	info.currentIndex = irIndex_ + 1;
-	info.instructions = irBlockCache_->GetBlockInstructionPtr(irBlockNum_);
-	info.numInstructions = irBlock_->GetNumIRInstructions();
+	info.instructions = irInsts_;
+	info.numInstructions = irCount_;
 
 	// Note: this intentionally doesn't look at the full reg, only the lane.
 	IRUsage usage = GetNextRegUsage(info, type, first);
@@ -477,8 +473,8 @@ IRNativeReg IRNativeRegCacheBase::FindBestToSpill(MIPSLoc type, MIPSMap flags, b
 	IRSituation info;
 	info.lookaheadCount = UNUSED_LOOKAHEAD_OPS;
 	info.currentIndex = irIndex_;
-	info.instructions = irBlockCache_->GetBlockInstructionPtr(irBlockNum_);
-	info.numInstructions = irBlock_->GetNumIRInstructions();
+	info.instructions = irInsts_;
+	info.numInstructions = irCount_;
 
 	*clobbered = false;
 	for (int i = 0; i < allocCount; i++) {
@@ -579,9 +575,15 @@ void IRNativeRegCacheBase::DiscardNativeReg(IRNativeReg nreg) {
 
 void IRNativeRegCacheBase::FlushNativeReg(IRNativeReg nreg) {
 	_assert_msg_(nreg >= 0 && nreg < config_.totalNativeRegs, "FlushNativeReg on invalid register %d", nreg);
-	if (nr[nreg].mipsReg == IRREG_INVALID || nr[nreg].mipsReg == MIPS_REG_ZERO) {
-		// Nothing to do, reg not mapped or mapped to fixed zero.
+	if (nr[nreg].mipsReg == IRREG_INVALID) {
+		// Nothing to do, reg not mapped.
 		_dbg_assert_(!nr[nreg].isDirty);
+		return;
+	}
+	if (nr[nreg].mipsReg == MIPS_REG_ZERO) {
+		// Nothing to store, but whoever flushes is about to clobber it.
+		_dbg_assert_(!nr[nreg].isDirty);
+		DiscardNativeReg(nreg);
 		return;
 	}
 	_dbg_assert_(!mr[nr[nreg].mipsReg].isStatic);
@@ -681,9 +683,62 @@ void IRNativeRegCacheBase::FlushReg(IRReg mreg) {
 	}
 }
 
+void IRNativeRegCacheBase::DiscardDeadTempsAtExit() {
+	if (!irInsts_ || irIndex_ < 0 || irIndex_ >= irCount_)
+		return;
+	const IRInst *insts = irInsts_;
+	if ((GetIRMeta(insts[irIndex_].op)->flags & IRFLAG_EXIT) == 0)
+		return;
+
+	// The temps don't live on past the block, so only reads later in this block matter.
+	auto isTemp = [](IRReg r) {
+		return (r >= IRTEMP_0 && r <= IRTEMP_LR_SHIFT) || (r >= 32 + IRVTEMP_PFX_S && r < 32 + IRVTEMP_0 + 4);
+	};
+	auto readLater = [&](IRReg r) {
+		const bool gpr = r < 32 + IRVTEMP_PFX_S;
+		const IRReg reg = gpr ? r : (IRReg)(r - 32);
+		auto reads = [&](IRReg src, char type) {
+			if (gpr)
+				return type == 'G' && src == reg;
+			int lanes = type == 'F' ? 1 : (type == '2' ? 2 : (type == 'V' ? 4 : (type == 'M' ? 16 : 0)));
+			return reg >= src && reg < src + lanes;
+		};
+		for (int i = irIndex_ + 1; i < irCount_; ++i) {
+			const IRInstMeta inst = GetIRMeta(insts[i]);
+			if (reads(inst.src1, inst.m.types[1]) || reads(inst.src2, inst.m.types[2]))
+				return true;
+			if ((inst.m.flags & (IRFLAG_SRC3 | IRFLAG_SRC3DST)) != 0 && reads(inst.src3, inst.m.types[0]))
+				return true;
+			if (gpr ? IRDestGPR(inst) == reg : IRWritesToFPR(inst, reg))
+				return false;
+		}
+		return false;
+	};
+
+	for (IRReg r = IRTEMP_0; r < 32 + IRVTEMP_0 + 4; ++r) {
+		if (!isTemp(r) || mr[r].isStatic || mr[r].loc == MIPSLoc::MEM || readLater(r))
+			continue;
+		IRNativeReg nreg = mr[r].nReg;
+		if (nreg == -1) {
+			DiscardReg(r);
+			continue;
+		}
+		// A vector reg may hold other lanes, which all have to be dead temps too.
+		bool allDead = true;
+		for (IRReg m = nr[nreg].mipsReg; m < IRREG_INVALID && mr[m].nReg == nreg; ++m) {
+			if (m != r && (!isTemp(m) || readLater(m)))
+				allDead = false;
+		}
+		if (allDead)
+			DiscardNativeReg(nreg);
+	}
+}
+
 void IRNativeRegCacheBase::FlushAll(bool gprs, bool fprs) {
 	// Note: make sure not to change the registers when flushing.
 	// Branching code may expect the native reg to retain its value.
+
+	DiscardDeadTempsAtExit();
 
 	if (!mr[MIPS_REG_ZERO].isStatic && mr[MIPS_REG_ZERO].nReg != -1)
 		DiscardNativeReg(mr[MIPS_REG_ZERO].nReg);
@@ -810,7 +865,13 @@ void IRNativeRegCacheBase::ApplyMapping(const Mapping *mapping, int count) {
 		bool mapSIMD = config_.mapFPUSIMD || mapping[i].type == 'G';
 		MIPSMap flags = mapping[i].flags;
 		for (int j = 0; j < count; ++j) {
-			if (mapping[j].type == mapping[i].type && mapping[j].reg == mapping[i].reg && i != j) {
+			if (mapping[j].type != mapping[i].type || i == j)
+				continue;
+			bool sameReg = mapping[j].reg == mapping[i].reg;
+			// Mapped lane by lane, a dest can also be a later lane of a source (Vec2Pack32To16
+			// vf3, vf2,vf3), and then it has to be loaded too.
+			bool overlaps = !mapSIMD && mapping[j].reg < mapping[i].reg + mapping[i].lanes && mapping[i].reg < mapping[j].reg + mapping[j].lanes;
+			if (sameReg || overlaps) {
 				_assert_msg_(!mapSIMD || mapping[j].lanes == mapping[i].lanes, "Lane aliasing not supported yet");
 
 				if (!isNoinit(mapping[j].flags) && isNoinit(flags)) {
@@ -1030,8 +1091,8 @@ void IRNativeRegCacheBase::MapNativeReg(MIPSLoc type, IRNativeReg nreg, IRReg fi
 							IRSituation info;
 							info.lookaheadCount = 16;
 							info.currentIndex = irIndex_;
-							info.instructions = irBlockCache_->GetBlockInstructionPtr(irBlockNum_);
-							info.numInstructions = irBlock_->GetNumIRInstructions();
+							info.instructions = irInsts_;
+							info.numInstructions = irCount_;
 
 							IRReg basefpr = first - oldlane - 32;
 							clobbered = true;

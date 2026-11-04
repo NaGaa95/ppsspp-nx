@@ -15,8 +15,11 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
 #include <cmath>
+#include <atomic>
 #include <mutex>
+#include <vector>
 
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
@@ -107,6 +110,14 @@ static u32 emuRapidFireFrames = 0;
 static bool emuRapidFireToggle = true;
 static u32 emuRapidFireInterval = 5;
 
+// Set while a system overlay (the HOME button's quit screen) owns the controls: the game then reads
+// no buttons and centered sticks, as impose does on a PSP. Host-side peeks still see the real state.
+static std::atomic<bool> gameInputBlocked{ false };
+
+// Buttons pressed since the last sample. A press and release that both land between two samples
+// would otherwise never be seen by the game. Guarded by ctrlMutex.
+static u32 ctrlUnsampledPresses = 0;
+
 // These buttons are not affected by rapid fire (neither is analog.)
 const u32 CTRL_EMU_RAPIDFIRE_MASK = CTRL_UP | CTRL_DOWN | CTRL_LEFT | CTRL_RIGHT;
 
@@ -115,7 +126,8 @@ static void __CtrlUpdateLatch()
 	std::lock_guard<std::mutex> guard(ctrlMutex);
 	u64 t = CoreTiming::GetGlobalTimeUs();
 
-	u32 buttons = ctrlCurrent.buttons;
+	u32 buttons = ctrlCurrent.buttons | ctrlUnsampledPresses;
+	ctrlUnsampledPresses = 0;
 	if (emuRapidFire && emuRapidFireToggle)
 		buttons &= CTRL_EMU_RAPIDFIRE_MASK;
 
@@ -135,6 +147,11 @@ static void __CtrlUpdateLatch()
 		float rY = x * sinAngle + y * cosAngle;
 		ctrlBufs[ctrlBuf].analog[0][0] = (u8)Clamp(rX + 128, 0.0f, 255.0f);
 		ctrlBufs[ctrlBuf].analog[0][1] = (u8)Clamp(rY + 128, 0.0f, 255.0f);
+	}
+
+	if (gameInputBlocked) {
+		buttons = 0;
+		memset(ctrlBufs[ctrlBuf].analog, CTRL_ANALOG_CENTER, sizeof(ctrlBufs[ctrlBuf].analog));
 	}
 
 	ctrlBufs[ctrlBuf].buttons = buttons;
@@ -167,6 +184,14 @@ static int __CtrlResetLatch()
 	memset(&latch, 0, sizeof(CtrlLatch));
 	ctrlLatchBufs = 0;
 	return oldBufs;
+}
+
+void __CtrlSetGameInputBlocked(bool blocked) {
+	gameInputBlocked = blocked;
+}
+
+bool __CtrlIsGameInputBlocked() {
+	return gameInputBlocked;
 }
 
 u32 __CtrlPeekButtons()
@@ -205,6 +230,58 @@ u32 __CtrlReadLatch()
 	return ret;
 }
 
+// Presses held for a number of vblank samples (the debugger's input.buttons.press). Counted down on
+// the emulator thread at each vblank, so how long a press lasts doesn't depend on how fast the
+// emulator runs. Guarded by ctrlMutex; not saved.
+struct TimedPress {
+	int id;
+	u32 buttons;
+	int samplesLeft;
+};
+static std::vector<TimedPress> timedPresses;
+static int nextTimedPressId = 1;
+
+int __CtrlPressFor(u32 buttons, int vblanks) {
+	std::lock_guard<std::mutex> guard(ctrlMutex);
+	buttons &= CTRL_MASK_USER;
+	ctrlCurrent.buttons |= buttons;
+	const int id = nextTimedPressId++;
+	timedPresses.push_back(TimedPress{ id, buttons, std::max(vblanks, 1) });
+	return id;
+}
+
+bool __CtrlPressActive(int id) {
+	std::lock_guard<std::mutex> guard(ctrlMutex);
+	for (const TimedPress &press : timedPresses) {
+		if (press.id == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// After the vblank's sample, so a press of N vblanks is seen by N samples.
+static void __CtrlUpdateTimedPresses() {
+	std::lock_guard<std::mutex> guard(ctrlMutex);
+	if (timedPresses.empty()) {
+		return;
+	}
+	u32 released = 0;
+	for (TimedPress &press : timedPresses) {
+		if (--press.samplesLeft <= 0) {
+			released |= press.buttons;
+		}
+	}
+	timedPresses.erase(std::remove_if(timedPresses.begin(), timedPresses.end(), [](const TimedPress &press) {
+		return press.samplesLeft <= 0;
+	}), timedPresses.end());
+	// Unless another press still holds them.
+	for (const TimedPress &press : timedPresses) {
+		released &= ~press.buttons;
+	}
+	ctrlCurrent.buttons &= ~released;
+}
+
 void __CtrlUpdateButtons(u32 bitsToSet, u32 bitsToClear)
 {
 	bitsToClear &= CTRL_MASK_USER;
@@ -212,7 +289,8 @@ void __CtrlUpdateButtons(u32 bitsToSet, u32 bitsToClear)
 
 	std::lock_guard<std::mutex> guard(ctrlMutex);
 	// There's no atomic operation for this, so mutex it is.
-	ctrlCurrent.buttons = (ctrlCurrent.buttons & ~bitsToClear) | bitsToSet;
+	ctrlUnsampledPresses |= bitsToSet & ~ctrlCurrent.buttons;
+	ctrlCurrent.buttons =(ctrlCurrent.buttons & ~bitsToClear) | bitsToSet;
 }
 
 void __CtrlSetAnalogXY(int stick, float x, float y)
@@ -343,6 +421,7 @@ void __CtrlVblank() {
 	// This always runs, so make sure we're in vblank mode.
 	if (ctrlCycle == 0)
 		__CtrlDoSample();
+	__CtrlUpdateTimedPresses();
 }
 
 static void __CtrlTimerUpdate(u64 userdata, int cyclesLate)
@@ -374,6 +453,8 @@ void __CtrlInit() {
 	// Start with everything released.
 	latch.btnRelease = 0xffffffff;
 
+	gameInputBlocked = false;
+	ctrlUnsampledPresses = 0;
 	memset(&ctrlCurrent, 0, sizeof(ctrlCurrent));
 	memset(ctrlCurrent.analog, CTRL_ANALOG_CENTER, sizeof(ctrlCurrent.analog));
 	analogEnabled = false;
@@ -390,6 +471,9 @@ void __CtrlDoState(PointerWrap &p)
 	if (!s)
 		return;
 
+	// Host input from before the load shouldn't show up in the loaded state.
+	ctrlUnsampledPresses = 0;
+
 	Do(p, analogEnabled);
 	Do(p, ctrlLatchBufs);
 	Do(p, ctrlOldButtons);
@@ -401,6 +485,13 @@ void __CtrlDoState(PointerWrap &p)
 	}
 	Do(p, ctrlBuf);
 	Do(p, ctrlBufRead);
+	if (ctrlBuf >= NUM_CTRL_BUFFERS || ctrlBufRead >= NUM_CTRL_BUFFERS) {
+		ERROR_LOG(Log::sceCtrl, "Savestate failure: invalid ctrl buffer index");
+		p.SetError(p.ERROR_FAILURE);
+		ctrlBuf = 0;
+		ctrlBufRead = 0;
+		return;
+	}
 	Do(p, latch);
 	if (s == 1) {
 		dialogBtnMake = 0;
@@ -423,6 +514,8 @@ void __CtrlDoState(PointerWrap &p)
 void __CtrlShutdown()
 {
 	waitingThreads.clear();
+	std::lock_guard<std::mutex> guard(ctrlMutex);
+	timedPresses.clear();
 }
 
 static u32 sceCtrlSetSamplingCycle(u32 cycle)
@@ -467,6 +560,12 @@ static int sceCtrlGetSamplingMode(u32 modePtr)
 	if (Memory::IsValidAddress(modePtr))
 		Memory::WriteUnchecked_U32(retVal, modePtr);
 
+	return hleLogDebug(Log::sceCtrl, 0);
+}
+
+// Hides buttons from user mode readers, for kernel code that takes them over (Daedalus, for the
+// system buttons, which games don't get here anyway).
+static int sceCtrlSetButtonIntercept(u32 buttons, int intercept) {
 	return hleLogDebug(Log::sceCtrl, 0);
 }
 
@@ -584,6 +683,23 @@ static const HLEFunction sceCtrl[] =
 	{0X6841BE1A, nullptr,                                  "sceCtrlSetRapidFire",              '?', ""  },
 	{0XA7144800, &WrapI_II<sceCtrlSetIdleCancelThreshold>, "sceCtrlSetIdleCancelThreshold",    'i', "ii"},
 	{0X687660FA, &WrapI_UU<sceCtrlGetIdleCancelThreshold>, "sceCtrlGetIdleCancelThreshold",    'i', "xx"},
+	// The "2" variants take a port first: (int port, data, int count).
+	{0X5A36B1C2, nullptr,                                  "sceCtrlPeekBufferPositive2",       '?', ""  },
+	{0X239A6BA7, nullptr,                                  "sceCtrlPeekBufferNegative2",       '?', ""  },
+	{0X1098030B, nullptr,                                  "sceCtrlReadBufferPositive2",       '?', ""  },
+	{0X7C3675AB, nullptr,                                  "sceCtrlReadBufferNegative2",       '?', ""  },
+	// sceCtrl_driver's NID for sceCtrlPeekBufferPositive in 3.71. Imported by NJEMU's SystemButtons.prx
+	// kernel plugin, which picks it when sceKernelDevkitVersion() is 3.71 or newer (#8925).
+	{0XC4AAD55F, &WrapI_UU<sceCtrlPeekBufferPositive>,     "sceCtrlPeekBufferPositive",        'i', "xx"},
+	// sceCtrl_driver NID for sceCtrlReadBufferPositive (firmware 3.71+, per JPCSP).
+	// Imported by translation-patch loaders like CLANNAD's chfont.prx.
+	{0X454455AC, &WrapI_UU<sceCtrlReadBufferPositive>,     "sceCtrlReadBufferPositive",        'i', "xx"},
+	// Driver only.
+	{0X7CA723DC, &WrapI_UI<sceCtrlSetButtonIntercept>,     "sceCtrlSetButtonIntercept",        'i', "xi"},
+	// sceCtrl_driver NIDs in 3.71-3.73's ctrl.prx (at the same addresses as the user exports), which
+	// LightMP3's support.prx imports.
+	{0X28E71A16, &WrapU_U<sceCtrlSetSamplingMode>,         "sceCtrlSetSamplingMode",           'x', "x" },
+	{0X6D74BF08, &WrapU_U<sceCtrlSetSamplingCycle>,        "sceCtrlSetSamplingCycle",          'x', "x" },
 };
 
 void Register_sceCtrl()

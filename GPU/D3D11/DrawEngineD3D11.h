@@ -63,7 +63,9 @@ public:
 	void Flush() override;
 
 	void FinishDeferred() {
-		DecodeVerts(dec_, decoded_);
+		// Decoding only the vertices isn't enough: the indices are still read from PSP memory at flush
+		// time, and the game may change them once it regains control (#10095).
+		Flush();
 	}
 
 	void NotifyConfigChanged() override;
@@ -82,7 +84,6 @@ private:
 	ID3D11Device *device_;
 	ID3D11Device1 *device1_;
 	ID3D11DeviceContext *context_;
-	ID3D11DeviceContext1 *context1_;
 
 	struct InputLayoutKey {
 		D3D11VertexShader *vshader;
@@ -108,6 +109,9 @@ private:
 	PushBufferD3D11 *pushInds_ = nullptr;
 
 	// D3D11 state object caches. Previously had smart pointers but they were harder to deal with.
+	// These are never trimmed, although D3D11 allows only 4096 unique state objects per type and a
+	// failed create is fatal. That's deliberate: games use far fewer combinations, so it isn't an
+	// issue in practice, and eviction would cost more than it's worth.
 	DenseHashMap<uint64_t, ID3D11BlendState *> blendCache_;
 	DenseHashMap<uint64_t, ID3D11BlendState1 *> blendCache1_;
 	DenseHashMap<uint64_t, ID3D11DepthStencilState *> depthStencilCache_;
