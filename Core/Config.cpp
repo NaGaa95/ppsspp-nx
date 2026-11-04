@@ -89,6 +89,8 @@ std::string GPUBackendToString(GPUBackend backend) {
 		return "ZINK";
 	case GPUBackend::METAL:
 		return "METAL";
+	case GPUBackend::DEKO3D:
+		return "DEKO3D";
 	}
 	// Intentionally not a default so we get a warning.
 	return "INVALID";
@@ -105,6 +107,9 @@ GPUBackend GPUBackendFromString(std::string_view backend) {
 		return GPUBackend::ZINK;
 	if (equalsNoCase(backend, "METAL") || backend == "4")
 		return GPUBackend::METAL;
+	if (equalsNoCase(backend, "DEKO3D") || backend == "6") {
+		return GPUBackend::DEKO3D;
+	}
 	return GPUBackend::OPENGL;
 }
 
@@ -644,7 +649,7 @@ static int DefaultGPUBackend() {
 #if PPSSPP_PLATFORM(UWP)
 	return (int)GPUBackend::DIRECT3D11;
 #elif PPSSPP_PLATFORM(SWITCH)
-	return (int)GPUBackend::VULKAN;
+	return (int)GPUBackend::DEKO3D;
 #elif PPSSPP_PLATFORM(WINDOWS)
 	// On Win10, there's a good chance Vulkan will work by default.
 	if (IsWin10OrHigher()) {
@@ -770,7 +775,7 @@ bool Config::IsBackendEnabled(GPUBackend backend) {
 	if (backend != GPUBackend::DIRECT3D11)
 		return false;
 #elif PPSSPP_PLATFORM(SWITCH)
-	if (backend != GPUBackend::OPENGL && backend != GPUBackend::VULKAN && backend != GPUBackend::ZINK)
+	if (backend != GPUBackend::OPENGL && backend != GPUBackend::VULKAN && backend != GPUBackend::ZINK && backend != GPUBackend::DEKO3D)
 		return false;
 #elif PPSSPP_PLATFORM(WINDOWS)
 	if (backend == GPUBackend::DIRECT3D11 && !IsVistaOrHigher())
@@ -778,6 +783,12 @@ bool Config::IsBackendEnabled(GPUBackend backend) {
 #else
 	if (backend == GPUBackend::DIRECT3D11 || backend == GPUBackend::ZINK)
 		return false;
+#endif
+
+#if !PPSSPP_PLATFORM(SWITCH)
+	if (backend == GPUBackend::ZINK || backend == GPUBackend::DEKO3D) {
+		return false;
+	}
 #endif
 
 #if !PPSSPP_API(METAL)
@@ -932,7 +943,7 @@ static int DefaultAnalogAltSpeedPercent() {
 }
 
 static constexpr const char *externalDisplayNames[] = { "Show the game", "Mirror the screen" };
-static constexpr const char *gpuBackendNames[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan", "Metal", "Zink" };
+static constexpr const char *gpuBackendNames[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan", "Metal", "Zink", "Deko3D" };
 static constexpr const char *internalResolutionNames[] = { "Auto (1:1)", "1x PSP", "2x PSP", "3x PSP", "4x PSP", "5x PSP", "6x PSP", "7x PSP", "8x PSP", "9x PSP", "10x PSP" };
 static constexpr const char *msaaLevelNames[] = { "Off", "2x", "4x", "8x", "16x" };
 static constexpr const char *androidHwScaleNames[] = { "Native device resolution", "Same as Rendering resolution", "1x PSP", "2x PSP", "3x PSP", "4x PSP", "5x PSP" };
@@ -970,7 +981,9 @@ static constexpr ConfigSetting graphicsSettings[] = {
 	ConfigSetting("VulkanDevice", SETTING(g_Config, sVulkanDevice), "", CfgFlag::DEFAULT)
 		.Label(I18NCat::GRAPHICS, "Device"),
 #if PPSSPP_PLATFORM(SWITCH)
-	ConfigSetting("SwitchFrameGeneration", SETTING(g_Config, bSwitchFrameGeneration), false, CfgFlag::DEFAULT),
+	ConfigSetting("SwitchFrameGeneration", SETTING(g_Config, bSwitchFrameGeneration), false, CfgFlag::PER_GAME),
+	ConfigSetting("SwitchFrameGenerationFlowScale", SETTING(g_Config, fSwitchFrameGenerationFlowScale), 0.25f, CfgFlag::PER_GAME),
+	ConfigSetting("SwitchFrameGenerationPerformance", SETTING(g_Config, bSwitchFrameGenerationPerformance), true, CfgFlag::PER_GAME),
 #endif
 #ifdef _WIN32
 	ConfigSetting("D3D11Device", SETTING(g_Config, sD3D11Device), "", CfgFlag::DEFAULT)
@@ -2143,7 +2156,7 @@ void Config::PostLoadCleanup() {
 
 	if (iGPUBackend == 1) {  // d3d9, no longer supported. Fall back to D3D11.
 		iGPUBackend = (int)GPUBackend::DIRECT3D11;
-	} else if (iGPUBackend < 0 || iGPUBackend > (int)GPUBackend::ZINK) {
+	} else if (iGPUBackend < 0 || iGPUBackend > (int)GPUBackend::DEKO3D) {
 		iGPUBackend = (int)DefaultGPUBackend();
 	}
 

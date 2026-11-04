@@ -4,7 +4,7 @@ set -euo pipefail
 
 export PATH="/usr/bin:/bin:${PATH:-}"
 
-ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
 DEPS_DIR="$ROOT_DIR/build-switch-deps"
 BUILD_DIR="$ROOT_DIR/build-switch-release"
 DIST_DIR="$ROOT_DIR/dist"
@@ -18,13 +18,28 @@ FFMPEG_PREFIX="$DEPS_DIR/ffmpeg-prefix"
 SDL_REPOSITORY="https://github.com/devkitPro/SDL.git"
 SDL_REVISION="c329016c0e338ab4397ad930f83330c9fe058348"
 SDL_RECIPE_VERSION="3"
+FFMPEG_REPOSITORY="https://github.com/hrydgard/ppsspp-ffmpeg.git"
 FFMPEG_REVISION="1e3b4965632f60b1d85360261d1b9dd45444bc71"
 FFMPEG_RECIPE_VERSION="9"
-MESA_VERSION="26.2.2"
-MESA_REVISION="67e632f90cb18a5af10f020cdf671ea262ad9a0b"
+MESA_VERSION="26.2.4"
+MESA_SDK_SHA256="c2f78d4c627adcd6950ae1be305f845a059eec325a2d9905c9eb48e1b5ab573f"
+
+# Every recursive removal is restricted to generated directories under this checkout.
+remove_build_dirs() {
+	local target resolved
+	for target in "$@"; do
+		resolved="$(realpath -m -- "$target")"
+		case "$resolved" in
+			"$DEPS_DIR"|"$DEPS_DIR/"*|"$BUILD_DIR") ;;
+			*) echo "Refusing to remove directory outside this build: $resolved" >&2; exit 1 ;;
+		esac
+		[[ ! -L "$target" ]] || { echo "Refusing to remove symlink: $target" >&2; exit 1; }
+	done
+	rm -rf -- "$@"
+}
 
 if [[ "${1:-}" == "clean" ]]; then
-	rm -rf "$DEPS_DIR" "$BUILD_DIR"
+	remove_build_dirs "$DEPS_DIR" "$BUILD_DIR"
 elif [[ $# -ne 0 ]]; then
 	echo "Usage: $0 [clean]" >&2
 	exit 2
@@ -38,11 +53,25 @@ export LC_ALL=C
 export TZ=UTC
 export ZERO_AR_DATE=1
 
-MESA_PREFIX="${SWITCH_MESA_PREFIX:-$DEVKITPRO/portlibs/switch}"
-MESA_MANIFEST="$MESA_PREFIX/share/mesa-switch/manifest.json"
-MESA_SUMS="$MESA_PREFIX/share/mesa-switch/sha256sums"
+MESA_SDK_DIR="$DEPS_DIR/mesa-$MESA_VERSION-sdk"
+MESA_PREFIX="${SWITCH_MESA_PREFIX:-$MESA_SDK_DIR/opt/devkitpro/portlibs/switch}"
+if [[ -n "${SWITCH_MESA_SDK:-}" ]]; then
+	if [[ ! -f "$MESA_SDK_DIR/.ppsspp-sdk-sha256" ]] || [[ "$(<"$MESA_SDK_DIR/.ppsspp-sdk-sha256")" != "$MESA_SDK_SHA256" ]]; then
+		"${PYTHON:-python3}" "$ROOT_DIR/scripts/unpack-switch-mesa.py" "$SWITCH_MESA_SDK" "$MESA_SDK_DIR"
+	fi
+fi
+# MSYS2 can have several Python installations; select one with the host Mako module.
+UAM_HOST_PYTHON=""
+for candidate in "${UAM_PYTHON:-}" "${PYTHON:-}" python3 python /clangarm64/bin/python.exe /mingw64/bin/python.exe /ucrt64/bin/python.exe; do
+	if [[ -n "$candidate" ]] && command -v "$candidate" >/dev/null && "$candidate" -c 'import mako.template' >/dev/null 2>&1; then
+		UAM_HOST_PYTHON="$(command -v "$candidate")"
+		break
+	fi
+done
+[[ -n "$UAM_HOST_PYTHON" ]] || { echo "Deko3D requires host Python with Mako. Install python-mako or set UAM_PYTHON." >&2; exit 1; }
+
 JOBS="${JOBS:-16}"
-SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION:-1.0.0}"
+SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION:-1.0.1}"
 
 case "$JOBS" in
 	''|*[!0-9]*) echo "JOBS must be a positive integer" >&2; exit 2 ;;
@@ -53,25 +82,21 @@ case "$SWITCH_RELEASE_VERSION" in
 	''|*[!0-9A-Za-z.+-]*) echo "PPSSPP_SWITCH_RELEASE_VERSION contains invalid characters" >&2; exit 2 ;;
 esac
 
-for tool in cmake git make ninja sha256sum tar aarch64-none-elf-gcc aarch64-none-elf-pkg-config; do
+for tool in cmake git make ninja sha256sum tar bison flex realpath aarch64-none-elf-gcc aarch64-none-elf-pkg-config; do
 	command -v "$tool" >/dev/null || { echo "Missing build tool: $tool" >&2; exit 1; }
 done
 
 [[ -f "$DEVKITPRO/cmake/Switch.cmake" ]] || { echo "Missing devkitPro Switch toolchain" >&2; exit 1; }
-[[ -f "$MESA_MANIFEST" ]] || { echo "Set SWITCH_MESA_PREFIX to the user-supplied Mesa SDK prefix" >&2; exit 1; }
-grep -Fq "\"mesa_version\": \"$MESA_VERSION\"" "$MESA_MANIFEST" || { echo "Mesa SDK $MESA_VERSION is required" >&2; exit 1; }
-grep -Fq "\"git_revision\": \"$MESA_REVISION\"" "$MESA_MANIFEST" || { echo "Unexpected Mesa SDK revision" >&2; exit 1; }
-if [[ -f "$MESA_SUMS" ]]; then
-	(cd "$MESA_PREFIX" && sha256sum --quiet -c "$MESA_SUMS")
-fi
+[[ -f "$MESA_PREFIX/lib/cmake/Vulkan/VulkanConfig.cmake" ]] || { echo "Set SWITCH_MESA_SDK to mesa-26.2.4-switch-unified-horizon-sdk.zip, or SWITCH_MESA_PREFIX to its extracted portlibs/switch directory" >&2; exit 1; }
+grep -Fq "Vulkan_VERSION \"$MESA_VERSION\"" "$MESA_PREFIX/lib/cmake/Vulkan/VulkanConfig.cmake" || { echo "Mesa SDK $MESA_VERSION is required" >&2; exit 1; }
 
 mkdir -p "$DEPS_DIR" "$DIST_DIR"
 
 SDL_PATCH="$ROOT_DIR/SDL/switch-vulkan-window.patch"
 SDL_PATCH_SUM="$(sha256sum "$SDL_PATCH" | cut -d' ' -f1)"
-SDL_STAMP="$SDL_RECIPE_VERSION $SDL_REVISION $SDL_PATCH_SUM"
+SDL_STAMP="$SDL_RECIPE_VERSION $SDL_REVISION $SDL_PATCH_SUM $MESA_SDK_SHA256"
 if [[ ! -f "$SDL_PREFIX/.ppsspp-switch-sdl" ]] || [[ "$(<"$SDL_PREFIX/.ppsspp-switch-sdl")" != "$SDL_STAMP" ]]; then
-	rm -rf "$SDL_SOURCE_DIR" "$SDL_BUILD_DIR" "$SDL_PREFIX"
+	remove_build_dirs "$SDL_SOURCE_DIR" "$SDL_BUILD_DIR" "$SDL_PREFIX"
 	git clone --no-checkout "$SDL_REPOSITORY" "$SDL_SOURCE_DIR"
 	git -C "$SDL_SOURCE_DIR" checkout --detach "$SDL_REVISION"
 	git -C "$SDL_SOURCE_DIR" apply "$SDL_PATCH"
@@ -96,12 +121,16 @@ fi
 
 FFMPEG_STAMP="$FFMPEG_RECIPE_VERSION $FFMPEG_REVISION"
 if [[ ! -f "$FFMPEG_PREFIX/.ppsspp-switch-ffmpeg" ]] || [[ "$(<"$FFMPEG_PREFIX/.ppsspp-switch-ffmpeg")" != "$FFMPEG_STAMP" ]]; then
-	rm -rf "$FFMPEG_SOURCE_DIR" "$FFMPEG_BUILD_DIR" "$FFMPEG_PREFIX"
+	remove_build_dirs "$FFMPEG_SOURCE_DIR" "$FFMPEG_BUILD_DIR" "$FFMPEG_PREFIX"
 	mkdir -p "$FFMPEG_SOURCE_DIR" "$FFMPEG_BUILD_DIR" "$FFMPEG_PREFIX"
-	if ! git -C "$ROOT_DIR/ffmpeg" cat-file -e "$FFMPEG_REVISION^{commit}" 2>/dev/null; then
-		git -C "$ROOT_DIR/ffmpeg" fetch origin "$FFMPEG_REVISION"
+	FFMPEG_GIT_DIR="$DEPS_DIR/ffmpeg-git"
+	if [[ ! -d "$FFMPEG_GIT_DIR" ]]; then
+		git init --bare "$FFMPEG_GIT_DIR"
 	fi
-	git -C "$ROOT_DIR/ffmpeg" archive "$FFMPEG_REVISION" | tar -xf - -C "$FFMPEG_SOURCE_DIR"
+	if ! git --git-dir="$FFMPEG_GIT_DIR" cat-file -e "$FFMPEG_REVISION^{commit}" 2>/dev/null; then
+		git --git-dir="$FFMPEG_GIT_DIR" fetch --depth 1 "$FFMPEG_REPOSITORY" "$FFMPEG_REVISION"
+	fi
+	git --git-dir="$FFMPEG_GIT_DIR" archive "$FFMPEG_REVISION" | tar -xf - -C "$FFMPEG_SOURCE_DIR"
 	(
 		cd "$FFMPEG_BUILD_DIR"
 		"$FFMPEG_SOURCE_DIR/configure" \
@@ -178,6 +207,7 @@ if git -C "$ROOT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
 fi
 
 cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G Ninja \
+	-U'OPENGL_*' -U'_OPENGL_*' -U'Vulkan_*' -U'_VULKAN_SWITCH_*' \
 	-DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
 	-DCMAKE_BUILD_TYPE=Release \
 	-DCMAKE_PREFIX_PATH="$MESA_PREFIX;$SDL_PREFIX" \
@@ -187,6 +217,7 @@ cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G Ninja \
 	-DFFMPEG_DIR="$FFMPEG_PREFIX" \
 	-DPPSSPP_SWITCH_RELEASE_VERSION="$SWITCH_RELEASE_VERSION" \
 	-DUSE_LIBNX=ON \
+	-DUAM_PYTHON="$UAM_HOST_PYTHON" \
 	-DSWITCH_ENABLE_LTO=ON \
 	-DSWITCH_LTO_JOBS="$JOBS" \
 	-DUSE_FFMPEG=ON \
@@ -203,15 +234,17 @@ cmake -E copy_if_different "$BUILD_DIR/PPSSPP.nro" "$DIST_DIR/PPSSPP.nro"
 
 SOURCE_REVISION="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
 SOURCE_STATE="clean"
-if ! git -C "$ROOT_DIR" diff --quiet --ignore-submodules HEAD -- 2>/dev/null || [[ -n "$(git -C "$ROOT_DIR" ls-files --others --exclude-standard)" ]]; then
+# MSYS and Windows Git can have different checkout line-ending settings.
+if ! git -c core.autocrlf=input -C "$ROOT_DIR" diff --quiet --ignore-submodules HEAD -- 2>/dev/null || [[ -n "$(git -C "$ROOT_DIR" ls-files --others --exclude-standard)" ]]; then
 	SOURCE_STATE="dirty"
 fi
 PPSSPP_SHA256="$(sha256sum "$DIST_DIR/PPSSPP.nro" | cut -d' ' -f1)"
 {
 	echo "PPSSPP Switch $SWITCH_RELEASE_VERSION"
+	echo "frontend=ppsspp"
 	echo "source=$SOURCE_REVISION"
 	echo "source_state=$SOURCE_STATE"
-	echo "mesa=$MESA_VERSION $MESA_REVISION"
+	echo "mesa=$MESA_VERSION archive_sha256=$MESA_SDK_SHA256"
 	echo "sdl=$SDL_REVISION patch=$SDL_PATCH_SUM"
 	echo "ffmpeg=$FFMPEG_REVISION"
 	echo "compiler=$(aarch64-none-elf-gcc -dumpfullversion)"

@@ -1,6 +1,9 @@
 #include <vector>
 
 #include "SDLGLGraphicsContext.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "Common/SwitchSaltyNX.h"
+#endif
 
 #include "Common/GPU/OpenGL/GLFeatures.h"
 #include "Common/GPU/thin3d_create.h"
@@ -488,6 +491,9 @@ bool SDLGLGraphicsContext::InitSurface(WindowSystem winsys, void *data1, void *d
 			SDL_GL_SwapWindow(window_);
 #else
 		SDL_GL_SwapWindow(window_);
+#endif
+#if PPSSPP_PLATFORM(SWITCH)
+		saltynx_frame(2);
 #endif
 	});
 	renderManager_->SetSwapIntervalFunction([&](int interval) {

@@ -321,6 +321,8 @@ public:
 	bool bVSync;
 	bool bLowLatencyPresent;
 	bool bSwitchFrameGeneration = false;
+	float fSwitchFrameGenerationFlowScale = 0.25f;
+	bool bSwitchFrameGenerationPerformance = true;
 
 	bool bSoftwareRendering;
 	bool bSoftwareDisableDithering;

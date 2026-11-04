@@ -67,6 +67,10 @@ enum class DataFormat : uint8_t {
 	D24_S8,
 	D32F,
 	D32F_S8,
+
+	R16G16_UNORM,
+	R16G16B16A16_UNORM,
+	R16G16B16A16_SNORM,
 };
 
 size_t DataFormatSizeInBytes(DataFormat fmt);

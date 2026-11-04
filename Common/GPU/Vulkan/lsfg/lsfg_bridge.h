@@ -32,6 +32,7 @@ typedef struct LsfgNxCreateInfo {
 
 LsfgNxRuntime *lsfg_nx_create(const LsfgNxCreateInfo *info);
 void lsfg_nx_destroy(LsfgNxRuntime *runtime);
+void lsfg_nx_reset_history(LsfgNxRuntime *runtime);
 
 bool lsfg_nx_present(LsfgNxRuntime *runtime, VkQueue queue,
                      const VkPresentInfoKHR *present_info, VkResult *result);

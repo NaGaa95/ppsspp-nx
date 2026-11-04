@@ -765,7 +765,7 @@ void TouchTestScreen::CreateViews() {
 	root_->Add(theTwo);
 
 #if !PPSSPP_PLATFORM(UWP)
-	static const char *renderingBackend[] = { "OpenGL", "(n/a)", "Direct3D 11", "Vulkan", "Metal", "Zink" };
+	static const char *renderingBackend[] = { "OpenGL", "(n/a)", "Direct3D 11", "Vulkan", "Metal", "Zink", "Deko3D" };
 	PopupMultiChoice *renderingBackendChoice = root_->Add(new PopupMultiChoice(&g_Config.iGPUBackend, gr->T("Backend"), renderingBackend, (int)GPUBackend::OPENGL, ARRAY_SIZE(renderingBackend), I18NCat::GRAPHICS, screenManager()));
 	renderingBackendChoice->OnChoice.Handle(this, &TouchTestScreen::OnRenderingBackend);
 
@@ -776,6 +776,9 @@ void TouchTestScreen::CreateViews() {
 		renderingBackendChoice->HideChoice((int)GPUBackend::DIRECT3D11);
 	if (!g_Config.IsBackendEnabled(GPUBackend::VULKAN))
 		renderingBackendChoice->HideChoice((int)GPUBackend::VULKAN);
+	if (!g_Config.IsBackendEnabled(GPUBackend::DEKO3D)) {
+		renderingBackendChoice->HideChoice((int)GPUBackend::DEKO3D);
+	}
 	if (!g_Config.IsBackendEnabled(GPUBackend::ZINK))
 		renderingBackendChoice->HideChoice((int)GPUBackend::ZINK);
 	if (!g_Config.IsBackendEnabled(GPUBackend::METAL))

@@ -11,7 +11,11 @@ if(NOT USING_GLES2 AND NOT NO_OPENGL)
 endif()
 
 set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "let's not build binaries we don't need" FORCE)
-set(SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS ON CACHE BOOL "let's not use exceptions" FORCE)
+if(USE_LIBNX OR DEKO3D_SHADER_TESTS)
+	set(SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS OFF CACHE BOOL "Report native shader translation failures" FORCE)
+else()
+	set(SPIRV_CROSS_EXCEPTIONS_TO_ASSERTIONS ON CACHE BOOL "let's not use exceptions" FORCE)
+endif()
 set(ENABLE_SPVREMAPPER OFF CACHE BOOL "we don't need spvremapper" FORCE)
 
 # not really needed since we currently bypass the official cmakelists...

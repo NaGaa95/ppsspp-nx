@@ -34,6 +34,9 @@
 #include "Core/HW/Display.h"
 #include "Core/HLE/sceNet.h"
 #include "Core/FrameTiming.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "Common/GPU/Vulkan/SwitchLSFG.h"
+#endif
 
 FrameTiming g_frameTiming;
 
@@ -79,6 +82,9 @@ void FrameTiming::PostSubmit() {
 }
 
 void FrameTiming::ComputePresentMode(Draw::DrawContext *draw, bool fastForward) {
+#if PPSSPP_PLATFORM(SWITCH)
+	SwitchLSFG_SetFastForward(fastForward);
+#endif
 	if (!draw) {
 		// This happens in headless mode.
 		fastForwardSkipFlip_ = true;

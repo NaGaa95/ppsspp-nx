@@ -22,6 +22,9 @@
 #include <cstring>
 #include <memory>
 #include "Common/GPU/thin3d.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "Common/SwitchSaltyNX.h"
+#endif
 
 #include "Common/System/Display.h"
 #include "Common/System/System.h"
@@ -685,6 +688,9 @@ void PresentationCommon::SourceTexture(Draw::Texture *texture, int bufferWidth, 
 	srcTexture_ = texture;
 	srcWidth_ = bufferWidth;
 	srcHeight_ = bufferHeight;
+#if PPSSPP_PLATFORM(SWITCH)
+	saltynx_set_resolution(bufferWidth, bufferHeight);
+#endif
 }
 
 void PresentationCommon::SourceFramebuffer(Draw::Framebuffer *fb, int bufferWidth, int bufferHeight) {
@@ -696,6 +702,9 @@ void PresentationCommon::SourceFramebuffer(Draw::Framebuffer *fb, int bufferWidt
 	srcFramebuffer_ = fb;
 	srcWidth_ = bufferWidth;
 	srcHeight_ = bufferHeight;
+#if PPSSPP_PLATFORM(SWITCH)
+	saltynx_set_resolution(bufferWidth, bufferHeight);
+#endif
 }
 
 // Return value is if stereo binding succeeded.

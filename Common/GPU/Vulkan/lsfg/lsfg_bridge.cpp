@@ -122,7 +122,12 @@ struct LsfgNxRuntime {
         return candidate == swapchain;
     }
 
-    VkResult present(VkQueue queue, const VkPresentInfoKHR& info) {
+	void resetHistory() {
+		historyValid = false;
+		historyWarmup = 2;
+	}
+
+	VkResult present(VkQueue queue, const VkPresentInfoKHR& info) {
         if (queue != vulkan->queue())
             throw std::runtime_error("present queue differs from borrowed LSFG queue");
         if (info.swapchainCount != 1 || info.pSwapchains[0] != swapchain)
@@ -134,8 +139,9 @@ struct LsfgNxRuntime {
 
         FrameSlot& slot = prepareSlot();
 
-        const size_t sourceIndex = static_cast<size_t>((realFrameIndex + 1U) & 1U);
-        const VkImage sourceImage = backend->sourceImage(*context, sourceIndex);
+		// Seed the previous image without advancing the backend's dispatch phase.
+		const size_t sourceIndex = static_cast<size_t>((realFrameIndex + (historyValid ? 1U : 0U)) & 1U);
+		const VkImage sourceImage = backend->sourceImage(*context, sourceIndex);
 
         std::vector<VkSemaphore> applicationWaits;
         if (info.waitSemaphoreCount) {
@@ -147,22 +153,33 @@ struct LsfgNxRuntime {
         recordCapture(slot.frame, swapchainImages.at(originalImageIndex), sourceImage,
             sourceInitialized.at(sourceIndex));
 
-        if (realFrameIndex == 0) {
-            slot.frame.end(*vulkan);
+		if (!historyValid) {
+			slot.frame.end(*vulkan);
             slot.frame.submit(*vulkan,
                 std::move(applicationWaits), VK_NULL_HANDLE, 0,
                 {slot.original.handle()}, VK_NULL_HANDLE, 0,
                 slot.completion.handle());
             sourceInitialized.at(sourceIndex) = true;
             slot.pending = true;
-            ++realFrameIndex;
-            return presentOriginal(
+			historyValid = true;
+			return presentOriginal(
                 queue, info, originalImageIndex, slot.original.handle(), true);
-        }
+		}
 
-        backend->recordFrame(*context, slot.frame);
+		backend->recordFrame(*context, slot.frame);
 
-        recordOutput(slot.frame, backend->destinationImage(*context, 0),
+		if (historyWarmup) {
+			--historyWarmup;
+			slot.frame.end(*vulkan);
+			slot.frame.submit(*vulkan, std::move(applicationWaits), VK_NULL_HANDLE, 0, {slot.original.handle()}, VK_NULL_HANDLE, 0,
+							  slot.completion.handle());
+			sourceInitialized.at(sourceIndex) = true;
+			slot.pending = true;
+			++realFrameIndex;
+			return presentOriginal(queue, info, originalImageIndex, slot.original.handle(), true);
+		}
+
+		recordOutput(slot.frame, backend->destinationImage(*context, 0),
             swapchainImages.at(originalImageIndex));
         slot.frame.end(*vulkan);
         slot.frame.submit(*vulkan,
@@ -312,8 +329,10 @@ private:
     std::vector<FrameSlot> slots;
 
     std::array<bool, 2> sourceInitialized{false, false};
-    uint64_t realFrameIndex{};
-    size_t slotCursor{};
+	uint64_t realFrameIndex{1};
+	bool historyValid = false;
+	unsigned historyWarmup = 0;
+	size_t slotCursor{};
 };
 
 extern "C" LsfgNxRuntime *lsfg_nx_create(const LsfgNxCreateInfo *info) {
@@ -329,6 +348,12 @@ extern "C" LsfgNxRuntime *lsfg_nx_create(const LsfgNxCreateInfo *info) {
 
 extern "C" void lsfg_nx_destroy(LsfgNxRuntime *runtime) {
     delete runtime;
+}
+
+extern "C" void lsfg_nx_reset_history(LsfgNxRuntime *runtime) {
+	if (runtime) {
+		runtime->resetHistory();
+	}
 }
 
 extern "C" bool lsfg_nx_present(LsfgNxRuntime *runtime, VkQueue queue,

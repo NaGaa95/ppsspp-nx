@@ -17,6 +17,12 @@
 #include "GPU/Common/DepalettizeShaderCommon.h"
 
 #include "UnitTest.h"
+#ifdef PPSSPP_DEKO3D_SHADER_TESTS
+#include "Common/GPU/Deko3D/ShaderCompiler.h"
+#include "Common/GPU/thin3d.h"
+#include "Common/File/FileUtil.h"
+#include "GPU/Common/TextureShaderCommon.h"
+#endif
 
 #if PPSSPP_PLATFORM(WINDOWS)
 #include <wrl/client.h>
@@ -123,6 +129,13 @@ bool TestCompileShader(const char *buffer, ShaderLanguage lang, ShaderStage stag
 #endif
 
 	case ShaderLanguage::GLSL_VULKAN:
+#ifdef PPSSPP_DEKO3D_SHADER_TESTS
+	{
+		std::string binary;
+		uint32_t arrays, textures;
+		return CompileDeko3DShader(stage, buffer, &binary, &arrays, &textures, errorMessage);
+	}
+#endif
 		return GLSLtoSPV(StageToVulkan(stage), buffer, GLSLVariant::VULKAN, spirv, errorMessage);
 	case ShaderLanguage::GLSL_1xx:
 		return GLSLtoSPV(StageToVulkan(stage), buffer, GLSLVariant::GL140, spirv, errorMessage);
@@ -385,6 +398,9 @@ bool TestVertexShaders() {
 		uint64_t id64 = rng.R64();
 		VShaderID id;
 		id.FromUint64(id64);
+#ifdef PPSSPP_DEKO3D_SHADER_TESTS
+		id.SetBit(VS_BIT_SIMPLE_STEREO, false);
+#endif
 
 		// The generated bits need some adjustment:
 
@@ -463,6 +479,10 @@ bool TestFragmentShaders() {
 		uint64_t id64 = rng.R64();
 		FShaderID id;
 		id.FromUint64(id64);
+#ifdef PPSSPP_DEKO3D_SHADER_TESTS
+		id.SetBit(FS_BIT_STEREO, false);
+		id.SetBit(FS_BIT_USE_FRAMEBUFFER_FETCH, false);
+#endif
 
 		// bits we don't need to test because they are irrelevant on d3d11
 		id.SetBit(FS_BIT_NO_DEPTH_CANNOT_DISCARD_STENCIL, false);
@@ -521,12 +541,106 @@ bool TestFragmentShaders() {
 	return true;
 }
 
+#ifdef PPSSPP_DEKO3D_SHADER_TESTS
+static bool TestDeko3DClipDistanceHeaders() {
+	// TGSI stores clip distances in vec4s. Padding components must not become clip planes.
+	for (uint32_t count = 0; count <= 8; ++count) {
+		std::string source = "#version 450\nlayout(location=0) in vec4 position;\n";
+		if (count) {
+			source += StringFromFormat("out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[%u]; };\n", count);
+		}
+		source += "void main() { gl_Position=position;\n";
+		for (uint32_t i = 0; i < count; ++i) {
+			source += StringFromFormat("gl_ClipDistance[%u] = position.x + %u.0;\n", i, i);
+		}
+		source += "}\n";
+		std::string binary, error;
+		uint32_t arrays = 0, textures = 0;
+		if (!CompileDeko3DShader(ShaderStage::Vertex, source.c_str(), &binary, &arrays, &textures, &error)) {
+			printf("Deko3D clip-distance shader (%u planes): %s\n", count, error.c_str());
+			return false;
+		}
+		uint32_t controlSize, programsOffset, entrypoint;
+		EXPECT_TRUE(binary.size() >= 24);
+		memcpy(&controlSize, binary.data() + 8, sizeof(controlSize));
+		memcpy(&programsOffset, binary.data() + 16, sizeof(programsOffset));
+		EXPECT_TRUE(programsOffset + 8 <= binary.size());
+		memcpy(&entrypoint, binary.data() + programsOffset + 4, sizeof(entrypoint));
+		// DKSH's graphics entry point starts with Maxwell's 80-byte header. OMAP C is at byte 72.
+		const size_t header = (size_t)controlSize + entrypoint;
+		EXPECT_TRUE(header + 80 <= binary.size());
+		const uint8_t clipMask = (uint8_t)binary[header + 72];
+		EXPECT_EQ_INT(clipMask, (1u << count) - 1);
+	}
+	return true;
+}
+
+static bool TestDeko3DThin3DShaders() {
+	const ShaderLanguageDesc language(GLSL_VULKAN);
+	for (int i = 0; i < Draw::VS_MAX_PRESET; ++i) {
+		for (bool tint : {false, true}) {
+			const std::string source = Draw::GenerateVertexShaderPreset(language, (Draw::VertexShaderPreset)i, tint);
+			std::string binary, error;
+			uint32_t arrays = 0, textures = 0;
+			EXPECT_TRUE(CompileDeko3DShader(ShaderStage::Vertex, source.c_str(), &binary, &arrays, &textures, &error, 1));
+			EXPECT_EQ_INT(textures, 0);
+		}
+	}
+	for (int i = 0; i < Draw::FS_MAX_PRESET; ++i) {
+		const std::string source = Draw::GenerateFragmentShaderPreset(language, (Draw::FragmentShaderPreset)i);
+		std::string binary, error;
+		uint32_t arrays = 0, textures = 0;
+		EXPECT_TRUE(CompileDeko3DShader(ShaderStage::Fragment, source.c_str(), &binary, &arrays, &textures, &error, 1));
+		EXPECT_EQ_INT(textures, 1);
+		EXPECT_EQ_INT(arrays, 0);
+		// The emulation path must retain Vulkan binding 1 as native slot 1.
+		EXPECT_TRUE(CompileDeko3DShader(ShaderStage::Fragment, source.c_str(), &binary, &arrays, &textures, &error));
+		EXPECT_EQ_INT(textures, 2);
+	}
+	const char *invalid = "#version 450\nlayout(binding=0) uniform sampler2D tex;\nlayout(location=0) out vec4 color;\nvoid main() { "
+						  "color=texture(tex,vec2(0)); }";
+	std::string binary, error;
+	uint32_t arrays = 0, textures = 0;
+	EXPECT_FALSE(CompileDeko3DShader(ShaderStage::Fragment, invalid, &binary, &arrays, &textures, &error, 1));
+	EXPECT_TRUE(!error.empty());
+	return true;
+}
+
+static bool TestDeko3DScalingShaders() {
+	const char *files[] = {
+		"tex_2xbrz.csh", "tex_4xbrz.csh", "tex_nnedi3_2x_single.csh", "tex_nnedi3_4x_single.csh",
+		"tex_nnedi3_mp_nns16_pass1_buffer.csh", "tex_nnedi3_mp_nns16_pass1_image.csh", "tex_nnedi3_mp_nns16_pass2.csh",
+		"tex_nnedi3_mp_cshift_2x.csh", "tex_nnedi3_mp_cshift_4x.csh",
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(files); ++i) {
+		std::string source, error, binary;
+		if (!File::ReadTextFileToString(Path("assets/shaders") / files[i], &source)) { printf("Could not read %s\n", files[i]); return false; }
+		if (i < 4) { source = StringFromFormat(textureScaleUploadShader, source.c_str()); }
+		uint32_t arrays = 0, textures = 0;
+		if (!CompileDeko3DShader(ShaderStage::Compute, source.c_str(), &binary, &arrays, &textures, &error)) {
+			printf("deko3d scaling shader %s failed: %s\n", files[i], error.c_str()); return false;
+		}
+	}
+	return true;
+}
+#endif
+
 bool TestShaderGenerators() {
 #if PPSSPP_PLATFORM(WINDOWS)
 	LoadD3D11();
 	init_glslang();
 #else
 	init_glslang();
+#endif
+
+#ifdef PPSSPP_DEKO3D_SHADER_TESTS
+	if (!TestDeko3DClipDistanceHeaders()) {
+		return false;
+	}
+	if (!TestDeko3DThin3DShaders()) {
+		return false;
+	}
+	if (!TestDeko3DScalingShaders()) { return false; }
 #endif
 
 	if (!TestStencilShaders()) {

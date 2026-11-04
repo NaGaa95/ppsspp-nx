@@ -92,8 +92,10 @@ SDLJoystick *joystick = NULL;
 #if PPSSPP_PLATFORM(SWITCH)
 #include <switch.h>
 #include "Common/GPU/Vulkan/SwitchLSFG.h"
+#include "Common/GPU/Deko3D/DekoContext.h"
 #include "UI/SwitchLibrary.h"
 #include "UI/SwitchUpdate.h"
+#include "Common/SwitchSaltyNX.h"
 
 #define LIBNX_SWKBD_LIMIT 500 // enforced by HOS
 extern "C" {
@@ -2482,11 +2484,16 @@ int main(int argc, char *argv[]) {
 
 	// After NativeInit, code should no longer look at cmdLineOptions, they should have been translated
 	// into g_Config settings. This is because NativeInit may modify g_Config settings based on the command line options.
+#if PPSSPP_PLATFORM(SWITCH)
+	saltynx_start();
+#endif
 	NativeInit(argc, (const char **)argv, cmdLineOptions, path, external_dir, nullptr);
 
 #if PPSSPP_PLATFORM(SWITCH)
 	File::CreateFullPath(Path("/switch/ppsspp-nx/lsfg"));
-	SwitchLSFG_Configure(g_Config.bSwitchFrameGeneration && g_Config.iGPUBackend == (int)GPUBackend::VULKAN, 0.25f, true);
+	SwitchLSFG_Configure(g_Config.iGPUBackend == (int)GPUBackend::VULKAN || g_Config.iGPUBackend == (int)GPUBackend::DEKO3D,
+						 g_Config.fSwitchFrameGenerationFlowScale, g_Config.bSwitchFrameGenerationPerformance,
+						 g_Config.iGPUBackend == (int)GPUBackend::DEKO3D);
 	SwitchLibrary::Initialize();
 	File::CreateFullPath(Path("/switch/ppsspp-nx/cache/mesa"));
 	setenv("MESA_SHADER_CACHE_DIR", "/switch/ppsspp-nx/cache/mesa", 1);
@@ -2516,6 +2523,7 @@ int main(int argc, char *argv[]) {
 			h = g_Config.iWindowHeight;
 	}
 
+#if !PPSSPP_PLATFORM(SWITCH)
 	// Switch away from Vulkan if not available.
 	int fallbackGPUBackend = -1;
 	switch ((GPUBackend)g_Config.iGPUBackend) {
@@ -2545,11 +2553,18 @@ int main(int argc, char *argv[]) {
 		break;
 	}
 
+#endif
 	SDL_Window *window = nullptr;
 	WindowDesc windowDesc;
 	auto initializeBackend = [&](GPUBackend backend, GraphicsContext **graphicsContext, std::string *errorMessage) -> bool {
 		GraphicsContext *ctx = nullptr;
 		windowDesc = {};
+#if PPSSPP_PLATFORM(SWITCH)
+		if (!g_Config.IsBackendEnabled(backend)) {
+			*errorMessage = "The selected graphics backend is unavailable";
+			return false;
+		}
+#endif
 		if (backend == GPUBackend::OPENGL || backend == GPUBackend::ZINK) {
 #if PPSSPP_PLATFORM(SWITCH)
 			setenv("GALLIUM_DRIVER", backend == GPUBackend::ZINK ? "zink" : "nouveau", 1);
@@ -2562,6 +2577,21 @@ int main(int argc, char *argv[]) {
 			windowDesc.data2 = (void *)glContext;
 
 			ctx = new SDLGLGraphicsContext();
+#if PPSSPP_PLATFORM(SWITCH)
+		} else if (backend == GPUBackend::DEKO3D) {
+			SDL_PropertiesID properties = SDL_CreateProperties();
+			SDL_SetStringProperty(properties, SDL_PROP_WINDOW_CREATE_TITLE_STRING, "Initializing deko3d...");
+			SDL_SetNumberProperty(properties, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, w);
+			SDL_SetNumberProperty(properties, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, h);
+			SDL_SetNumberProperty(properties, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, mode | SDL_WINDOW_HIDDEN);
+			SDL_SetBooleanProperty(properties, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, true);
+			window = SDL_CreateWindowWithProperties(properties);
+			SDL_DestroyProperties(properties);
+			if (!window) { *errorMessage = SDL_GetError(); return false; }
+			windowDesc.winsys = WINDOWSYSTEM_SDL;
+			windowDesc.data1 = window;
+			ctx = new Deko3DGraphicsContext();
+#endif
 #if PPSSPP_PLATFORM(MAC)
 		} else if (backend == GPUBackend::METAL) {
 			window = SDL_CreateWindow("Initializing graphics...", w, h, (SDL_WindowFlags)(mode | SDL_WINDOW_METAL | SDL_WINDOW_HIDDEN));
@@ -2669,6 +2699,10 @@ int main(int argc, char *argv[]) {
 	std::string error_message;
 	if (!initializeBackend((GPUBackend)g_Config.iGPUBackend, &graphicsContext, &error_message)) {
 		fprintf(stderr, "Failed to initialize graphics backend: %s\n", error_message.c_str());
+#if PPSSPP_PLATFORM(SWITCH)
+		SDL_Quit();
+		return 1;
+#else
 		if (fallbackGPUBackend != -1) {
 			fprintf(stderr, "Attempting to fall back to %s...\n", GPUBackendToString((GPUBackend)fallbackGPUBackend).c_str());
 			g_Config.iGPUBackend = fallbackGPUBackend;
@@ -2683,7 +2717,11 @@ int main(int argc, char *argv[]) {
 			SDL_Quit();
 			return 1;
 		}
+#endif
 	}
+
+	// Initialization can select a fallback after NativeInit set the active backend.
+	SetGPUBackend((GPUBackend)g_Config.iGPUBackend);
 
 	// At this point, we have a window that we can show finally.
 	SDL_ShowWindow(window);
@@ -2732,8 +2770,10 @@ int main(int argc, char *argv[]) {
 		imageData = NULL;
 	}
 
+#if !PPSSPP_PLATFORM(SWITCH)
 	// OK, we have a valid graphics backend selected. Let's clear the failures.
 	g_Config.sFailedGPUBackends.clear();
+#endif
 
 #ifdef MOBILE_DEVICE
 	SDL_HideCursor();
@@ -2920,6 +2960,7 @@ int main(int argc, char *argv[]) {
 	NativeShutdown();
 
 #if PPSSPP_PLATFORM(SWITCH)
+	saltynx_stop();
 	SwitchLibrary::Shutdown();
 #endif
 

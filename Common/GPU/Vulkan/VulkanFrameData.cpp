@@ -5,6 +5,7 @@
 #include "Common/StringUtils.h"
 #if PPSSPP_PLATFORM(SWITCH)
 #include "Common/GPU/Vulkan/SwitchLSFG.h"
+#include "Common/SwitchSaltyNX.h"
 #endif
 
 #if 0 // def _DEBUG
@@ -153,10 +154,19 @@ VkResult FrameData::QueuePresent(VulkanContext *vulkan, FrameDataShared &shared)
 #if PPSSPP_PLATFORM(SWITCH)
 	VkResult result = VK_SUCCESS;
 	if (SwitchLSFG_Present(vulkan->GetGraphicsQueue(), present, result)) {
+		if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
+			saltynx_frame(3);
+		}
 		return result;
 	}
 #endif
-	return vkQueuePresentKHR(vulkan->GetGraphicsQueue(), &present);
+	const VkResult presentResult = vkQueuePresentKHR(vulkan->GetGraphicsQueue(), &present);
+#if PPSSPP_PLATFORM(SWITCH)
+	if (presentResult == VK_SUCCESS || presentResult == VK_SUBOPTIMAL_KHR) {
+		saltynx_frame(3);
+	}
+#endif
+	return presentResult;
 }
 
 bool FrameData::AcquireExtraSwapchain(VulkanContext *vulkan, VKRSwapchain *swapchain) {

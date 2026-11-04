@@ -6,6 +6,7 @@
 #include "Common/GPU/thin3d.h"
 #include "Common/GPU/ShaderWriter.h"
 #include "Common/Log.h"
+#include "Common/StringUtils.h"
 #include "Common/System/Display.h"
 
 namespace Draw {
@@ -38,7 +39,10 @@ size_t DataFormatSizeInBytes(DataFormat fmt) {
 	case DataFormat::R16_UNORM: return 2;
 
 	case DataFormat::R16_FLOAT: return 2;
+	case DataFormat::R16G16_UNORM:
 	case DataFormat::R16G16_FLOAT: return 4;
+	case DataFormat::R16G16B16A16_UNORM:
+	case DataFormat::R16G16B16A16_SNORM:
 	case DataFormat::R16G16B16A16_FLOAT: return 8;
 	case DataFormat::R32_FLOAT: return 4;
 	case DataFormat::R32G32_FLOAT: return 8;
@@ -65,6 +69,9 @@ const char *DataFormatToString(DataFormat fmt) {
 	case DataFormat::R8G8B8A8_UNORM: return "R8G8B8A8_UNORM";
 	case DataFormat::B8G8R8A8_UNORM: return "B8G8R8A8_UNORM";
 	case DataFormat::R16_UNORM: return "R16_UNORM";
+	case DataFormat::R16G16_UNORM: return "R16G16_UNORM";
+	case DataFormat::R16G16B16A16_UNORM: return "R16G16B16A16_UNORM";
+	case DataFormat::R16G16B16A16_SNORM: return "R16G16B16A16_SNORM";
 	case DataFormat::R16_FLOAT: return "R16_FLOAT";
 	case DataFormat::R32_FLOAT: return "R32_FLOAT";
 
@@ -128,6 +135,10 @@ int DataFormatNumChannels(DataFormat fmt) {
 	case DataFormat::R16_FLOAT:
 	case DataFormat::R32_FLOAT:
 		return 1;
+	case DataFormat::R16G16_UNORM:
+		return 2;
+	case DataFormat::R16G16B16A16_UNORM:
+	case DataFormat::R16G16B16A16_SNORM:
 	case DataFormat::R8G8B8A8_UNORM:
 	case DataFormat::R8G8B8A8_UNORM_SRGB:
 	case DataFormat::B8G8R8A8_UNORM:
@@ -210,8 +221,7 @@ const UniformDef g_uniforms[] = {
 	{ "vec2", "TintSaturation", 1 },
 };
 
-static ShaderModule *GenerateVShader(DrawContext *draw, VertexShaderPreset preset, bool tintSupported) {
-	const ShaderLanguageDesc &shaderLanguageDesc = draw->GetShaderLanguageDesc();
+std::string GenerateVertexShaderPreset(const ShaderLanguageDesc &shaderLanguageDesc, VertexShaderPreset preset, bool tintSupported) {
 	char code[2048];
 	ShaderWriter vsWriter(code, shaderLanguageDesc, ShaderStage::Vertex);
 
@@ -252,11 +262,10 @@ vec3 hsv2rgb(vec3 c) {
 		vsWriter.C("oTexCoord0 = TexCoord0;\n");
 	}
 	vsWriter.EndVSMain(texCoords ? Slice(g_varyingsTex) : Slice(g_varyings));
-	return draw->CreateShaderModule(ShaderStage::Vertex, shaderLanguageDesc.shaderLanguage, (const uint8_t *)code, strlen(code));
+	return code;
 }
 
-static ShaderModule *GenerateFShader(DrawContext *draw, FragmentShaderPreset preset) {
-	const ShaderLanguageDesc &shaderLanguageDesc = draw->GetShaderLanguageDesc();
+std::string GenerateFragmentShaderPreset(const ShaderLanguageDesc &shaderLanguageDesc, FragmentShaderPreset preset) {
 	char code[2048];
 	ShaderWriter fsWriter(code, shaderLanguageDesc, ShaderStage::Fragment);
 
@@ -285,7 +294,7 @@ static ShaderModule *GenerateFShader(DrawContext *draw, FragmentShaderPreset pre
 	}
 	fsWriter.C("col.rgb *= oColor0.a;\n");  // premultiply alpha
 	fsWriter.EndFSMain("col");
-	return draw->CreateShaderModule(ShaderStage::Fragment, shaderLanguageDesc.shaderLanguage, (const uint8_t *)code, strlen(code));
+	return code;
 }
 
 bool DrawContext::CreatePresets() {
@@ -293,14 +302,20 @@ bool DrawContext::CreatePresets() {
 	bool tintSupported = !bugs_.Has(Bugs::RASPBERRY_SHADER_COMP_HANG);
 
 	for (int i = 0; i < VS_MAX_PRESET; i++) {
-		vsPresets_[i] = GenerateVShader(this, (VertexShaderPreset)i, tintSupported);
+		const std::string code = GenerateVertexShaderPreset(shaderLanguageDesc_, (VertexShaderPreset)i, tintSupported);
+		const std::string tag = StringFromFormat("thin3d VS preset %d", i);
+		vsPresets_[i] = CreateShaderModule(ShaderStage::Vertex, shaderLanguageDesc_.shaderLanguage, (const uint8_t *)code.data(),
+										   code.size(), tag.c_str());
 		if (!vsPresets_[i]) {
 			WARN_LOG(Log::G3D, "Failed to create vertex shader preset %d", i);
 			return false;
 		}
 	}
 	for (int i = 0; i < FS_MAX_PRESET; i++) {
-		fsPresets_[i] = GenerateFShader(this, (FragmentShaderPreset)i);
+		const std::string code = GenerateFragmentShaderPreset(shaderLanguageDesc_, (FragmentShaderPreset)i);
+		const std::string tag = StringFromFormat("thin3d FS preset %d", i);
+		fsPresets_[i] = CreateShaderModule(ShaderStage::Fragment, shaderLanguageDesc_.shaderLanguage, (const uint8_t *)code.data(),
+										   code.size(), tag.c_str());
 		if (!fsPresets_[i]) {
 			WARN_LOG(Log::G3D, "Failed to create fragment shader preset %d", i);
 			return false;

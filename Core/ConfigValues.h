@@ -137,6 +137,7 @@ enum class GPUBackend {
 	VULKAN = 3,
 	METAL = 4,
 	ZINK = 5,
+	DEKO3D = 6,
 };
 
 // What an external display (a TV) shows, where the platform lets us choose. See docs/multi-swapchain.md.

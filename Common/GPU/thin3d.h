@@ -152,6 +152,10 @@ enum FragmentShaderPreset : int {
 	FS_MAX_PRESET,
 };
 
+// Shader generation is independent of device creation so presets can be compiled in host tests.
+std::string GenerateVertexShaderPreset(const ShaderLanguageDesc &language, VertexShaderPreset preset, bool tintSupported);
+std::string GenerateFragmentShaderPreset(const ShaderLanguageDesc &language, FragmentShaderPreset preset);
+
 enum class TextureType : uint8_t {
 	UNKNOWN,
 	LINEAR1D,

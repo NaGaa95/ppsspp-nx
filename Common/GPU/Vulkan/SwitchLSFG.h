@@ -2,7 +2,18 @@
 
 #include <vulkan/vulkan_core.h>
 
-void SwitchLSFG_Configure(bool prepared, float flowScale, bool performanceMode);
+void SwitchLSFG_Configure(bool prepared, float flowScale, bool performanceMode, bool deko3d = false);
+// Published by emulation frame timing; render threads consume this atomically.
+void SwitchLSFG_SetFastForward(bool fastForward);
+
+struct SwitchLSFGDekoState {
+	bool enabled = false, active = false, resetSession = false;
+	uint32_t speedControlState = 0;
+	float flowScale = 0.25f;
+	bool performance = true;
+};
+SwitchLSFGDekoState SwitchLSFG_PollDeko();
+void SwitchLSFG_SetDekoStatus(bool available, bool highRate);
 
 bool SwitchLSFG_PrepareDeviceFeatures(VkPhysicalDevice physicalDevice, void*& featureChain,
 	VkPhysicalDeviceTimelineSemaphoreFeatures& timelineFeature);

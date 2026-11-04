@@ -45,7 +45,7 @@
 #endif
 
 static bool UsingHardwareTextureScaling() {
-	return g_Config.bTexHardwareScaling && (GetGPUBackend() == GPUBackend::VULKAN || GetGPUBackend() == GPUBackend::METAL) && !g_Config.bSoftwareRendering;
+	return g_Config.bTexHardwareScaling && (GetGPUBackend() == GPUBackend::VULKAN || GetGPUBackend() == GPUBackend::METAL || GetGPUBackend() == GPUBackend::DEKO3D) && !g_Config.bSoftwareRendering;
 }
 
 static std::string TextureTranslateName(std::string_view value) {
@@ -169,6 +169,9 @@ void BuildGraphicsSettings(SettingsPage *page) {
 				choice->HideChoice((int)GPUBackend::DIRECT3D11);
 			if (!g_Config.IsBackendEnabled(GPUBackend::VULKAN))
 				choice->HideChoice((int)GPUBackend::VULKAN);
+			if (!g_Config.IsBackendEnabled(GPUBackend::DEKO3D)) {
+				choice->HideChoice((int)GPUBackend::DEKO3D);
+			}
 			if (!g_Config.IsBackendEnabled(GPUBackend::ZINK))
 				choice->HideChoice((int)GPUBackend::ZINK);
 			if (!g_Config.IsBackendEnabled(GPUBackend::METAL))
@@ -354,7 +357,7 @@ void BuildGraphicsSettings(SettingsPage *page) {
 
 	page->Header("Texture upscaling");
 
-	if (GetGPUBackend() == GPUBackend::VULKAN || GetGPUBackend() == GPUBackend::METAL) {
+	if (GetGPUBackend() == GPUBackend::VULKAN || GetGPUBackend() == GPUBackend::METAL || GetGPUBackend() == GPUBackend::DEKO3D) {
 		page->Custom("GPU texture upscaler (fast)", [host](UI::ViewGroup *parent) -> UI::View * {
 			auto gr = GetI18NCategory(I18NCat::GRAPHICS);
 			ChoiceWithValueDisplay *textureShaderChoice = parent->Add(new ChoiceWithValueDisplay(&g_Config.sTextureShaderName, gr->T("GPU texture upscaler (fast)"), &TextureTranslateName));

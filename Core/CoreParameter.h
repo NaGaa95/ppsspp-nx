@@ -32,6 +32,7 @@ enum GPUCore : int {
 	GPUCORE_VULKAN = 4,
 	GPUCORE_NULL = 5,  // Draws nothing, see GPU_Null.h.
 	GPUCORE_METAL = 6,
+	GPUCORE_DEKO3D = 7,
 };
 
 // The XMB session a game was started from.

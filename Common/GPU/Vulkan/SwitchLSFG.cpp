@@ -1,4 +1,7 @@
 #include "Common/GPU/Vulkan/SwitchLSFG.h"
+#include "Core/Config.h"
+#include "Common/System/System.h"
+#include "Core/System.h"
 
 #include "Common/GPU/Vulkan/VulkanLoader.h"
 #include "Common/GPU/Vulkan/lsfg/lsfg_bridge.h"
@@ -21,8 +24,13 @@ std::atomic_bool s_prepared{false};
 std::atomic_bool s_installed{false};
 std::atomic_bool s_available{false};
 std::atomic_bool s_enabledRequested{false};
+std::atomic_int s_sessionOverride{-1};
 std::atomic_bool s_highRatePassthrough{false};
 std::atomic_bool s_resetSessionRequested{false};
+std::atomic_bool s_deko3d{false};
+// Bit 0 is fast-forward; the remaining bits count speed-control transitions.
+std::atomic_uint32_t s_speedControlState{0};
+uint32_t s_observedSpeedControlState = 0;
 
 float s_flowScale = 0.25f;
 bool s_performanceMode = true;
@@ -93,6 +101,7 @@ void ResetSwapchain()
 	s_swapchainImages.clear();
 	s_swapchainCompatible = false;
 	s_initAttempted = false;
+	s_observedSpeedControlState = 0;
 	s_available.store(false, std::memory_order_release);
 	ResetTiming();
 }
@@ -159,26 +168,39 @@ bool TryCreateRuntime(VkQueue queue)
 }
 }
 
-void SwitchLSFG_Configure(bool prepared, float flowScale, bool performanceMode)
-{
+void SwitchLSFG_Configure(bool prepared, float flowScale, bool performanceMode, bool deko3d) {
 	s_flowScale = std::isfinite(flowScale) && flowScale == 0.5f ? 0.5f : 0.25f;
 	s_performanceMode = performanceMode;
 	const bool installed = FileReadable(kShaderDllPath);
 	s_installed.store(installed, std::memory_order_release);
-	prepared = prepared && installed && EnableNvkNoCbuf();
+	s_deko3d.store(deko3d, std::memory_order_release);
+	prepared = prepared && installed && (deko3d || EnableNvkNoCbuf());
 	s_prepared.store(prepared, std::memory_order_release);
+	s_sessionOverride.store(-1, std::memory_order_release);
 	s_enabledRequested.store(false, std::memory_order_release);
-	s_available.store(false, std::memory_order_release);
+	s_available.store(deko3d && prepared, std::memory_order_release);
 	s_highRatePassthrough.store(false, std::memory_order_release);
 	s_resetSessionRequested.store(false, std::memory_order_release);
+	s_speedControlState.store(0, std::memory_order_release);
+}
+
+void SwitchLSFG_SetFastForward(bool fastForward) {
+	uint32_t state = s_speedControlState.load(std::memory_order_relaxed);
+	while (((state & 1) != 0) != fastForward) {
+		const uint32_t next = ((state + 2) & ~1u) | (fastForward ? 1u : 0u);
+		if (s_speedControlState.compare_exchange_weak(state, next, std::memory_order_release, std::memory_order_relaxed)) {
+			break;
+		}
+	}
 }
 
 bool SwitchLSFG_PrepareDeviceFeatures(VkPhysicalDevice physicalDevice, void*& featureChain,
 	VkPhysicalDeviceTimelineSemaphoreFeatures& timelineFeature)
 {
 	s_deviceFeatureEnabled = false;
-	if (!s_prepared.load(std::memory_order_acquire))
+	if (!s_prepared.load(std::memory_order_acquire) || s_deko3d.load(std::memory_order_acquire)) {
 		return false;
+	}
 
 	VkPhysicalDeviceProperties properties{};
 	vkGetPhysicalDeviceProperties(physicalDevice, &properties);
@@ -296,7 +318,27 @@ bool SwitchLSFG_Present(VkQueue queue, const VkPresentInfoKHR& presentInfo, VkRe
 		presentInfo.pSwapchains[0] != s_swapchain)
 		return false;
 
-	const bool requested = s_enabledRequested.load(std::memory_order_acquire);
+	const int sessionOverride = s_sessionOverride.load(std::memory_order_acquire);
+	const bool enabled = g_Config.bSwitchFrameGeneration && sessionOverride != 0;
+	const bool inGame = GetUIState() == UISTATE_INGAME;
+	const uint32_t speedControlState = s_speedControlState.load(std::memory_order_acquire);
+	const bool fastForward = (speedControlState & 1) != 0;
+	if (speedControlState != s_observedSpeedControlState) {
+		ResetTiming();
+		if (s_runtime) {
+			lsfg_nx_reset_history(s_runtime);
+		}
+		s_observedSpeedControlState = speedControlState;
+	}
+	const bool requested = enabled && inGame && !fastForward;
+	const float flowScale = g_Config.fSwitchFrameGenerationFlowScale == 0.5f ? 0.5f : 0.25f;
+	if (flowScale != s_flowScale || g_Config.bSwitchFrameGenerationPerformance != s_performanceMode) {
+		DestroyRuntime();
+		s_initAttempted = false;
+		s_flowScale = flowScale;
+		s_performanceMode = g_Config.bSwitchFrameGenerationPerformance;
+	}
+	s_enabledRequested.store(enabled, std::memory_order_release);
 	uint64_t sourceInterval = 0;
 	if (!requested || s_rateDecision != 0)
 		sourceInterval = ObserveSourcePresent();
@@ -313,8 +355,10 @@ bool SwitchLSFG_Present(VkQueue queue, const VkPresentInfoKHR& presentInfo, VkRe
 
 	if (!requested)
 	{
-		DestroyRuntime();
-		s_initAttempted = false;
+		if (!enabled || !inGame) {
+			DestroyRuntime();
+			s_initAttempted = false;
+		}
 		s_highRatePassthrough.store(false, std::memory_order_release);
 		return false;
 	}
@@ -356,6 +400,33 @@ bool SwitchLSFG_IsPrepared()
 	return s_prepared.load(std::memory_order_acquire);
 }
 
+SwitchLSFGDekoState SwitchLSFG_PollDeko() {
+	SwitchLSFGDekoState state;
+	if (!s_deko3d.load(std::memory_order_acquire)) {
+		return state;
+	}
+	state.enabled = s_prepared.load(std::memory_order_acquire) && g_Config.bSwitchFrameGeneration &&
+					s_sessionOverride.load(std::memory_order_acquire) != 0;
+	state.speedControlState = s_speedControlState.load(std::memory_order_acquire);
+	state.active = state.enabled && GetUIState() == UISTATE_INGAME && !(state.speedControlState & 1);
+	state.flowScale = g_Config.fSwitchFrameGenerationFlowScale == 0.5f ? 0.5f : 0.25f;
+	state.performance = g_Config.bSwitchFrameGenerationPerformance;
+	state.resetSession = s_resetSessionRequested.exchange(false, std::memory_order_acq_rel);
+	s_enabledRequested.store(state.enabled, std::memory_order_release);
+	return state;
+}
+
+void SwitchLSFG_SetDekoStatus(bool available, bool highRate) {
+	if (!s_deko3d.load(std::memory_order_acquire)) {
+		return;
+	}
+	s_available.store(available && s_prepared.load(std::memory_order_acquire), std::memory_order_release);
+	s_highRatePassthrough.store(available && highRate, std::memory_order_release);
+	if (!available) {
+		s_enabledRequested.store(false, std::memory_order_release);
+	}
+}
+
 bool SwitchLSFG_IsInstalled()
 {
 	return s_installed.load(std::memory_order_acquire);
@@ -381,12 +452,14 @@ bool SwitchLSFG_RequestEnabled(bool enabled, float sourceFPS)
 {
 	if (enabled && (!s_available.load(std::memory_order_acquire) || sourceFPS < 27.0f || sourceFPS > 33.5f))
 		return false;
+	s_sessionOverride.store(enabled ? 1 : 0, std::memory_order_release);
 	s_enabledRequested.store(enabled, std::memory_order_release);
 	return true;
 }
 
 void SwitchLSFG_ResetSession()
 {
+	s_sessionOverride.store(-1, std::memory_order_release);
 	s_enabledRequested.store(false, std::memory_order_release);
 	s_resetSessionRequested.store(true, std::memory_order_release);
 }

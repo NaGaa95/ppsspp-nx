@@ -221,6 +221,15 @@ set(GPU_SOURCES
 add_library(GPU OBJECT ${GPU_SOURCES})
 target_compile_features(GPU PUBLIC cxx_std_17)
 
+if(USE_LIBNX)
+	target_sources(GPU PRIVATE
+		Deko3D/GPU_Deko3D.cpp Deko3D/GPU_Deko3D.h
+		Deko3D/DrawEngineDeko3D.cpp Deko3D/DrawEngineDeko3D.h
+		Deko3D/FramebufferManagerDeko3D.cpp Deko3D/FramebufferManagerDeko3D.h
+		Deko3D/ShaderManagerDeko3D.cpp Deko3D/ShaderManagerDeko3D.h
+		Deko3D/TextureCacheDeko3D.cpp Deko3D/TextureCacheDeko3D.h)
+endif()
+
 if(LIBRETRO)
 	target_include_directories(GPU PRIVATE ${CMAKE_SOURCE_DIR}/libretro/libretro-common/include)
 endif()

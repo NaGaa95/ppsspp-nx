@@ -1007,10 +1007,16 @@ VKContext::VKContext(VulkanContext *vulkan, bool useRenderThread)
 	// Additional swapchains go with a real main one.
 	caps_.multipleSwapchains = vulkan->GetPresentation() == nullptr;
 
-	if (vulkan->GetPresentation()) {
+#if PPSSPP_PLATFORM(SWITCH)
+	const bool fixedFifo = true;
+#else
+	const bool fixedFifo = vulkan->GetPresentation() != nullptr;
+#endif
+	if (fixedFifo) {
 		// No real present modes exist in this model (the host, e.g. libretro, owns real presentation
 		// and controls its own timing) - we always hand back one finished frame at a time serially,
 		// which is closest in spirit to FIFO.
+		// Switch also fixes the swapchain to FIFO, so fast-forward must use skip-flip.
 		caps_.presentModesSupported = PresentMode::FIFO;
 	} else {
 		for (auto mode : vulkan->GetAvailablePresentModes()) {
