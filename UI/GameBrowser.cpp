@@ -398,7 +398,11 @@ void GameBrowser::Refresh() {
 
 	if (browseFlags_ & BrowseFlags::HOMEBREW_STORE) {
 		Choice *hbStore = topBar->Add(new Choice(mm->T("Homebrew store"), ImageID("I_HOMEBREW_STORE"), new UI::LinearLayoutParams(WRAP_CONTENT, 64.0f)));
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 		hbStore->OnClick.Handle(this, &GameBrowser::OnHomebrewStore);
+#else
+		hbStore->SetVisibility(UI::V_GONE);
+#endif
 		hbStore->SetRoundCorners(RoundCorners::All);
 	}
 
@@ -705,5 +709,7 @@ void GameBrowser::OnRecentClear(UI::EventParams &e) {
 }
 
 void GameBrowser::OnHomebrewStore(UI::EventParams &e) {
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	screenManager_->push(new StoreScreen());
+#endif
 }

@@ -61,6 +61,12 @@ ENUM_CLASS_BITOPS(GameInfoFlags);
 class FileLoader;
 enum class IdentifiedFileType;
 
+struct GameInfoMetadata {
+	std::string title, id;
+	GameRegion region = GameRegion::UNKNOWN;
+	bool hasConfig = false;
+};
+
 struct GameInfoTex {
 	std::string data;
 	Draw::Texture *texture = nullptr;
@@ -113,6 +119,7 @@ public:
 	std::vector<Path> GetSaveDataDirectories() const;
 
 	std::string GetTitle();
+	bool TryGetMetadata(GameInfoMetadata *metadata);
 	std::string GetDBTitle();  // Falls back to GetTitle if not in the DB.
 
 	void SetTitle(const std::string &newTitle);
@@ -238,6 +245,10 @@ public:
 	// lower-priority load that's already queued for the same data, it queues its own - so don't use it
 	// every frame.
 	std::shared_ptr<GameInfo> GetInfo(Draw::DrawContext *draw, const Path &gamePath, GameInfoFlags wantFlags, GameInfoFlags *outHasFlags = nullptr, GameInfoFlags refetchFlags = GameInfoFlags::EMPTY, TaskPriority priority = TaskPriority::NORMAL);
+	// Main thread only. Queues CPU data without waiting on busy cache/info locks or creating textures.
+	// Returns null if the cache map is busy; outHasFlags is EMPTY when the info lock is busy. Retry next frame.
+	std::shared_ptr<GameInfo> TryGetInfo(const Path &gamePath, GameInfoFlags wantFlags, GameInfoFlags *outHasFlags = nullptr,
+										 TaskPriority priority = TaskPriority::NORMAL);
 	void FlushBGs();  // Gets rid of all BG textures. Also gets rid of bg sounds.
 
 	void CancelAll();

@@ -23,7 +23,13 @@ namespace {
 enum class BrowserMode {
 	Explorer,
 	PickFolder,
+	PickImage,
 };
+
+bool IsImageFile(const Path &path) {
+	const std::string extension = path.GetFileExtension();
+	return extension == ".png" || extension == ".jpg" || extension == ".jpeg";
+}
 
 bool ValidEntryName(std::string_view name) {
 	if (name.empty() || name == "." || name == "..")
@@ -102,7 +108,13 @@ public:
 		: UISimpleBaseDialogScreen(Path(), SimpleDialogFlags::ContentsCanScroll), mode_(mode), current_(start), selected_(std::move(selected)) {}
 
 	const char *tag() const override { return "SwitchFileBrowser"; }
-	std::string_view GetTitle() const override { return mode_ == BrowserMode::PickFolder ? "Choose game folder" : "File Explorer"; }
+	std::string_view GetTitle() const override {
+		if (mode_ == BrowserMode::PickFolder)
+			return "Choose game folder";
+		if (mode_ == BrowserMode::PickImage)
+			return "Choose image";
+		return "File Explorer";
+	}
 	void CreateDialogViews(UI::ViewGroup *parent) override;
 	void dialogFinished(const Screen *dialog, DialogResult result) override {
 		RecreateViews();
@@ -279,7 +291,7 @@ void SwitchFileBrowserScreen::CreateDialogViews(UI::ViewGroup *parent) {
 				selected_(current_);
 			TriggerFinish(DR_OK);
 		});
-	} else {
+	} else if (mode_ == BrowserMode::Explorer) {
 		commands->Add(new Choice("Folder options", ImageID("I_GEAR"), new LinearLayoutParams(1.0f)))->OnClick.Add([this](EventParams &) {
 			screenManager()->push(new SwitchFileActionScreen(current_, [this] { RecreateViews(); }));
 		});
@@ -301,6 +313,12 @@ void SwitchFileBrowserScreen::CreateDialogViews(UI::ViewGroup *parent) {
 		} else if (mode_ == BrowserMode::Explorer) {
 			item->OnClick.Add([this, path = entry.fullName](EventParams &) {
 				screenManager()->push(new SwitchFileActionScreen(path, [this] { RecreateViews(); }));
+			});
+		} else if (mode_ == BrowserMode::PickImage && IsImageFile(entry.fullName)) {
+			item->OnClick.Add([this, path = entry.fullName](EventParams &) {
+				if (selected_)
+					selected_(path);
+				TriggerFinish(DR_OK);
 			});
 		} else {
 			item->SetEnabled(false);
@@ -367,6 +385,10 @@ void SwitchSmbEditScreen::CreateDialogViews(UI::ViewGroup *parent) {
 }
 
 }  // namespace
+
+UIScreen *CreateSwitchImagePickerScreen(const Path &start, std::function<void(const Path &)> selected) {
+	return new SwitchFileBrowserScreen(BrowserMode::PickImage, start, std::move(selected));
+}
 
 void SwitchLibraryScreen::CreateDialogViews(UI::ViewGroup *parent) {
 	using namespace UI;

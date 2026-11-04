@@ -144,11 +144,13 @@ void BuildNetworkingSettings(SettingsPage *page) {
 
 	page->Header();
 
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	page->Choice("Quick start guide for multiplayer", ImageID("I_LINK_OUT")).OnClick([](EventParams &e) {
 		auto n = GetI18NCategory(I18NCat::NETWORKING);
 		std::string url(n->T("MultiplayerQuickStartURL", "https://www.ppsspp.org/docs/multiplayer/quickstart/"));
 		System_LaunchUrl(LaunchUrlType::BROWSER_URL, url);
 	});
+#endif
 
 	// Ad hoc play, the built-in server and UPnP all talk to the local network.
 	auto requestLocalNetwork = [](UI::EventParams &e) {
@@ -250,6 +252,7 @@ void BuildNetworkingSettings(SettingsPage *page) {
 		return parent->Add(new PopupTextInputChoice(host->PageRequesterToken(), &g_Config.sInfrastructureDNSServer, T(I18NCat::NETWORKING, "DNS server"), "", 32, host->PageScreenManager()));
 	}).Disabled(&g_Config.bInfrastructureAutoDNS);
 
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	page->Header("UPnP (port-forwarding)");
 	// Only togglable outside a game - sceNet latches settings like UPnPUseOriginalPort at boot,
 	// and a game that's already mapped its ports wouldn't cope with them disappearing.
@@ -264,15 +267,18 @@ void BuildNetworkingSettings(SettingsPage *page) {
 	page->Setting(&g_Config.bUPnPUseOriginalPort).Enabled(&g_Config.bEnableUPnP);
 	page->Hint({ I18NCat::NETWORKING, "UseOriginalPort Tip", "May not work for all devices or games, see wiki." });
 
+#endif
 	page->Header();
 	page->Link({I18NCat::NETWORKING, "Chat"}, I18NCat::NETWORKING, &BuildChatSettingsPage);
 
 	page->Header({ I18NCat::NETWORKING, "Misc", "Misc (default = compatibility)" });
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	page->Choice("Open PPSSPP Multiplayer Wiki Page", ImageID("I_LINK_OUT")).OnClick([](EventParams &e) {
 		auto n = GetI18NCategory(I18NCat::NETWORKING);
 		std::string url(n->T("MultiplayerHowToURL", "https://github.com/hrydgard/ppsspp/wiki/How-to-play-multiplayer-games-with-PPSSPP"));
 		System_LaunchUrl(LaunchUrlType::BROWSER_URL, url);
 	});
+#endif
 	static const char *wlanChannels[] = {"Auto", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"};
 	page->Setting(&g_Config.iWlanAdhocChannel).Setup([](View *view) {
 		PopupMultiChoice *wlanChannelChoice = static_cast<PopupMultiChoice *>(view);

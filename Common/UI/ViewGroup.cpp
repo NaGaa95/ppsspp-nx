@@ -455,6 +455,11 @@ static float GetDirectionScore(int originIndex, const View *origin, View *destin
 }
 
 NeighborResult ViewGroup::FindNeighbor(View *view, FocusMove direction, NeighborResult result) {
+	if (focusNavigation_) {
+		if (View *destination = focusNavigation_(view, direction)) {
+			return NeighborResult(destination, 0.0f);
+		}
+	}
 	if (!IsEnabled()) {
 		INFO_LOG(Log::UI, "Not enabled");
 		return result;

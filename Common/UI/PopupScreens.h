@@ -316,6 +316,8 @@ public:
 	void HideChoice(int c) {
 		hidden_.insert(c);
 	}
+	// Display this choice first while retaining the original choice values.
+	void SetFirstChoice(int c) { firstChoice_ = c; }
 	int NumChoices() const { return numChoices_; }
 	bool IsChoiceHidden(int c) const {
 		return hidden_.find(c) != hidden_.end();
@@ -382,6 +384,7 @@ private:
 	std::function<void(PopupMultiChoice *)> preOpenCallback_;
 	bool callbackExecuted_ = false;
 	int default_ = -99;
+	int firstChoice_ = -1;
 };
 
 // Allows passing in a dynamic vector of strings. Saves the string.

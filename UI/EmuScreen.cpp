@@ -16,6 +16,9 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #include "ppsspp_config.h"
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+#include "SDL/SwitchLauncher.h"
+#endif
 
 #include <functional>
 
@@ -412,6 +415,9 @@ void EmuScreen::bootComplete() {
 	}
 
 	UpdateUIState(UISTATE_INGAME);
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	SwitchLauncher::RecordLaunch(PSP_CoreParameter().fileToStart);
+#endif
 	System_Notify(SystemNotification::BOOT_DONE);
 	System_Notify(SystemNotification::DISASSEMBLY);
 

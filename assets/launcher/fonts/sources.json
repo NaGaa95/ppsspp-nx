@@ -1,0 +1,21 @@
+{
+  "repository": "https://github.com/notofonts/noto-fonts",
+  "revision": "ffebf8c1ee449e544955a7e813c54f9b73848eac",
+  "files": {
+    "NotoSans-Regular.ttf": "b85c38ecea8a7cfb39c24e395a4007474fa5a4fc864f6ee33309eb4948d232d5",
+    "NotoSansArabic-Regular.ttf": "ceea25b464a656dc3b26849bab9356740401af62aedf1bfa8b7f0d9b75925b1b",
+    "NotoSansHebrew-Regular.ttf": "a7fa16fffb27bedb060a0866267c29e9859aeb9c21cc33f5b3aaf6eb062eca85",
+    "NotoSansKhmer-Regular.ttf": "5c1ec068352f1e1fe8e7a3218230360d054e104d377ef40c0423b17c34c3c259",
+    "NotoSansLao-Regular.ttf": "ebddea479dd4a9b2dfda4a826b9b8664f9ce67255fd8852096a32e937e2e54c0",
+    "NotoSansThai-Regular.ttf": "404ddfb5ed0aaa6b6ec8a85700d682978992062d67da93903967b56cbd9a4acc",
+    "NotoSansSymbols2-Regular.ttf": "630846d528dbe4c4981370a4d0a9475a1fd1491a129bb411f8e157cdb5de13c6",
+    "NotoSansSymbols-Regular.ttf": "8f02f31959bbdf6061547a188248e13f84dc5fdd940326ec494675f453f072bb"
+  },
+  "overrides": {
+    "NotoSansLao-Regular.ttf": {
+      "repository": "https://github.com/notofonts/lao",
+      "revision": "5af3828e5b8ec60719d00ad8da4adb253d3e5bd0",
+      "path": "fonts/NotoSansLao/hinted/ttf/NotoSansLao-Regular.ttf"
+    }
+  }
+}

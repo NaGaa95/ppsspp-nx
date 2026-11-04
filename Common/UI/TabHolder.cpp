@@ -1,3 +1,5 @@
+#include <algorithm>
+
 #include "Common/Math/curves.h"
 #include "Common/Data/Text/I18n.h"
 #include "Common/UI/TabHolder.h"
@@ -65,6 +67,55 @@ TabHolder::TabHolder(Orientation orientation, float stripSize, TabHolderFlags fl
 	contents_ = contentHolder_->Add(new AnchorLayout(new LinearLayoutParams(FILL_PARENT, FILL_PARENT, 1.0f)));
 	contents_->SetClip(true);
 	Add(contentHolder_);
+}
+
+void TabHolder::EnablePaneNavigation(ViewGroup *root) {
+	root->SetFocusNavigation([this, remembered = std::vector<View *>()](View *origin, FocusMove direction) mutable -> View * {
+		if (tabOrientation_ != ORIENT_VERTICAL || !origin || currentTab_ < 0 || currentTab_ >= (int)tabs_.size()) {
+			return nullptr;
+		}
+		ViewGroup *page = tabs_[currentTab_];
+		if (!page) {
+			return nullptr;
+		}
+		remembered.resize(tabs_.size());
+		std::vector<View *> order;
+		page->CollectTabOrder(&order);
+		order.erase(std::remove_if(order.begin(), order.end(),
+								   [](View *view) {
+									   for (ViewGroup *parent = view->Parent(); parent; parent = parent->Parent()) {
+										   if (!parent->IsEnabled() || parent->GetVisibility() != V_VISIBLE) {
+											   return true;
+										   }
+									   }
+									   return false;
+								   }),
+					order.end());
+		if (page->ContainsSubview(origin)) {
+			remembered[currentTab_] = origin;
+			if (direction == FocusMove::LEFT) {
+				return tabStrip_->GetViewByIndex(currentTab_);
+			}
+			if (direction == FocusMove::UP || direction == FocusMove::DOWN) {
+				auto it = std::find(order.begin(), order.end(), origin);
+				if (it == order.end()) {
+					return order.empty() ? origin : order.front();
+				}
+				if (direction == FocusMove::DOWN) {
+					return it + 1 == order.end() ? origin : *(it + 1);
+				}
+				return it == order.begin() ? origin : *(it - 1);
+			}
+			if (direction == FocusMove::RIGHT) {
+				View *next = page->FindNeighbor(origin, direction, NeighborResult()).view;
+				return next ? next : origin;
+			}
+		} else if (tabContainer_->ContainsSubview(origin) && direction == FocusMove::RIGHT) {
+			auto it = std::find(order.begin(), order.end(), remembered[currentTab_]);
+			return it != order.end() ? *it : order.empty() ? origin : order.front();
+		}
+		return nullptr;
+	});
 }
 
 void TabHolder::AddBack(UIScreen *parent) {

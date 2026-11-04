@@ -145,6 +145,11 @@ void GameSettingsScreen::CreateTabs() {
 	const bool showVR = deviceType == DEVICE_TYPE_VR || g_Config.bForceVR;
 
 	for (const PageDef &def : pageDefs) {
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		if (def.build == &BuildToolsSettings || def.build == &BuildVRSettings) {
+			continue;
+		}
+#endif
 		if (def.build == &BuildVRSettings && !showVR) {
 			continue;
 		}

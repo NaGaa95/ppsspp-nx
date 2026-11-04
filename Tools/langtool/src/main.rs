@@ -48,6 +48,8 @@ enum Command {
     ListUnknownLines {},
     CommentUnknownLines {},
     RemoveUnknownLines {},
+    /// Add missing keys from an English INI patch to every language, leaving existing values untouched.
+    AddNewKeys { filename: String },
     AddNewKey {
         section: String,
         key: String,
@@ -836,6 +838,22 @@ fn execute_command(cmd: Command, ai: Option<&Ai>, dry_run: bool, verbose: bool) 
         }
     }
 
+    if let Command::AddNewKeys { filename } = &cmd {
+        let patch = IniFile::parse_file(filename).unwrap();
+        for filename in &filenames {
+            let mut target = IniFile::parse_file(&format!("{root}/{filename}")).unwrap();
+            for section in &patch.sections {
+                for line in &section.lines {
+                    if let Some((key, value)) = split_line(line) {
+                        add_new_key(&mut target, &section.name, key, value, false).unwrap();
+                    }
+                }
+            }
+            if !dry_run { target.write().unwrap(); }
+        }
+        return;
+    }
+
     let mut single_ini_section: Option<Section> = None;
     if let Command::ImportSingle {
         filename,
@@ -971,7 +989,7 @@ fn execute_command(cmd: Command, ai: Option<&Ai>, dry_run: bool, verbose: bool) 
                 language: _,
                 section: _,
             } => {}
-            Command::ImportLanguage { .. } => {}
+            Command::ImportLanguage { .. } | Command::AddNewKeys { .. } => {}
             Command::FindMissingKeys { .. } => {}
             Command::FixupRefKeys => {
                 if is_reference {

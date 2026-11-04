@@ -62,6 +62,9 @@
 #include "UI/BackgroundAudio.h"
 #include "UI/SavedataScreen.h"
 #include "UI/MiscViews.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "UI/SwitchForwarderScreen.h"
+#endif
 
 // This is in an objective-C file.
 #if PPSSPP_PLATFORM(IOS)
@@ -626,6 +629,14 @@ void GameScreen::CreateSettingsViews(UI::ViewGroup *rightColumn) {
 			btnCreateGameConfig->OnClick.Handle(this, &GameScreen::OnCreateConfig);
 		}
 	}
+
+#if PPSSPP_PLATFORM(SWITCH)
+	if (!inGame_ && FileTypeIsPlayable(info_->fileType, lookups_.firmwareRunsPS1Discs)) {
+		rightColumnItems->Add(new Choice(ga->T("Create forwarder"), ImageID("I_SHORTCUT")))->OnClick.Add([this](UI::EventParams &) {
+			screenManager()->push(new SwitchForwarderScreen(gamePath_, info_->GetTitle()));
+		});
+	}
+#endif
 
 	if (g_Config.bEnableCheats) {
 		auto pa = GetI18NCategory(I18NCat::PAUSE);

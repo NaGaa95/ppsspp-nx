@@ -206,6 +206,9 @@ if git -C "$ROOT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
 	export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT_DIR" show -s --format=%ct HEAD)}"
 fi
 
+make -C "$ROOT_DIR/Switch/forwarder" clean
+make -C "$ROOT_DIR/Switch/forwarder" -j"$JOBS" VERSION="$SWITCH_RELEASE_VERSION"
+
 cmake -S "$ROOT_DIR" -B "$BUILD_DIR" -G Ninja \
 	-U'OPENGL_*' -U'_OPENGL_*' -U'Vulkan_*' -U'_VULKAN_SWITCH_*' \
 	-DCMAKE_TOOLCHAIN_FILE="$DEVKITPRO/cmake/Switch.cmake" \
@@ -241,7 +244,7 @@ fi
 PPSSPP_SHA256="$(sha256sum "$DIST_DIR/PPSSPP.nro" | cut -d' ' -f1)"
 {
 	echo "PPSSPP Switch $SWITCH_RELEASE_VERSION"
-	echo "frontend=ppsspp"
+	echo "frontend=sdl"
 	echo "source=$SOURCE_REVISION"
 	echo "source_state=$SOURCE_STATE"
 	echo "mesa=$MESA_VERSION archive_sha256=$MESA_SDK_SHA256"
@@ -253,3 +256,7 @@ PPSSPP_SHA256="$(sha256sum "$DIST_DIR/PPSSPP.nro" | cut -d' ' -f1)"
 
 echo "Built $DIST_DIR/PPSSPP.nro"
 echo "SHA-256 $PPSSPP_SHA256"
+
+# Remove artifacts produced by the former dual-frontend build.
+cmake -E rm -f "$DIST_DIR/PPSSPP-SDL.nro" "$DIST_DIR/PPSSPP-SDL-build.txt" \
+	"$DIST_DIR/PPSSPP-Original.nro" "$DIST_DIR/PPSSPP-Original-build.txt"

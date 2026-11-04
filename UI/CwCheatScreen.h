@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "Common/UI/Notice.h"
+
 #include <cstdint>
 #include <functional>
 
@@ -55,6 +57,10 @@ public:
 
 protected:
 	void BeforeCreateViews() override;
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	bool focusFirstCheat_ = true;
+	UI::View *pendingCheatFocus_ = nullptr;
+#endif
 	void CreateSettingsViews(UI::ViewGroup *) override;
 	void CreateContentViews(UI::ViewGroup *) override;
 	std::string_view GetTitle() const override;
@@ -88,3 +94,6 @@ private:
 
 	std::shared_ptr<http::Request> downloadRequest_;
 };
+
+// Shared database import for the stock screen and the independent SDL launcher.
+bool ImportCheatsFromDatabase(const Path &source, const std::string &discID, const Path &destination, int *cheatsFound);

@@ -179,7 +179,8 @@ static std::string GetExtFromString(std::string_view str) {
 	}
 	std::string ext(str.substr(pos));
 	for (size_t i = 0; i < ext.size(); i++) {
-		ext[i] = tolower(ext[i]);
+		if (ext[i] >= 'A' && ext[i] <= 'Z')
+			ext[i] += 'a' - 'A';
 	}
 	return ext;
 }
@@ -476,7 +477,8 @@ static bool FixFilenameCase(const std::string &path, std::string &filename) {
 	size_t filenameSize = filename.size();  // size in bytes, not characters
 	for (size_t i = 0; i < filenameSize; i++)
 	{
-		filename[i] = tolower(filename[i]);
+		if (filename[i] >= 'A' && filename[i] <= 'Z')
+			filename[i] += 'a' - 'A';
 	}
 
 	//TODO: lookup filename in cache for "path"
@@ -496,7 +498,10 @@ static bool FixFilenameCase(const std::string &path, std::string &filename) {
 		size_t i;
 		for (i = 0; i < filenameSize; i++)
 		{
-			if (filename[i] != tolower(result->d_name[i]))
+			char directoryCharacter = result->d_name[i];
+			if (directoryCharacter >= 'A' && directoryCharacter <= 'Z')
+				directoryCharacter += 'a' - 'A';
+			if (filename[i] != directoryCharacter)
 				break;
 		}
 

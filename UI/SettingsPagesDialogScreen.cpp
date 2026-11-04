@@ -195,6 +195,7 @@ void SettingsPagesDialogScreen::CreateNavBar(UI::ViewGroup *parent, int settings
 		bar->Add(CreateGameIconView(gamePath_, new LinearLayoutParams(WRAP_CONTENT, WRAP_CONTENT, 0.0f, Gravity::G_VCENTER)));
 	}
 
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	// While searching, the back button leaves the search, and this changes it.
 	if (CanShowSearch()) {
 		Choice *searchButton = bar->Add(new Choice(ImageID("I_SEARCH"), new LinearLayoutParams(ITEM_HEIGHT, ITEM_HEIGHT, Margins(8, 0, 0, 0))));
@@ -212,6 +213,7 @@ void SettingsPagesDialogScreen::CreateNavBar(UI::ViewGroup *parent, int settings
 			System_LaunchUrl(LaunchUrlType::BROWSER_URL, settingsUrl);
 		});
 	}
+#endif
 }
 
 void SettingsPagesDialogScreen::AskForSearchText() {

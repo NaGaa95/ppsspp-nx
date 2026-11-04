@@ -27,9 +27,8 @@
 #include "UI/SettingsPage.h"
 #include "UI/Settings/MainSettingsPages.h"
 #include "UI/SystemInfoScreen.h"
-#if PPSSPP_PLATFORM(SWITCH)
-#include "UI/SwitchUpdate.h"
-#endif
+#include "Common/UI/PopupScreens.h"
+#include "Core/Config.h"
 
 void BuildToolsSettings(SettingsPage *page) {
 	using namespace UI;
@@ -37,8 +36,11 @@ void BuildToolsSettings(SettingsPage *page) {
 
 	page->Header("Tools");
 #if PPSSPP_PLATFORM(SWITCH)
-	page->Choice("Check for updates").OpensScreen().OnClick([host](UI::EventParams &) {
-		host->PageScreenManager()->push(new SwitchUpdateScreen());
+	page->Custom("Steam Grid DB API Key", [host](UI::ViewGroup *parent) -> UI::View * {
+		auto choice = parent->Add(new PopupTextInputChoice(host->PageRequesterToken(), &g_Config.sSteamGridDBAPIKey,
+			"Steam Grid DB API Key", "", 256, host->PageScreenManager()));
+		choice->SetPasswordDisplay();
+		return choice;
 	});
 #endif
 
@@ -59,9 +61,11 @@ void BuildToolsSettings(SettingsPage *page) {
 		host->PageScreenManager()->push(new SystemInfoScreen(host->PageGamePath()));
 	});
 	page->Link({ I18NCat::SYSTEM, "Developer Tools" }, I18NCat::DEVELOPER, &BuildDeveloperToolsPage);
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	page->Choice({ I18NCat::REMOTEISO, "Remote disc streaming" }).OpensScreen().OnClick([host](UI::EventParams &) {
 		host->PageScreenManager()->push(new RemoteISOScreen(host->PageGamePath()));
 	});
+#endif
 	page->Choice({ I18NCat::SYSTEM, "PSP Firmware" }).OpensScreen().OnClick([host](UI::EventParams &) {
 		host->PageScreenManager()->push(new FirmwareScreen(host->PageGamePath()));
 	});

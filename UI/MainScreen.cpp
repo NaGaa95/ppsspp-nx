@@ -52,10 +52,15 @@
 #include "UI/InstallPkgScreen.h"
 #include "UI/Background.h"
 #include "UI/GameBrowser.h"
-#if PPSSPP_PLATFORM(SWITCH)
+#if PPSSPP_PLATFORM(SWITCH) && defined(SDL)
 #include "UI/SwitchLibraryScreen.h"
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+#include "SDL/SwitchLauncher.h"
+#endif
+#include "Common/System/Request.h"
 #endif
 #include "Core/Config.h"
+#include "Core/RetroAchievements.h"
 #include "Core/Loaders.h"
 #include "Common/Data/Text/I18n.h"
 #include "Core/Util/DarwinFileSystemServices.h" // For the browser
@@ -72,7 +77,7 @@ static void LaunchInEmuScreen(ScreenManager *screenManager, Screen *currentScree
 	screenManager->switchScreen(emuScreen);
 }
 
-static void LaunchFile(ScreenManager *screenManager, Screen *currentScreen, const Path &path) {
+void LaunchPSPFile(ScreenManager *screenManager, Screen *currentScreen, const Path &path) {
 	if (GamePacker::IsPacking(path)) {
 		// Can't play it while it's read (and maybe replaced), so show its progress instead.
 		screenManager->push(new GameScreen(path, false));
@@ -199,13 +204,31 @@ static bool IsTempPath(const Path &str) {
 	return false;
 }
 
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+// Shared in-game screens return here after stopping emulation. The stock library
+// and its menu are not compiled into the independent SDL frontend.
+MainScreen::MainScreen(const Path &launchPath) : pendingLaunchPath_(launchPath) {}
+MainScreen::~MainScreen() = default;
+bool MainScreen::WantsTextInput() const { return false; }
+bool MainScreen::key(const KeyInput &) { return false; }
+void MainScreen::CreateViews() { root_ = new UI::AnchorLayout(); }
+void MainScreen::DrawBackground(UIContext &) {}
+void MainScreen::sendMessage(UIMessage, const char *) {}
+void MainScreen::dialogFinished(const Screen *, DialogResult) {}
+void MainScreen::update() {
+	if (screenManager()->topScreen() == this && !GamePacker::IsBusy() &&
+		g_GameManager.GetState() == GameManagerState::IDLE && !Achievements::IsBlockingExecution()) {
+		System_RestartApp("");
+	}
+}
+#else
 // Leaving a game creates a new MainScreen, which should come back on the tab the game was
 // launched from. The default tab setting is only for the first one after startup.
 static int g_lastMainScreenTab = -1;
 // Tab indices shift when the Recent tab isn't shown, so the saved tab only applies if this matches.
 static bool g_lastMainScreenHadRecent = false;
 
-MainScreen::MainScreen() {
+MainScreen::MainScreen(const Path &launchPath) : pendingLaunchPath_(launchPath) {
 	g_BackgroundAudio.SetGame(Path());
 	packGeneration_ = GamePacker::Generation();
 }
@@ -417,7 +440,9 @@ void MainScreen::CreateMainButtons(UI::LinearLayout *parent, bool portrait) {
 #endif
 		mainButtons->Add(new Choice(mm->T("Game Settings", "Settings")))->OnClick.Handle(this, &MainScreen::OnGameSettings);
 		mainButtons->Add(new Choice(mm->T("About PPSSPP")))->OnClick.Handle(this, &MainScreen::OnCredits);
+#if !PPSSPP_PLATFORM(SWITCH)
 		mainButtons->Add(new Choice(mm->T("www.ppsspp.org")))->OnClick.Handle(this, &MainScreen::OnPPSSPPOrg);
+#endif
 
 		if (showGold) {
 			Choice *gold = mainButtons->Add(new Choice(mm->T("Buy PPSSPP Gold")));
@@ -722,7 +747,7 @@ void MainScreen::sendMessage(UIMessage message, const char *value) {
 	UIBaseScreen::sendMessage(message, value);
 
 	if (message == UIMessage::REQUEST_GAME_BOOT) {
-		LaunchFile(screenManager(), this, Path(value));
+		LaunchPSPFile(screenManager(), this, Path(value));
 	} else if (message == UIMessage::PERMISSION_GRANTED && !strcmp(value, "storage")) {
 		RecreateViews();
 	} else if (message == UIMessage::RECENT_FILES_CHANGED) {
@@ -731,6 +756,13 @@ void MainScreen::sendMessage(UIMessage message, const char *value) {
 }
 
 void MainScreen::update() {
+	if (!pendingLaunchPath_.empty()) {
+		const Path path = pendingLaunchPath_;
+		pendingLaunchPath_ = Path();
+		LaunchPSPFile(screenManager(), this, path);
+		return;
+	}
+
 	UIScreen::update();
 	UpdateUIState(UISTATE_MENU);
 
@@ -879,7 +911,7 @@ void MainScreen::OnGameHighlight(UI::EventParams &e) {
 
 void MainScreen::OnGameSelectedInstant(UI::EventParams &e) {
 	ScreenManager *screen = screenManager();
-	LaunchFile(screen, nullptr, Path(e.s));
+	LaunchPSPFile(screen, nullptr, Path(e.s));
 }
 
 void MainScreen::OnGameSettings(UI::EventParams &e) {
@@ -964,6 +996,8 @@ void MainScreen::dialogFinished(const Screen *dialog, DialogResult result) {
 		}
 	}
 }
+
+#endif
 
 void UmdReplaceScreen::CreateViews() {
 	using namespace UI;

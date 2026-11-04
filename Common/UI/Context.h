@@ -89,6 +89,8 @@ public:
 
 	// Utility methods
 	TextDrawer *Text() const { return textDrawer_; }
+	// Takes ownership. Install before drawing any text with this context.
+	void SetTextDrawer(TextDrawer *drawer);
 
 	void SetTintSaturation(float tint, float sat);
 

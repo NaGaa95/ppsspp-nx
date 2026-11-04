@@ -73,6 +73,7 @@ void BuildAudioSettings(SettingsPage *page) {
 
 	page->Header();
 
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	page->Setting(&g_Config.bUISound);
 	page->Setting(&g_Config.iUIVolume).LiveUpdate().Enabled(&g_Config.bUISound).OnChange([](EventParams &e) {
 		static double lastTimePlayed = 0.0;
@@ -85,12 +86,14 @@ void BuildAudioSettings(SettingsPage *page) {
 		PlayUISound(UI::UISound::CONFIRM);
 	});
 
+#endif
 	page->Setting(&g_Config.iGamePreviewVolume);
 
 	bool sdlAudio = false;
 
 #if defined(SDL)
 	page->Header("Audio backend");
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	std::vector<std::string> audioDeviceList;
 	SplitString(System_GetProperty(SYSPROP_AUDIO_DEVICE_LIST), '\0', audioDeviceList);
 	audioDeviceList.insert(audioDeviceList.begin(), std::string(T(I18NCat::AUDIO, "Auto")));
@@ -100,6 +103,7 @@ void BuildAudioSettings(SettingsPage *page) {
 		}
 		System_Notify(SystemNotification::AUDIO_RESET_DEVICE);
 	});
+#endif
 	sdlAudio = true;
 
 	static const int bufferSizes[] = {128, 256, 512, 1024, 2048};

@@ -1,25 +1,33 @@
 #include "UI/SwitchLibrary.h"
+#include "Common/Common.h"
+#include "Core/FileLoaders/PS1EbootFileLoader.h"
 
 #include <algorithm>
 #include <cctype>
 #include <condition_variable>
+#include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <dirent.h>
 #include <map>
 #include <mutex>
 #include <set>
 #include <thread>
 
+#include <switch.h>
+
 #include "Common/File/DirListing.h"
 #include "Common/File/FileUtil.h"
 #include "Common/StringUtils.h"
 #include "Common/Thread/ThreadUtil.h"
+#include "Common/TimeUtil.h"
 
 namespace SwitchLibrary {
 namespace {
 
 constexpr const char *kConfigPath = "/switch/ppsspp-nx/library.ini";
 constexpr const char *kDefaultGamesPath = "/switch/ppsspp-nx/games";
+constexpr std::string_view kForwarderTargetPrefix = "ppsspp-nx-forwarder:v1:";
 
 std::mutex s_mutex;
 std::condition_variable s_condition;
@@ -71,6 +79,83 @@ std::string CleanValue(std::string value) {
 	value.erase(std::remove(value.begin(), value.end(), '\r'), value.end());
 	value.erase(std::remove(value.begin(), value.end(), '\n'), value.end());
 	return value;
+}
+
+std::vector<SwitchStorage::SmbShare> ParseSmbShares(const std::map<std::string, std::string> &values) {
+	std::vector<SwitchStorage::SmbShare> shares;
+	int count = std::clamp(std::atoi(Value(values, "SmbCount").c_str()), 0, 16);
+	for (int i = 0; i < count; ++i) {
+		std::string prefix = "Smb" + std::to_string(i);
+		SwitchStorage::SmbShare share;
+		share.id = Value(values, prefix + "Id");
+		share.name = Value(values, prefix + "Name");
+		share.server = Value(values, prefix + "Server");
+		share.share = Value(values, prefix + "Share");
+		share.path = Value(values, prefix + "Path");
+		share.user = Value(values, prefix + "User");
+		share.password = Value(values, prefix + "Password");
+		share.domain = Value(values, prefix + "Domain");
+		share.autoMount = Value(values, prefix + "AutoMount") != "0";
+		if (!share.id.empty() && !share.server.empty() && !share.share.empty())
+			shares.push_back(std::move(share));
+	}
+	return shares;
+}
+
+std::string HexEncode(std::string_view value) {
+	static constexpr char digits[] = "0123456789abcdef";
+	std::string result;
+	result.reserve(value.size() * 2);
+	for (unsigned char character : value) {
+		result.push_back(digits[character >> 4]);
+		result.push_back(digits[character & 0x0F]);
+	}
+	return result;
+}
+
+int HexValue(char character) {
+	if (character >= '0' && character <= '9')
+		return character - '0';
+	if (character >= 'a' && character <= 'f')
+		return character - 'a' + 10;
+	if (character >= 'A' && character <= 'F')
+		return character - 'A' + 10;
+	return -1;
+}
+
+bool HexDecode(std::string_view encoded, std::string *value) {
+	if ((encoded.size() & 1) != 0 || encoded.size() / 2 >= 2048)
+		return false;
+	value->clear();
+	value->reserve(encoded.size() / 2);
+	for (size_t i = 0; i < encoded.size(); i += 2) {
+		const int high = HexValue(encoded[i]);
+		const int low = HexValue(encoded[i + 1]);
+		if (high < 0 || low < 0)
+			return false;
+		value->push_back(static_cast<char>((high << 4) | low));
+	}
+	return true;
+}
+
+bool ValidForwarderRelativePath(std::string_view path) {
+	if (path.empty() || path.front() == '/' || path.find('\0') != std::string_view::npos ||
+		path.find_first_of("\r\n") != std::string_view::npos)
+		return false;
+	for (size_t start = 0; start <= path.size();) {
+		const size_t end = path.find('/', start);
+		const std::string_view component = path.substr(start, end == std::string_view::npos ? path.size() - start : end - start);
+		if (component.empty() || component == "." || component == "..")
+			return false;
+		if (end == std::string_view::npos)
+			break;
+		start = end + 1;
+	}
+	return true;
+}
+
+std::string MakeExternalForwarderTarget(std::string_view type, std::string_view id, std::string_view relative) {
+	return std::string(kForwarderTargetPrefix) + std::string(type) + ":" + std::string(id) + ":" + HexEncode(relative);
 }
 
 void SaveConfigLocked() {
@@ -160,28 +245,37 @@ std::string ResolveSourceInternal(const Source &source, const std::vector<Switch
 bool IsGameExtension(const Path &path) {
 	const std::string extension = path.GetFileExtension();
 	return extension == ".iso" || extension == ".cso" || extension == ".chd" || extension == ".pbp" ||
-		extension == ".elf" || extension == ".prx" || extension == ".ppdmp";
+		extension == ".elf" || extension == ".prx" || extension == ".ppdmp" || extension == ".cue" ||
+		extension == ".ccd" || extension == ".mds" || extension == ".bin" || extension == ".img";
 }
 
 void ScanDirectory(const Path &directory, std::vector<Path> &games, int depth) {
-	if (s_stop.load(std::memory_order_acquire) || depth > 24)
+	if (s_stop.load(std::memory_order_acquire) || depth > 24) {
 		return;
+	}
+	DIR *handle = opendir(directory.c_str());
+	if (!handle) { return; }
 	std::vector<File::FileInfo> entries;
-	if (!File::GetFilesInDir(directory, &entries))
-		return;
-	for (const File::FileInfo &entry : entries) {
-		if (s_stop.load(std::memory_order_acquire))
-			return;
-		if (!entry.isDirectory) {
-			if (IsGameExtension(entry.fullName))
-				games.push_back(entry.fullName);
-			continue;
+	while (dirent *entry = readdir(handle)) {
+		if (s_stop.load(std::memory_order_acquire)) { break; }
+		if (entry->d_name[0] == '.') { continue; }
+		File::FileInfo info;
+		const Path fullName = directory / entry->d_name;
+		if (!File::GetFileInfo(fullName, &info)) {
+			if (!IsGameExtension(fullName)) { continue; }
+			info.name = entry->d_name; info.fullName = fullName;
 		}
-		if (File::Exists(entry.fullName / "PSP_GAME/SYSDIR") || File::Exists(entry.fullName / "EBOOT.PBP")) {
-			games.push_back(entry.fullName);
-			continue;
-		}
-		ScanDirectory(entry.fullName, games, depth + 1);
+		entries.push_back(std::move(info));
+	}
+	closedir(handle);
+	RemoveDescribedDiscImages(&entries);
+	for (const auto &info : entries) {
+		if (s_stop.load(std::memory_order_acquire)) { break; }
+		if (!info.isDirectory) {
+			if (IsGameExtension(info.fullName)) { games.push_back(info.fullName); }
+		} else if (File::Exists(info.fullName / "PSP_GAME/SYSDIR") || File::Exists(info.fullName / "EBOOT.PBP")) {
+			games.push_back(info.fullName);
+		} else { ScanDirectory(info.fullName, games, depth + 1); }
 	}
 }
 
@@ -268,22 +362,7 @@ void Initialize() {
 			if (!source.path.empty() || source.type != SourceType::Local)
 				s_sources.push_back(std::move(source));
 		}
-		int smbCount = std::clamp(std::atoi(Value(values, "SmbCount").c_str()), 0, 16);
-		for (int i = 0; i < smbCount; ++i) {
-			std::string prefix = "Smb" + std::to_string(i);
-			SwitchStorage::SmbShare share;
-			share.id = Value(values, prefix + "Id");
-			share.name = Value(values, prefix + "Name");
-			share.server = Value(values, prefix + "Server");
-			share.share = Value(values, prefix + "Share");
-			share.path = Value(values, prefix + "Path");
-			share.user = Value(values, prefix + "User");
-			share.password = Value(values, prefix + "Password");
-			share.domain = Value(values, prefix + "Domain");
-			share.autoMount = Value(values, prefix + "AutoMount") != "0";
-			if (!share.id.empty() && !share.server.empty() && !share.share.empty())
-				s_smbShares.push_back(std::move(share));
-		}
+		s_smbShares = ParseSmbShares(values);
 		if (s_sources.empty()) {
 			File::CreateFullPath(Path(kDefaultGamesPath));
 			s_sources.push_back({SourceType::Local, {}, kDefaultGamesPath});
@@ -386,7 +465,7 @@ std::vector<SwitchStorage::SmbShare> GetSmbShares() {
 	return s_smbShares;
 }
 
-bool SaveSmbShare(const SwitchStorage::SmbShare &share, std::string *error) {
+bool SaveSmbShare(const SwitchStorage::SmbShare &share, std::string *error, bool connect) {
 	bool validId = !share.id.empty() && share.id.size() <= 16 &&
 		std::all_of(share.id.begin(), share.id.end(), [](unsigned char c) {
 			return std::isalnum(c) || c == '_';
@@ -406,7 +485,7 @@ bool SaveSmbShare(const SwitchStorage::SmbShare &share, std::string *error) {
 			*it = share;
 		SaveConfigLocked();
 	}
-	if (share.autoMount && !SwitchStorage::MountSmb(share, error))
+	if (connect && share.autoMount && !SwitchStorage::MountSmb(share, error))
 		return false;
 	RequestScan();
 	return true;
@@ -455,6 +534,90 @@ uint64_t Generation() {
 
 bool IsScanning() {
 	return s_scanning.load(std::memory_order_acquire);
+}
+
+std::string MakeForwarderTarget(const Path &gamePath) {
+	const std::string path = gamePath.ToString();
+	for (const auto &location : SwitchStorage::ListUsbLocations()) {
+		if (path.rfind(location.path, 0) != 0)
+			continue;
+		const std::string relative = RelativeFromRoot(path, location.path);
+		if (ValidForwarderRelativePath(relative))
+			return MakeExternalForwarderTarget("usb", location.id, relative);
+	}
+
+	for (const auto &share : GetSmbShares()) {
+		const std::string root = SwitchStorage::SmbRootPath(share.id);
+		if (root.empty() || path.rfind(root, 0) != 0)
+			continue;
+		const std::string relative = RelativeFromRoot(path, root);
+		if (ValidForwarderRelativePath(relative))
+			return MakeExternalForwarderTarget("smb", share.id, relative);
+	}
+	return path;
+}
+
+bool ResolveForwarderTarget(std::string_view target, std::string *gamePath, std::string *error) {
+	if (!gamePath)
+		return false;
+	if (error)
+		error->clear();
+	if (target.substr(0, kForwarderTargetPrefix.size()) != kForwarderTargetPrefix) {
+		*gamePath = target;
+		return true;
+	}
+
+	auto fail = [&](const char *message) {
+		gamePath->clear();
+		if (error)
+			*error = message;
+		return false;
+	};
+	const std::string_view encoded = target.substr(kForwarderTargetPrefix.size());
+	const size_t typeEnd = encoded.find(':');
+	const size_t idEnd = typeEnd == std::string_view::npos ? std::string_view::npos : encoded.find(':', typeEnd + 1);
+	if (typeEnd == std::string_view::npos || idEnd == std::string_view::npos)
+		return fail("The forwarder launch target is invalid.");
+
+	const std::string_view type = encoded.substr(0, typeEnd);
+	const std::string id(encoded.substr(typeEnd + 1, idEnd - typeEnd - 1));
+	if (id.empty() || id.size() > 64 || id.find_first_of(":/\\\r\n") != std::string::npos)
+		return fail("The forwarder launch target is invalid.");
+	std::string relative;
+	if (!HexDecode(encoded.substr(idEnd + 1), &relative) || !ValidForwarderRelativePath(relative))
+		return fail("The forwarder launch target is invalid.");
+
+	std::string root;
+	if (type == "usb") {
+		if (!SwitchStorage::InitializeUsb(error)) {
+			gamePath->clear();
+			return false;
+		}
+		for (int attempt = 0; attempt < 50 && root.empty(); ++attempt) {
+			root = SwitchStorage::ResolveUsbPath(id);
+			if (root.empty())
+				sleep_ms(100, "forwarder-usb-mount");
+		}
+		if (root.empty())
+			return fail("The USB drive used by this forwarder is not connected.");
+	} else if (type == "smb") {
+		const auto shares = ParseSmbShares(ReadConfig());
+		const auto share = std::find_if(shares.begin(), shares.end(), [&](const auto &item) { return item.id == id; });
+		if (share == shares.end())
+			return fail("The SMB share used by this forwarder is no longer configured.");
+		if (!SwitchStorage::MountSmb(*share, error)) {
+			gamePath->clear();
+			return false;
+		}
+		root = SwitchStorage::SmbRootPath(id);
+	} else {
+		return fail("The forwarder launch target is invalid.");
+	}
+
+	*gamePath = AppendRelative(root, relative);
+	if (gamePath->size() >= FS_MAX_PATH || !File::Exists(Path(*gamePath)))
+		return fail("The game used by this forwarder could not be found.");
+	return true;
 }
 
 }  // namespace SwitchLibrary

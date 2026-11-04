@@ -53,8 +53,16 @@ struct HeldKey {
 
 static std::set<HeldKey> heldKeys;
 
-const double repeatDelay = 15 * (1.0 / 60.0f);  // 15 frames like before.
-const double repeatInterval = 5 * (1.0 / 60.0f);  // 5 frames like before.
+static double repeatDelay = 15 * (1.0 / 60.0f);  // 15 frames like before.
+static double repeatInterval = 5 * (1.0 / 60.0f);  // 5 frames like before.
+
+static bool horizontalStickNavigation = true;
+
+void ConfigureMenuNavigation(bool horizontalStick, double initialDelay, double interval) {
+	horizontalStickNavigation = horizontalStick;
+	repeatDelay = std::max(.1, initialDelay);
+	repeatInterval = std::max(.05, interval);
+}
 
 struct DispatchQueueItem {
 	Event *e;
@@ -337,6 +345,12 @@ static void FakeKeyEvent(const KeyInput &key, ViewGroup *root) {
 }
 
 void AxisEvent(const AxisInput &axis, ViewGroup *root) {
+	if (!horizontalStickNavigation && axis.axisId == JOYSTICK_AXIS_X) {
+		AxisInput neutral = axis;
+		neutral.value = 0;
+		root->Axis(neutral);
+		return;
+	}
 	enum class DirState {
 		NONE = 0,
 		POS = 1,

@@ -30,5 +30,6 @@ protected:
 	bool UseImmersiveMode() const override;
 
 	void sendMessage(UIMessage message, const char *value) override;
+	void DrawBackground(UIContext &ui) override;
 	Path gamePath_;
 };

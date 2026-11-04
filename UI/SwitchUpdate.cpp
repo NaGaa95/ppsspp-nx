@@ -27,61 +27,27 @@
 #include <sys/statvfs.h>
 #include <unistd.h>
 
-#include "Common/Data/Format/JSONReader.h"
-#include "Common/Data/Text/I18n.h"
 #include "Common/Log.h"
 #include "Common/StringUtils.h"
-#include "Common/System/Request.h"
 #include "Common/Thread/ThreadUtil.h"
-#include "Common/UI/ScrollView.h"
-#include "Common/UI/ScreenManager.h"
-#include "Common/UI/View.h"
-#include "Common/UI/ViewGroup.h"
 #include "UI/SwitchUpdate.h"
 
 #ifndef PPSSPP_SWITCH_RELEASE_VERSION
-#define PPSSPP_SWITCH_RELEASE_VERSION "1.0.0"
+#define PPSSPP_SWITCH_RELEASE_VERSION "1.0.1"
 #endif
 
 namespace {
 
 constexpr char LATEST_RELEASE_URL[] = "https://api.github.com/repos/NaGaa95/ppsspp-nx/releases/latest";
-constexpr char RELEASE_ASSET_PREFIX[] = "https://github.com/NaGaa95/ppsspp-nx/releases/download/";
 constexpr size_t MAX_RELEASE_RESPONSE = 2 * 1024 * 1024;
 constexpr uint64_t MINIMUM_NRO_SIZE = 1024 * 1024;
 constexpr uint64_t MAXIMUM_NRO_SIZE = 512ULL * 1024 * 1024;
 
 std::string executablePath_;
 
-enum class UpdateState {
-	Checking,
-	UpdateAvailable,
-	UpToDate,
-	Downloading,
-	ReadyToInstall,
-	Installing,
-	Installed,
-	Cancelled,
-	Error,
-};
-
-struct ReleaseInfo {
-	std::string tag;
-	std::string name;
-	std::string notes;
-	std::string assetName;
-	std::string assetUrl;
-	std::string assetDigest;
-	uint64_t assetSize = 0;
-};
-
-struct UpdateSnapshot {
-	UpdateState state = UpdateState::Checking;
-	ReleaseInfo release;
-	std::string error;
-	uint64_t downloaded = 0;
-	uint64_t total = 0;
-};
+using UpdateState = SwitchUpdateState;
+using ReleaseInfo = SwitchReleaseInfo;
+using UpdateSnapshot = SwitchUpdateSnapshot;
 
 bool StartsWith(std::string_view value, std::string_view prefix) {
 	return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
@@ -102,61 +68,6 @@ int HexDigit(char value) {
 	if (value >= 'A' && value <= 'F')
 		return value - 'A' + 10;
 	return -1;
-}
-
-bool ParseRelease(const std::string &data, ReleaseInfo *release, std::string *error) {
-	json::JsonReader reader(data.data(), data.size());
-	json::JsonGet root = reader.root();
-	if (!reader.ok() || !root || !root.getString("tag_name", &release->tag) || release->tag.empty()) {
-		*error = "GitHub returned a release without a valid version.";
-		return false;
-	}
-	root.getString("name", &release->name);
-	root.getString("body", &release->notes);
-	if (release->name.empty())
-		release->name = release->tag;
-	if (release->notes.empty())
-		release->notes = "No changelog was provided for this release.";
-
-	int bestAsset = -1;
-	const JsonNode *assets = root.getArray("assets");
-	if (!assets) {
-		*error = "The latest release does not contain a downloadable PPSSPP NRO.";
-		return false;
-	}
-	int index = 0;
-	for (const JsonNode *node : assets->value) {
-		json::JsonGet asset = node->value;
-		std::string name;
-		std::string url;
-		double jsonSize = asset.getFloat("size", -1.0);
-		if (!asset.getString("name", &name) || !asset.getString("browser_download_url", &url) || jsonSize < 0.0) {
-			++index;
-			continue;
-		}
-		uint64_t size = (uint64_t)jsonSize;
-		std::string lowerName = Lower(name);
-		if (lowerName.size() < 4 || lowerName.substr(lowerName.size() - 4) != ".nro" ||
-			size < MINIMUM_NRO_SIZE || size > MAXIMUM_NRO_SIZE || !StartsWith(url, RELEASE_ASSET_PREFIX)) {
-			++index;
-			continue;
-		}
-		if (bestAsset < 0 || lowerName == "ppsspp.nro") {
-			bestAsset = index;
-			release->assetName = std::move(name);
-			release->assetUrl = std::move(url);
-			release->assetSize = size;
-			asset.getString("digest", &release->assetDigest);
-			if (lowerName == "ppsspp.nro")
-				break;
-		}
-		++index;
-	}
-	if (bestAsset < 0) {
-		*error = "The latest release does not contain a downloadable PPSSPP NRO.";
-		return false;
-	}
-	return true;
 }
 
 struct MemoryDownload {
@@ -251,7 +162,7 @@ bool FetchLatestRelease(std::atomic<bool> *cancel, ReleaseInfo *release, std::st
 		*error = "GitHub returned HTTP " + std::to_string(responseCode) + ".";
 		return false;
 	}
-	return ParseRelease(download.data, release, error);
+	return SwitchUpdate_ParseRelease(download.data, release, error);
 }
 
 bool ParseSHA256(const std::string &digest, std::array<u8, SHA256_HASH_SIZE> *output) {
@@ -486,7 +397,7 @@ bool IsNewer(const std::string &candidate, const std::string &installed) {
 
 }  // namespace
 
-struct SwitchUpdateScreen::Impl {
+struct SwitchUpdateTask::Impl {
 	std::mutex mutex;
 	std::thread worker;
 	UpdateState state = UpdateState::Checking;
@@ -603,6 +514,14 @@ struct SwitchUpdateScreen::Impl {
 	}
 };
 
+SwitchUpdateTask::SwitchUpdateTask() : impl_(new Impl()) {}
+SwitchUpdateTask::~SwitchUpdateTask() = default;
+SwitchUpdateSnapshot SwitchUpdateTask::Snapshot() { return impl_->Snapshot(); }
+void SwitchUpdateTask::StartCheck() { impl_->StartCheck(); }
+void SwitchUpdateTask::StartDownload() { impl_->StartDownload(); }
+void SwitchUpdateTask::Cancel() { impl_->cancel.store(true, std::memory_order_relaxed); }
+bool SwitchUpdateTask::Install() { return impl_->Install(); }
+
 void SwitchUpdate_SetExecutablePath(std::string path) {
 	executablePath_ = std::move(path);
 }
@@ -646,145 +565,6 @@ bool SwitchUpdate_RecoverInstallation(std::string *error) {
 		fsdevCommitDevice("sdmc");
 	}
 	return true;
-}
-
-SwitchUpdateScreen::SwitchUpdateScreen()
-	: UI::PopupScreen(T(I18NCat::MAINSETTINGS, "PPSSPP Update")), impl_(new Impl()) {
-	impl_->StartCheck();
-}
-
-SwitchUpdateScreen::~SwitchUpdateScreen() = default;
-
-void SwitchUpdateScreen::CreatePopupContents(UI::ViewGroup *parent) {
-	using namespace UI;
-	auto di = GetI18NCategory(I18NCat::DIALOG);
-	auto ms = GetI18NCategory(I18NCat::MAINSETTINGS);
-
-	statusView_ = parent->Add(new TextView("", ALIGN_LEFT | ALIGN_VCENTER | FLAG_WRAP_TEXT, false,
-		new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(12, 8))));
-
-	releaseView_ = parent->Add(new TextView("", ALIGN_LEFT | FLAG_WRAP_TEXT, false,
-		new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(12, 4))));
-	releaseView_->SetBig(true);
-
-	notesScroll_ = parent->Add(new ScrollView(ORIENT_VERTICAL,
-		new LinearLayoutParams(FILL_PARENT, 240, Margins(12, 4))));
-	LinearLayout *notes = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
-	notesView_ = notes->Add(new TextView("", ALIGN_LEFT | FLAG_WRAP_TEXT, false,
-		new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(8))));
-	notesScroll_->Add(notes);
-
-	progressBar_ = parent->Add(new ProgressBar(new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(12, 4))));
-
-	LinearLayout *buttons = parent->Add(new LinearLayout(ORIENT_HORIZONTAL,
-		new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Margins(8, 4))));
-	actionChoice_ = buttons->Add(new Choice(ms->T("Download update"), ImageID("I_DOWNLOAD"), new LinearLayoutParams(1.0f, Margins(4))));
-	actionChoice_->OnClick.Handle(this, &SwitchUpdateScreen::OnAction);
-	closeChoice_ = buttons->Add(new Choice(di->T("Cancel"), ImageID("I_NAVIGATE_BACK"), new LinearLayoutParams(1.0f, Margins(4))));
-	closeChoice_->OnClick.Handle(this, &SwitchUpdateScreen::OnClose);
-
-	Refresh();
-}
-
-bool SwitchUpdateScreen::CanComplete(DialogResult result) {
-	return impl_->Snapshot().state != UpdateState::Installing;
-}
-
-void SwitchUpdateScreen::OnCompleted(DialogResult result) {
-	impl_->cancel.store(true, std::memory_order_relaxed);
-}
-
-void SwitchUpdateScreen::OnAction(UI::EventParams &e) {
-	UpdateState state = impl_->Snapshot().state;
-	if (state == UpdateState::UpdateAvailable) {
-		impl_->StartDownload();
-	} else if (state == UpdateState::UpToDate || state == UpdateState::Error || state == UpdateState::Cancelled) {
-		impl_->StartCheck();
-	}
-	Refresh();
-}
-
-void SwitchUpdateScreen::OnClose(UI::EventParams &e) {
-	TriggerFinish(DR_CANCEL);
-}
-
-void SwitchUpdateScreen::Refresh() {
-	if (!statusView_)
-		return;
-	using namespace UI;
-	auto di = GetI18NCategory(I18NCat::DIALOG);
-	auto ms = GetI18NCategory(I18NCat::MAINSETTINGS);
-	UpdateSnapshot snapshot = impl_->Snapshot();
-	bool busy = snapshot.state == UpdateState::Checking || snapshot.state == UpdateState::Downloading ||
-		snapshot.state == UpdateState::Installing;
-	bool showRelease = snapshot.state == UpdateState::UpdateAvailable || snapshot.state == UpdateState::Downloading ||
-		snapshot.state == UpdateState::ReadyToInstall || snapshot.state == UpdateState::Installing ||
-		snapshot.state == UpdateState::Installed;
-	std::string status;
-	switch (snapshot.state) {
-	case UpdateState::Checking:
-		status = ms->T("Checking GitHub for the latest release...");
-		break;
-	case UpdateState::UpdateAvailable:
-		status = ApplySafeSubstitutions(ms->T("A newer version is available. Installed: %1"), PPSSPP_SWITCH_RELEASE_VERSION);
-		break;
-	case UpdateState::UpToDate:
-		status = ApplySafeSubstitutions(ms->T("PPSSPP is up to date. Installed: %1"), PPSSPP_SWITCH_RELEASE_VERSION);
-		break;
-	case UpdateState::Downloading:
-		status = ApplySafeSubstitutions(ms->T("Downloading %1"), snapshot.release.assetName);
-		break;
-	case UpdateState::ReadyToInstall:
-		status = ms->T("Download verified. Installing update...");
-		break;
-	case UpdateState::Installing:
-		status = ms->T("Installing update...");
-		break;
-	case UpdateState::Installed:
-		status = ms->T("Update installed. Restarting PPSSPP...");
-		break;
-	case UpdateState::Cancelled:
-		status = ms->T("Update cancelled.");
-		break;
-	case UpdateState::Error:
-		status = snapshot.error.empty() ? ms->T("Update failed.") : snapshot.error;
-		break;
-	}
-	statusView_->SetText(status);
-	releaseView_->SetText(showRelease ? snapshot.release.name + " (" + snapshot.release.tag + ")" : "");
-	releaseView_->SetVisibility(showRelease ? V_VISIBLE : V_GONE);
-	notesView_->SetText(showRelease ? snapshot.release.notes : "");
-	notesScroll_->SetVisibility(showRelease ? V_VISIBLE : V_GONE);
-	progressBar_->SetVisibility(snapshot.state == UpdateState::Downloading ? V_VISIBLE : V_GONE);
-	if (snapshot.state == UpdateState::Downloading && snapshot.total > 0)
-		progressBar_->SetProgress((float)((double)snapshot.downloaded / (double)snapshot.total));
-
-	actionChoice_->SetEnabled(!busy && snapshot.state != UpdateState::Installed && snapshot.state != UpdateState::ReadyToInstall);
-	if (snapshot.state == UpdateState::UpdateAvailable) {
-		actionChoice_->SetText(ms->T("Download update"));
-	} else if (snapshot.state == UpdateState::Error || snapshot.state == UpdateState::Cancelled) {
-		actionChoice_->SetText(ms->T("Try again"));
-	} else if (snapshot.state == UpdateState::UpToDate) {
-		actionChoice_->SetText(ms->T("Check again"));
-	} else {
-		actionChoice_->SetText(ms->T("Please wait"));
-	}
-	closeChoice_->SetText(busy ? di->T("Cancel") : di->T("Back"));
-	closeChoice_->SetEnabled(snapshot.state != UpdateState::Installing);
-}
-
-void SwitchUpdateScreen::update() {
-	UI::PopupScreen::update();
-	UpdateSnapshot snapshot = impl_->Snapshot();
-	if (snapshot.state == UpdateState::ReadyToInstall) {
-		Refresh();
-		if (impl_->Install() && !restartRequested_) {
-			restartRequested_ = true;
-			INFO_LOG(Log::System, "Installed PPSSPP update %s", snapshot.release.tag.c_str());
-			System_RestartApp("");
-		}
-	}
-	Refresh();
 }
 
 #endif

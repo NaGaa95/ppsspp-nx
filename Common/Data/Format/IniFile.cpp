@@ -537,6 +537,6 @@ bool IniFile::Save(const Path &filename)
 		}
 	}
 
-	fclose(file);
-	return true;
+	const bool written = ferror(file) == 0;
+	return fclose(file) == 0 && written;
 }

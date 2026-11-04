@@ -83,6 +83,9 @@ static const ImageMeta g_uiImageIDs[] = {
 	{"I_GRID", false},
 	{"I_LARGE_LIST", false},
 	{"I_LOGO", false},
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	{"I_LSFG_LOGO", false},
+#endif
 	{"I_ICON", false},
 	{"I_ICON_GOLD", false},
 	{"I_FOLDER", false},
@@ -384,6 +387,16 @@ static bool RasterizeSVG(std::string_view filename, float dpiScale, int maxTextu
 	return true;
 }
 
+bool RasterizeSVGImage(std::string_view filename, std::string_view id, float scale, Image *output) {
+	const ImageMeta metadata[]{{id, false}};
+	std::vector<Image> images(1);
+	if (!RasterizeSVG(filename, scale, 0, metadata, 1, &images) || images[0].IsEmpty()) {
+		return false;
+	}
+	*output = std::move(images[0]);
+	return true;
+}
+
 // White, premultiplied, antialiased by distance to the edge.
 static void GenerateRoundRectCorner(Image &img, float radius, float thickness, float dpiScale) {
 	const float r = radius * dpiScale;
@@ -480,6 +493,11 @@ static bool GenerateUIAtlasImage(Atlas *atlas, float dpiScale, Image *dest, int 
 			GenerateRoundRectCorner(img, imageIDs[i].cornerRadius, imageIDs[i].cornerThickness, dpiScale);
 		} else {
 			std::string name = "ui_images/";
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+			if (imageIDs[i].id == "I_LSFG_LOGO") {
+				name = "launcher/";
+			}
+#endif
 			std::string pngName = PNGNameFromID(imageIDs[i].id);
 			name.append(pngName);
 			bool success = img.LoadPNG(name.c_str());

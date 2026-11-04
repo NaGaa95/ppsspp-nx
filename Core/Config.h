@@ -292,6 +292,9 @@ public:
 	// Moves the URI to the front. Returns true if it wasn't in the list before.
 	bool AddShortcutUri(std::string_view uri);
 	std::string sLanguageIni;
+#if PPSSPP_PLATFORM(SWITCH)
+	std::string sSteamGridDBAPIKey;
+#endif
 
 	std::string sIgnoreCompatSettings;
 
@@ -836,6 +839,8 @@ public:
 
 	// Finds the setting a pointer into g_Config (or one of its blocks) points to. Null if it isn't one.
 	static const ConfigSettingRef *FindSetting(const void *ptr);
+	// Declaration order, for alternate frontends that present the same settings.
+	static const std::vector<ConfigSettingRef> &GetSettings();
 	static int GetDefaultValueInt(const int *configSetting);
 	static float GetDefaultValueFloat(const float *configSetting);
 	// Sets the setting that ptr points to back to its default. Returns true if that changed it.

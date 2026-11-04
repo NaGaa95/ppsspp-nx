@@ -20,6 +20,9 @@
 #include <algorithm>
 
 #include "UI/Theme.h"
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+#include "UI/SwitchUIStyle.h"
+#endif
 
 #include "Common/Data/Format/IniFile.h"
 #include "Common/File/DirListing.h"
@@ -251,6 +254,9 @@ void UpdateTheme() {
 	ui_theme.popupSliderFocusedColor = themeInfo.uPopupSliderFocusedColor;
 
 	ui_theme.choiceRoundRadius = themeInfo.choiceRoundRadius;
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	SwitchUI::ApplyTheme(ui_theme);
+#endif
 }
 
 const UI::Theme *GetTheme() {

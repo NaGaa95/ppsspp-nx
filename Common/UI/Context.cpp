@@ -40,6 +40,11 @@ void UIContext::Init(Draw::DrawContext *thin3d, Draw::Pipeline *uipipe, Draw::Pi
 	textDrawer_ = TextDrawer::Create(thin3d);  // May return nullptr if no implementation is available for this platform.
 }
 
+void UIContext::SetTextDrawer(TextDrawer *drawer) {
+	delete textDrawer_;
+	textDrawer_ = drawer;
+}
+
 void UIContext::BeginFrame() {
 	frameStartTime_ = time_now_d();
 	// Text drawn before anything set a style uses the theme's.

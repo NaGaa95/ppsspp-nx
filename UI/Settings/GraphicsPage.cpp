@@ -155,6 +155,9 @@ void BuildGraphicsSettings(SettingsPage *page) {
 #if !PPSSPP_PLATFORM(UWP)
 	page->Setting(&g_Config.iGPUBackend).Setup([host](View *view) {
 		PopupMultiChoice *renderingBackendChoice = static_cast<PopupMultiChoice *>(view);
+#if PPSSPP_PLATFORM(SWITCH)
+		renderingBackendChoice->SetFirstChoice((int)GPUBackend::DEKO3D);
+#endif
 		renderingBackendChoice->SetPreOpenCallback([host, runningBackend = g_Config.iGPUBackend](UI::PopupMultiChoice *choice) {
 			// Don't filter until the last possible moment, since it involves trying to initialize Vulkan, if we were
 			// started in OpenGL mode on Android.
@@ -203,11 +206,10 @@ void BuildGraphicsSettings(SettingsPage *page) {
 
 #if PPSSPP_PLATFORM(SWITCH)
 	if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN) {
-		page->Bool(&g_Config.bSwitchFrameGeneration, "Frame Generation").EnabledFunc([] {
-			return !PSP_IsInited() && SwitchLSFG_IsInstalled();
-		}).OnChange([host](UI::EventParams &) {
-			host->RestartOrDo([] { g_Config.bSwitchFrameGeneration = !g_Config.bSwitchFrameGeneration; });
-		});
+		page->Bool(&g_Config.bSwitchFrameGeneration, "LSFG 2x").EnabledFunc([] { return !PSP_IsInited() && SwitchLSFG_IsInstalled(); });
+		page->Bool("Half-resolution optical flow", [] { return g_Config.fSwitchFrameGenerationFlowScale == 0.5f; },
+			[](bool half) { g_Config.fSwitchFrameGenerationFlowScale = half ? 0.5f : 0.25f; }).EnabledFunc([] { return !PSP_IsInited(); });
+		page->Bool(&g_Config.bSwitchFrameGenerationPerformance, "LSFG performance mode").EnabledFunc([] { return !PSP_IsInited(); });
 	}
 #endif
 

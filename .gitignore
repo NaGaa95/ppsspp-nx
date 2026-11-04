@@ -155,3 +155,13 @@ cmake-build-*/
 
 /dist/PPSSPP.nro
 /dist/PPSSPP-build.txt
+/assets/fwd/
+/Switch/forwarder/hbl.elf
+# Obsolete submodule checkout retained after upstream moved FFmpeg to FetchContent.
+/ffmpeg/
+
+# Separate Switch frontend release artifacts.
+/dist/PPSSPP-SDL.nro
+/dist/PPSSPP-Original.nro
+/dist/PPSSPP-SDL-build.txt
+/dist/PPSSPP-Original-build.txt

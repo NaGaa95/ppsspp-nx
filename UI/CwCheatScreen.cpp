@@ -190,6 +190,9 @@ bool CwCheatScreen::TryLoadCheatInfo() {
 }
 
 void CwCheatScreen::BeforeCreateViews() {
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	pendingCheatFocus_ = nullptr;
+#endif
 	TryLoadCheatInfo();  // in case the info is already in cache.
 }
 
@@ -299,6 +302,11 @@ void CwCheatScreen::CreateContentViews(UI::ViewGroup *parent) {
 
 	UI::ScrollView *rightScroll = rightSide->Add(new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT, 1.0f)));
 	rightScroll->SetTag("CwCheats");
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	if (focusFirstCheat_) {
+		g_Config.fCwCheatScrollPosition = 0;
+	}
+#endif
 	rightScroll->RememberPosition(&g_Config.fCwCheatScrollPosition);
 
 	LinearLayout *rightColumn = new LinearLayoutList(ORIENT_VERTICAL, new LinearLayoutParams(200, FILL_PARENT));
@@ -358,6 +366,16 @@ void CwCheatScreen::CreateContentViews(UI::ViewGroup *parent) {
 			prevIsTitle = false;
 		}
 	}
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	if (focusFirstCheat_) {
+		std::vector<UI::View *> order;
+		cheatList_->CollectTabOrder(&order);
+		if (!order.empty()) {
+			pendingCheatFocus_ = order.front();
+			focusFirstCheat_ = false;
+		}
+	}
+#endif
 }
 
 std::string_view CwCheatScreen::GetTitle() const {
@@ -429,6 +447,19 @@ void CwCheatScreen::update() {
 	}
 
 	UIBaseDialogScreen::update();
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	if (pendingCheatFocus_ && pendingCheatFocus_->GetBounds().h > 0) {
+		root_->SetDefaultFocusView(pendingCheatFocus_);
+		if (auto *scroll = UI::GetEnclosingScrollView(pendingCheatFocus_)) {
+			scroll->ScrollTo(0);
+		}
+		if (UI::IsFocusMovementEnabled()) {
+			pendingCheatFocus_->SetFocus(UI::FocusFlags::CAUSE_RESTORE);
+			root_->SubviewFocused(pendingCheatFocus_);
+		}
+		pendingCheatFocus_ = nullptr;
+	}
+#endif
 }
 
 void CwCheatScreen::onFinish(DialogResult result) {
@@ -512,6 +543,9 @@ void CwCheatScreen::ImportAndReport(const Path &cheatFile) {
 		errorDetails_ = GetFriendlyPath(cheatFile);
 	}
 	g_Config.bReloadCheats = true;
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	focusFirstCheat_ = true;
+#endif
 	RecreateViews();
 }
 
@@ -532,9 +566,9 @@ void CwCheatScreen::OnImportCheat(UI::EventParams &params) {
 	ImportAndReport(importPath);
 }
 
-bool CwCheatScreen::ImportCheats(const Path &cheatFile, int *cheatsFound) {
-	if (gameID_.length() != 9 || !engine_) {
-		WARN_LOG(Log::CwCheats, "CWCHEAT: Incorrect ID(%s) - can't import cheats.", gameID_.c_str());
+bool ImportCheatsFromDatabase(const Path &cheatFile, const std::string &discID, const Path &destination, int *cheatsFound) {
+	if (discID.length() != 9) {
+		WARN_LOG(Log::CwCheats, "CWCHEAT: Incorrect ID(%s) - can't import cheats.", discID.c_str());
 		return false;
 	}
 
@@ -544,8 +578,11 @@ bool CwCheatScreen::ImportCheats(const Path &cheatFile, int *cheatsFound) {
 		return false;
 	}
 
-	std::string gameID = StringFromFormat("_S %s-%s", gameID_.substr(0, 4).c_str(), gameID_.substr(4).c_str());
+	std::string gameID = StringFromFormat("_S %s-%s", discID.substr(0, 4).c_str(), discID.substr(4).c_str());
 
+	CWCheatEngine existingEngine(discID);
+	std::set<std::string> existingNames;
+	for (const auto &cheat : existingEngine.FileInfo()) { existingNames.insert(cheat.name); }
 	std::vector<std::string> title;
 	std::vector<std::string> newList;
 
@@ -569,7 +606,7 @@ bool CwCheatScreen::ImportCheats(const Path &cheatFile, int *cheatsFound) {
 			// "_C" or "_C0" with no name) is shorter than 4 chars - substr(4) would
 			// throw std::out_of_range, uncaught here, crashing the whole app.
 			std::string lineStr(line);
-			parseCheatEntry = lineStr.size() < 4 || !HasCheatWithName(lineStr.substr(4));
+			parseCheatEntry = lineStr.size() < 4 || !existingNames.count(lineStr.substr(4));
 		}
 
 		if (!parseGameEntry) {
@@ -593,7 +630,7 @@ bool CwCheatScreen::ImportCheats(const Path &cheatFile, int *cheatsFound) {
 
 	std::string title2;
 	// Hmm, this probably gets confused about BOMs?
-	FILE *inTitle2 = File::OpenCFile(engine_->CheatFilename(), "rt");
+	FILE *inTitle2 = File::OpenCFile(destination, "rt");
 	if (inTitle2) {
 		char temp[2048];
 		char *line = GetLineNoNewline(temp, sizeof(temp), inTitle2);
@@ -602,7 +639,7 @@ bool CwCheatScreen::ImportCheats(const Path &cheatFile, int *cheatsFound) {
 		fclose(inTitle2);
 	}
 
-	FILE *append = File::OpenCFile(engine_->CheatFilename(), "at");
+	FILE *append = File::OpenCFile(destination, "at");
 	if (!append) {
 		return false;
 	}
@@ -626,6 +663,10 @@ bool CwCheatScreen::ImportCheats(const Path &cheatFile, int *cheatsFound) {
 	}
 	fclose(append);
 	return true;
+}
+
+bool CwCheatScreen::ImportCheats(const Path &cheatFile, int *cheatsFound) {
+	return engine_ && ImportCheatsFromDatabase(cheatFile, gameID_, engine_->CheatFilename(), cheatsFound);
 }
 
 void CwCheatScreen::OnCheckBox(int index) {

@@ -14,6 +14,7 @@ public:
 
 	void registerEventHandler();
 	void ProcessInput(const SDL_Event &event);
+	static InputKeyCode getKeycodeForButton(SDL_GamepadButton button);
 #if PPSSPP_PLATFORM(SWITCH)
 	void releaseRightStickFaceButtons();
 #endif
@@ -21,7 +22,6 @@ public:
 private:
 	void setUpController(SDL_JoystickID deviceID);
 	void setUpControllers();
-	InputKeyCode getKeycodeForButton(SDL_GamepadButton button);
 	int getDeviceIndex(int instanceId);
 	void releaseAllKeys();
 #if PPSSPP_PLATFORM(SWITCH)

@@ -102,6 +102,16 @@ impl IniFile {
                 "No filename specified for writing",
             ));
         };
+        let existing = match std::fs::read(filename) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error),
+        };
+        let newline: &[u8] = if existing.windows(2).any(|pair| pair == b"\r\n") {
+            b"\r\n"
+        } else {
+            b"\n"
+        };
         let file = std::fs::File::create(filename)?;
         let mut file = std::io::LineWriter::new(file);
 
@@ -111,14 +121,14 @@ impl IniFile {
         }
         for line in &self.preamble {
             file.write_all(line.as_bytes())?;
-            file.write_all(b"\n")?;
+            file.write_all(newline)?;
         }
         for section in &self.sections {
             file.write_all(section.title_line.as_bytes())?;
-            file.write_all(b"\n")?;
+            file.write_all(newline)?;
             for line in &section.lines {
                 file.write_all(line.as_bytes())?;
-                file.write_all(b"\n")?;
+                file.write_all(newline)?;
             }
         }
 
@@ -162,5 +172,26 @@ impl IniFile {
         self.sections
             .iter()
             .find(|section| section.name == section_name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IniFile;
+
+    #[test]
+    fn write_preserves_bom_and_line_endings() {
+        for newline in ["\n", "\r\n"] {
+            let path = std::env::temp_dir().join(format!(
+                "ppsspp-langtool-{}-{}.ini", std::process::id(), newline.len()
+            ));
+            let original = format!("\u{feff}[MainMenu]{newline}Example = Example{newline}");
+            std::fs::write(&path, original.as_bytes()).unwrap();
+            let mut ini = IniFile::parse_file(path.to_str().unwrap()).unwrap();
+            ini.get_section_mut("MainMenu").unwrap().set_value("Example", "Translated", None);
+            ini.write().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), original.replace("= Example", "= Translated").as_bytes());
+            std::fs::remove_file(path).unwrap();
+        }
     }
 }

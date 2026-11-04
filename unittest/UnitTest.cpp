@@ -113,6 +113,10 @@
 #include "Common/UI/Root.h"
 #include "Common/UI/View.h"
 #include "Common/UI/ViewGroup.h"
+#include "Common/UI/TabHolder.h"
+#include "Common/UI/ScrollView.h"
+#include "SDL/SwitchInputNames.h"
+#include "UI/SwitchUpdateRelease.h"
 #include "Core/Debugger/MemBlockInfo.h"
 #include "Core/FileLoaders/CachingFileLoader.h"
 #include "Core/FileSystems/FileSystem.h"
@@ -2821,6 +2825,8 @@ static bool TestPath() {
 	EXPECT_EQ_INT((Path("") / "/etc/passwd").empty(), false);
 
 	EXPECT_EQ_STR(Path("foo.bar/hello").GetFileExtension(), std::string());
+	EXPECT_EQ_STR(Path(u8"/Games/Resistance - Retribution™ [UCES01184].cso").GetFileExtension(), std::string(".cso"));
+	EXPECT_EQ_STR(Path(u8"/Games/Test.™").GetFileExtension(), std::string(u8".™"));
 	Path replaced("unset");
 	EXPECT_EQ_INT(Path("foo.bar/hello.txt").WithReplacedExtension(".txt", ".html", &replaced), true);
 	EXPECT_EQ_STR(replaced.ToString(), std::string("foo.bar/hello.html"));
@@ -3882,6 +3888,32 @@ protected:
 	void ClearFonts() override {}
 };
 
+bool TestTextDrawerFactory() {
+	struct ResetFactory {
+		~ResetFactory() { TextDrawer::SetFactory(nullptr); }
+	} reset;
+	static Draw::DrawContext *received;
+	TextDrawer::SetFactory(+[](Draw::DrawContext *draw) -> TextDrawer * {
+		received = draw;
+		return new FakeTextDrawer();
+	});
+	// Both UIContext and the PSP utility dialogs use this factory.
+	auto *context = reinterpret_cast<Draw::DrawContext *>(&received);
+	std::unique_ptr<TextDrawer> drawer(TextDrawer::Create(context));
+	EXPECT_TRUE(drawer != nullptr);
+	EXPECT_TRUE(received == context);
+
+	class UnreadyDrawer : public FakeTextDrawer {
+	public:
+		bool IsReady() const override { return false; }
+	};
+	TextDrawer::SetFactory(+[](Draw::DrawContext *) -> TextDrawer * { return new UnreadyDrawer(); });
+	EXPECT_TRUE(TextDrawer::Create(nullptr) == nullptr);
+	TextDrawer::SetFactory(+[](Draw::DrawContext *) -> TextDrawer * { return nullptr; });
+	EXPECT_TRUE(TextDrawer::Create(nullptr) == nullptr);
+	return true;
+}
+
 bool TestTextDrawerCache() {
 	FakeTextDrawer drawer;
 	drawer.SetForcedDPIScale(1.0f);
@@ -4104,6 +4136,145 @@ bool TestUIFocusNavigation() {
 	return true;
 }
 
+bool TestUIPaneNavigation() {
+	using namespace UI;
+	LinearLayout root(ORIENT_VERTICAL);
+	auto *tabs = root.Add(new TabHolder(ORIENT_VERTICAL, 200, TabHolderFlags::Default, nullptr, nullptr));
+	auto *page = new LinearLayout(ORIENT_VERTICAL);
+	auto *first = page->Add(new Button("Backend"));
+	auto *disabled = page->Add(new Button("Unavailable"));
+	disabled->SetEnabled(false);
+	auto *disabledGroup = page->Add(new LinearLayout(ORIENT_VERTICAL));
+	disabledGroup->SetEnabled(false);
+	disabledGroup->Add(new Button("Disabled group child"));
+	auto *last = page->Add(new Button("Last option, below the viewport"));
+	first->SetBounds(Bounds(300, 10, 200, 40));
+	last->SetBounds(Bounds(300, 1800, 200, 40));
+	tabs->AddTab("Graphics", ImageID::invalid(), page);
+	auto *otherPage = tabs->AddTab("Audio", ImageID::invalid(), new LinearLayout(ORIENT_VERTICAL));
+	otherPage->Add(new Button("Volume"));
+	auto *back = tabs->Container()->Add(new Button("Back"));
+	back->SetBounds(Bounds(0, 1750, 200, 40));
+	tabs->EnablePaneNavigation(&root);
+	auto next = [&](View *from, FocusMove move) { return root.FindNeighbor(from, move, NeighborResult()).view; };
+	EXPECT_TRUE(next(first, FocusMove::DOWN) == last);
+	EXPECT_TRUE(next(last, FocusMove::DOWN) == last);
+	EXPECT_TRUE(next(last, FocusMove::UP) == first);
+	EXPECT_TRUE(next(first, FocusMove::UP) == first);
+	View *graphics = next(last, FocusMove::LEFT);
+	EXPECT_TRUE(graphics && tabs->Container()->ContainsSubview(graphics));
+	EXPECT_TRUE(graphics != back);
+	EXPECT_TRUE(next(graphics, FocusMove::RIGHT) == last);
+	// The same return target at both ends, regardless of vertical distance.
+	EXPECT_TRUE(next(first, FocusMove::LEFT) == graphics);
+	EXPECT_TRUE(next(graphics, FocusMove::RIGHT) == first);
+	// A disabled remembered option must never be restored.
+	first->SetEnabled(false);
+	EXPECT_TRUE(next(graphics, FocusMove::RIGHT) == last);
+	// Each category restores its own option, without crossing into a hidden page.
+	tabs->SetCurrentTab(1, true);
+	View *audio = next(otherPage->GetViewByIndex(0), FocusMove::LEFT);
+	EXPECT_TRUE(audio && audio != graphics && audio != back);
+	EXPECT_TRUE(next(audio, FocusMove::RIGHT) == otherPage->GetViewByIndex(0));
+	tabs->SetCurrentTab(0, true);
+	EXPECT_TRUE(next(graphics, FocusMove::RIGHT) == last);
+	// Replacing a page removes remembered pointers from the eligible order.
+	page->Clear();
+	auto *replacement = page->Add(new Button("Replacement"));
+	EXPECT_TRUE(next(graphics, FocusMove::RIGHT) == replacement);
+	return true;
+}
+
+bool TestSwitchUpdateRelease() {
+	SwitchReleaseInfo release;
+	std::string error;
+	const std::string canonical =
+		R"({"name":"PPSSPP.nro","size":73756974,"browser_download_url":"https://github.com/NaGaa95/ppsspp-nx/releases/download/v1.0.2/PPSSPP.nro","digest":"sha256:0123456789abcdef"})";
+	const std::string legacy =
+		R"({"name":"PPSSPP-SDL.nro","size":73756974,"browser_download_url":"https://github.com/NaGaa95/ppsspp-nx/releases/download/v1.0.2/PPSSPP-SDL.nro"},{"name":"PPSSPP-Original.nro","size":69560050,"browser_download_url":"https://github.com/NaGaa95/ppsspp-nx/releases/download/v1.0.2/PPSSPP-Original.nro"})";
+	auto parse = [&](std::string_view assets) {
+		return SwitchUpdate_ParseRelease(std::string(R"({"tag_name":"v1.0.2","name":"Release","body":"Changes","assets":[)") +
+											 std::string(assets) + "]}",
+										 &release, &error);
+	};
+	// A single-file release works. Older assets ahead of it must never win selection.
+	EXPECT_TRUE(parse(canonical));
+	EXPECT_TRUE(release.assetName == "PPSSPP.nro");
+	EXPECT_TRUE(release.assetSize == 73756974);
+	EXPECT_TRUE(release.assetDigest == "sha256:0123456789abcdef");
+	EXPECT_TRUE(release.tag == "v1.0.2" && release.name == "Release" && release.notes == "Changes");
+	EXPECT_TRUE(parse(legacy + "," + canonical));
+	EXPECT_TRUE(release.assetName == "PPSSPP.nro");
+	EXPECT_FALSE(parse(legacy));
+	EXPECT_TRUE(error.find("PPSSPP.nro") != std::string::npos);
+	EXPECT_FALSE(parse(""));
+	EXPECT_FALSE(SwitchUpdate_ParseRelease("not JSON", &release, &error));
+	EXPECT_FALSE(SwitchUpdate_ParseRelease(R"({"assets":[]})", &release, &error));
+	// Reject malformed sizes before converting JSON numbers to an integer.
+	for (const char *size : {"-1", "1048575", "536870913", "1e100", "1048576.5", "null", R"("73756974")"}) {
+		std::string asset = canonical;
+		asset.replace(asset.find("73756974"), 8, size);
+		EXPECT_FALSE(parse(asset));
+	}
+	for (const char *url : {"http://github.com/NaGaa95/ppsspp-nx/releases/download/v1/PPSSPP.nro", "https://example.com/PPSSPP.nro",
+							"https://github.com/NaGaa95/ppsspp-nx/releases/download-evil/v1/PPSSPP.nro"}) {
+		std::string asset = canonical;
+		auto start = asset.find("https://");
+		asset.replace(start, asset.find('"', start) - start, url);
+		EXPECT_FALSE(parse(asset));
+	}
+	// If an invalid canonical entry comes first, a later valid one still works.
+	EXPECT_TRUE(parse(R"({"name":"PPSSPP.nro","size":0,"browser_download_url":"bad"},)" + canonical));
+	return true;
+}
+
+bool TestSwitchInputNames() {
+	using SwitchLauncher::GamepadInputName;
+	EXPECT_TRUE(std::string(GamepadInputName(InputMapping(DEVICE_ID_PAD_0, NKCODE_BUTTON_3))) == "A");
+	EXPECT_TRUE(std::string(GamepadInputName(InputMapping(DEVICE_ID_PAD_0, NKCODE_BUTTON_2))) == "B");
+	EXPECT_TRUE(std::string(GamepadInputName(InputMapping(DEVICE_ID_PAD_0, NKCODE_BUTTON_1))) == "X");
+	EXPECT_TRUE(std::string(GamepadInputName(InputMapping(DEVICE_ID_PAD_0, NKCODE_BUTTON_4))) == "Y");
+	EXPECT_TRUE(std::string(GamepadInputName(InputMapping(DEVICE_ID_PAD_0, JOYSTICK_AXIS_Z, -1))) == "Right stick Left");
+	EXPECT_TRUE(std::string(GamepadInputName(InputMapping(DEVICE_ID_PAD_0, JOYSTICK_AXIS_RZ, 1))) == "Right stick Down");
+	EXPECT_TRUE(std::string(GamepadInputName(InputMapping(DEVICE_ID_PAD_0, JOYSTICK_AXIS_LTRIGGER, 1))) == "ZL");
+	EXPECT_TRUE(std::string(GamepadInputName(InputMapping(DEVICE_ID_PAD_0, JOYSTICK_AXIS_RTRIGGER, 1))) == "ZR");
+	EXPECT_TRUE(std::string(GamepadInputName(InputMapping(DEVICE_ID_SWITCH_RIGHT_STICK, NKCODE_DPAD_UP))) == "Right stick Up");
+	EXPECT_TRUE(GamepadInputName(InputMapping(DEVICE_ID_KEYBOARD, NKCODE_A)) == nullptr);
+	return true;
+}
+
+bool TestUIOverlayInput() {
+	using namespace UI;
+	class Probe : public LinearLayout {
+	public:
+		Probe() : LinearLayout(ORIENT_VERTICAL) {}
+		void Axis(const AxisInput &axis) override { value = axis.value; }
+		bool Key(const KeyInput &key) override { lastKey = key.keyCode; return true; }
+		float value = 0;
+		InputKeyCode lastKey = NKCODE_UNKNOWN;
+	} root;
+	ConfigureMenuNavigation(false, .4, .17);
+	AxisEvent(AxisInput{DEVICE_ID_PAD_0, JOYSTICK_AXIS_X, .9f}, &root);
+	EXPECT_EQ_FLOAT(root.value, 0.f);
+	EXPECT_EQ_INT(root.lastKey, NKCODE_UNKNOWN);
+	AxisEvent(AxisInput{DEVICE_ID_PAD_0, JOYSTICK_AXIS_HAT_X, .9f}, &root);
+	EXPECT_EQ_FLOAT(root.value, .9f);
+	EXPECT_EQ_INT(root.lastKey, NKCODE_DPAD_RIGHT);
+	AxisEvent(AxisInput{DEVICE_ID_PAD_0, JOYSTICK_AXIS_HAT_X, 0.f}, &root);
+	AxisEvent(AxisInput{DEVICE_ID_PAD_0, JOYSTICK_AXIS_Y, .9f}, &root);
+	EXPECT_EQ_FLOAT(root.value, .9f);
+	AxisEvent(AxisInput{DEVICE_ID_PAD_0, JOYSTICK_AXIS_Y, 0.f}, &root);
+	KeyEvent(KeyInput{DEVICE_ID_KEYBOARD, NKCODE_DPAD_LEFT, KeyInputFlags::DOWN}, &root);
+	EXPECT_EQ_INT(root.lastKey, NKCODE_DPAD_LEFT);
+	ConfigureMenuNavigation(true, 15.0 / 60.0, 5.0 / 60.0);
+	AxisEvent(AxisInput{DEVICE_ID_PAD_0, JOYSTICK_AXIS_X, .9f}, &root);
+	EXPECT_EQ_FLOAT(root.value, .9f);
+	EXPECT_EQ_INT(root.lastKey, NKCODE_DPAD_RIGHT);
+	AxisEvent(AxisInput{DEVICE_ID_PAD_0, JOYSTICK_AXIS_X, 0.f}, &root);
+	UpdateViewHierarchy(&root, false);
+	return true;
+}
+
 bool TestTextureReplacer();
 
 static bool TestQueueBuf() {
@@ -4269,7 +4440,12 @@ TestItem availableTests[] = {
 	TEST_ITEM(TextureReplacer),
 	TEST_ITEM(UITabOrder),
 	TEST_ITEM(UIFocusNavigation),
+	TEST_ITEM(UIOverlayInput),
+	TEST_ITEM(UIPaneNavigation),
+	TEST_ITEM(SwitchInputNames),
+	TEST_ITEM(SwitchUpdateRelease),
 	TEST_ITEM(TextDrawerCache),
+	TEST_ITEM(TextDrawerFactory),
 	TEST_ITEM(FatShortNames),
 	TEST_ITEM(GEDumpGameID),
 	TEST_ITEM(UmdDiscType),

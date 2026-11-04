@@ -77,6 +77,9 @@ public:
 
 	// Assumes that layout has taken place.
 	NeighborResult FindNeighbor(View *view, FocusMove direction, NeighborResult best);
+	// A root can opt into pane navigation. Return the origin to keep focus in place,
+	// or nullptr to use the normal spatial navigation.
+	void SetFocusNavigation(std::function<View *(View *, FocusMove)> navigation) { focusNavigation_ = std::move(navigation); }
 	virtual NeighborResult FindScrollNeighbor(View *view, const Point2D &target, FocusMove direction, NeighborResult best);
 
 	// Appends the views Tab/Shift+Tab step through, in the order they were added, depth first -
@@ -118,6 +121,7 @@ protected:
 
 	std::vector<View *> views_;
 	View *defaultFocusView_ = nullptr;
+	std::function<View *(View *, FocusMove)> focusNavigation_;
 	Drawable bg_;
 	float dropShadowExpand_ = 0.0f;
 	float radiusFactor_ = 1.0f;

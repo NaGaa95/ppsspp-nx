@@ -11,6 +11,11 @@
 #include "UI/MiscViews.h"
 #include "Common/UI/Context.h"
 #include "UI/TabbedDialogScreen.h"
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+#include "UI/SwitchUIStyle.h"
+#include "Common/SwitchUIColors.h"
+#include "UI/GameInfoCache.h"
+#endif
 
 UITabbedBaseDialogScreen::UITabbedBaseDialogScreen(const Path &gamePath, int *currentTabSetting, TabDialogFlags flags)
 	: UIBaseDialogScreen(gamePath), currentTabSetting_(currentTabSetting), flags_(flags) {}
@@ -91,7 +96,25 @@ void UITabbedBaseDialogScreen::CreateViews() {
 		tabHolder_ = new TabHolder(ORIENT_VERTICAL, 300, tabHolderFlags, nullptr, nullptr);
 		CreateExtraButtons(tabHolder_->Container(), 10);
 		tabHolder_->AddBack(this);
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		auto *frame = new LinearLayout(ORIENT_VERTICAL, new LayoutParams(FILL_PARENT, FILL_PARENT));
+		frame->SetPadding(Margins(26, 4, 26, 8));
+		frame->SetSpacing(12);
+		std::string gameTitle;
+		if (!gamePath_.empty()) {
+			gameTitle = g_gameInfoCache->GetInfo(nullptr, gamePath_, GameInfoFlags::PARAM_SFO)->GetTitle();
+		}
+		frame->Add(SwitchUI::Header(gamePath_, gameTitle.empty() ? std::string(GetI18NCategory(I18NCat::DIALOG)->T("Settings")) : gameTitle,
+			GetI18NCategory(I18NCat::PAUSE)->T("Game Settings")));
+		tabHolder_->ReplaceLayoutParams(new LinearLayoutParams(FILL_PARENT, FILL_PARENT, 1.0f));
+		tabHolder_->SetBG(Drawable(SwitchUI::PANEL));
+		frame->Add(tabHolder_);
+		tabHolder_->EnablePaneNavigation(frame);
+		frame->Add(SwitchUI::Footer(false, true));
+		root_ = frame;
+#else
 		root_ = tabHolder_;
+#endif
 	}
 
 	tabHolder_->SetTag(tag());  // take the tag from the screen.

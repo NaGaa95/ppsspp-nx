@@ -118,6 +118,8 @@ include(CheckCXXSourceCompiles)
 include(GNUInstallDirs)
 
 if(USE_LIBNX)
+	# Discard the frontend selector from older build directories. Switch always uses SDL.
+	unset(SWITCH_SDL_LAUNCHER CACHE)
 	add_compile_definitions(ASSETS_DIR="romfs:/")
 else()
 	add_compile_definitions(ASSETS_DIR="${CMAKE_INSTALL_FULL_DATADIR}/ppsspp/assets/")
@@ -384,7 +386,7 @@ endif()
 # naett wraps a native HTTPS implementation per platform: WinHTTP on Windows, the Java
 # APIs on Android, NSURLSession on macOS, and libcurl elsewhere.
 if(USE_LIBNX)
-	set(PPSSPP_SWITCH_RELEASE_VERSION "1.0.0" CACHE STRING "PPSSPP Switch release version")
+	set(PPSSPP_SWITCH_RELEASE_VERSION "1.0.1" CACHE STRING "PPSSPP Switch release version")
 	add_compile_definitions(PPSSPP_SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION}")
 	find_path(SWITCH_CURL_INCLUDE_DIR curl/curl.h REQUIRED)
 	find_library(SWITCH_CURL_LIBRARY NAMES curl REQUIRED)
@@ -1154,10 +1156,21 @@ else()
 			Common/GPU/Vulkan/SwitchLSFG.cpp
 			UI/SwitchLibrary.h
 			UI/SwitchLibrary.cpp
-			UI/SwitchLibraryScreen.h
-			UI/SwitchLibraryScreen.cpp
+			UI/SwitchForwarderInstaller.h
+			UI/SwitchForwarderInstaller.cpp
+			UI/SwitchForwarderStructs.h
+			UI/SwitchForwarderScreen.h
+			UI/SwitchForwarderScreen.cpp
+			UI/SwitchSteamGridDB.h
+			UI/SwitchSteamGridDB.cpp
 			UI/SwitchUpdate.h
+			UI/SwitchUpdateRelease.h
 			UI/SwitchUpdate.cpp)
+		list(APPEND targetExtra SDL/SwitchLauncher.h SDL/SwitchLauncher.cpp SDL/SwitchText.h SDL/SwitchText.cpp SDL/SwitchTextDrawer.h SDL/SwitchTextDrawer.cpp)
+		set_property(SOURCE SDL/SDLMain.cpp SDL/SwitchLauncher.cpp SDL/SwitchText.cpp UI/SwitchUpdate.cpp UI/SwitchForwarderScreen.cpp APPEND PROPERTY COMPILE_DEFINITIONS PPSSPP_SWITCH_SDL_LAUNCHER)
+		find_package(PkgConfig REQUIRED)
+		pkg_check_modules(SWITCH_TEXT REQUIRED IMPORTED_TARGET freetype2 harfbuzz fribidi)
+		list(APPEND targetExtraLibs PkgConfig::SWITCH_TEXT)
 		list(APPEND targetExtraLibs SwitchLsfgBackend SwitchCurl smb2 libusbhsfs)
 	endif()
 	if(SDL_TTF_LIB_TARGET)
@@ -1720,7 +1733,11 @@ if(USE_LIBNX)
 		RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/assets"
 		"${CMAKE_CURRENT_SOURCE_DIR}/assets/*"
 	)
-	dkp_add_asset_target(PPSSPP_romfs "${CMAKE_CURRENT_SOURCE_DIR}/assets")
+	set(SWITCH_ROMFS_DIR "${CMAKE_CURRENT_BINARY_DIR}/romfs")
+	foreach(asset IN LISTS SWITCH_ROMFS_FILES)
+		configure_file("${CMAKE_CURRENT_SOURCE_DIR}/assets/${asset}" "${SWITCH_ROMFS_DIR}/${asset}" COPYONLY)
+	endforeach()
+	dkp_add_asset_target(PPSSPP_romfs "${SWITCH_ROMFS_DIR}")
 	dkp_track_assets(PPSSPP_romfs FILES ${SWITCH_ROMFS_FILES})
 
 	nx_generate_nacp(

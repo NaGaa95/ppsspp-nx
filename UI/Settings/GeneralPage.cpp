@@ -164,6 +164,7 @@ static void BuildUISettingsPage(SettingsPage *page) {
 	});
 
 	page->Header();
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	const Path bgPng = GetSysDirectory(DIRECTORY_SYSTEM) / "background.png";
 	const Path bgJpg = GetSysDirectory(DIRECTORY_SYSTEM) / "background.jpg";
 	if (File::Exists(bgPng) || File::Exists(bgJpg)) {
@@ -200,6 +201,8 @@ static void BuildUISettingsPage(SettingsPage *page) {
 		page->Setting(&g_Config.fUITint).LiveUpdate().Setup(noDropShadow);
 		page->Setting(&g_Config.fUISaturation).LiveUpdate().Setup(noDropShadow);
 	}
+
+#endif
 
 	// Shared with achievements.
 	page->Header({I18NCat::ACHIEVEMENTS, "Notifications"});  // Unclean string reuse :)
@@ -292,7 +295,9 @@ void BuildGeneralSettings(SettingsPage *page, SystemPageState *state) {
 
 	page->Header();
 
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	page->Setting(&g_Config.bCheckForNewVersion);
+#endif
 	page->Choice("Restore Default Settings").OnClick([host, state](UI::EventParams &e) {
 		OnRestoreDefaultSettings(host, state);
 	});
@@ -312,8 +317,10 @@ void BuildGeneralSettings(SettingsPage *page, SystemPageState *state) {
 	page->Setting(&g_Config.bScreenshotsAsPNG);
 	page->Setting(&g_Config.iScreenshotMode);
 
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	page->Header("Help the PPSSPP team");
 	page->Bool(&state->enableReports, "Enable Compatibility Server Reports").EnabledFunc([]() {
 		return Reporting::IsSupported();
 	});
+#endif
 }

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "Common/File/Path.h"
@@ -33,7 +34,7 @@ bool AddSource(const Path &path);
 void RemoveSource(size_t index);
 
 std::vector<SwitchStorage::SmbShare> GetSmbShares();
-bool SaveSmbShare(const SwitchStorage::SmbShare &share, std::string *error = nullptr);
+bool SaveSmbShare(const SwitchStorage::SmbShare &share, std::string *error = nullptr, bool connect = true);
 void RemoveSmbShare(const std::string &id);
 
 void RequestScan();
@@ -41,5 +42,8 @@ void RequestScan(size_t sourceIndex);
 std::vector<Path> GetGames();
 uint64_t Generation();
 bool IsScanning();
+
+std::string MakeForwarderTarget(const Path &gamePath);
+bool ResolveForwarderTarget(std::string_view target, std::string *gamePath, std::string *error = nullptr);
 
 }  // namespace SwitchLibrary

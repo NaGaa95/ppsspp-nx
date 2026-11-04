@@ -64,6 +64,10 @@
 #include "UI/DevScreens.h"
 #include "UI/EmuScreen.h"
 #include "UI/PauseScreen.h"
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+#include "UI/SwitchUIStyle.h"
+#include "Common/SwitchUIColors.h"
+#endif
 #include "UI/LoadStateConfirmScreen.h"
 #include "UI/GameSettingsScreen.h"
 #include "UI/ReportScreen.h"
@@ -261,6 +265,8 @@ public:
 	UI::Event OnStateLoaded;
 	UI::Event OnStateSaved;
 	UI::Event OnScreenshotClicked;
+	UI::Event OnDeleteRequested;
+	UI::View *StateFocus() const { return loadStateButton_ ? loadStateButton_ : saveStateButton_; }
 	UI::Event OnSelected;
 	UI::Event OnLoadRequested;
 
@@ -285,12 +291,16 @@ SaveSlotView::SaveSlotView(std::string_view saveStatePrefix, int slot, UI::Layou
 	Add(new Spacer(5));
 
 	// TEMP HACK: use some other view, like a Choice, themed differently to enable keyboard access to selection.
-	ClickableTextView *numberView = Add(new ClickableTextView(number, new LinearLayoutParams(40.0f, WRAP_CONTENT, 0.0f, Gravity::G_VCENTER)));
-	numberView->SetBig(true);
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	auto *numberView = Add(new TextView(number, new LinearLayoutParams(40.0f, WRAP_CONTENT, 0.0f, Gravity::G_VCENTER)));
+#else
+	auto *numberView = Add(new ClickableTextView(number, new LinearLayoutParams(40.0f, WRAP_CONTENT, 0.0f, Gravity::G_VCENTER)));
 	numberView->OnClick.Add([this](UI::EventParams &e) {
 		e.v = this;
 		OnSelected.Trigger(e);
 	});
+#endif
+	numberView->SetBig(true);
 
 	AsyncImageFileView *fv = Add(new AsyncImageFileView(screenshotFilename_, IS_DEFAULT, new UI::LayoutParams(82 * 2, 47 * 2)));
 
@@ -310,10 +320,14 @@ SaveSlotView::SaveSlotView(std::string_view saveStatePrefix, int slot, UI::Layou
 	saveStateButton_ = buttons->Add(new Button(pa->T("Save State"), new LinearLayoutParams(0.0, Gravity::G_VCENTER)));
 	saveStateButton_->OnClick.Handle(this, &SaveSlotView::OnSaveState);
 	saveStateButton_->SetRoundCorners();
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	fv->SetCanBeFocused(false);
+#else
 	fv->OnClick.Add([this](UI::EventParams &e) {
 		e.v = this;
 		OnScreenshotClicked.Trigger(e);
 	});
+#endif
 
 	if (SaveState::HasSaveInSlot(saveStatePrefix_, slot_)) {
 		if (!Achievements::HardcoreModeActive()) {
@@ -322,6 +336,15 @@ SaveSlotView::SaveSlotView(std::string_view saveStatePrefix, int slot, UI::Layou
 			loadStateButton_->SetRoundCorners();
 		}
 
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		auto *remove = buttons->Add(
+			SwitchUI::DeleteButton(GetI18NCategory(I18NCat::DIALOG)->T("Delete"), new LinearLayoutParams(0.0, Gravity::G_VCENTER)));
+		remove->SetRoundCorners();
+		remove->OnClick.Add([this](UI::EventParams &e) {
+			e.v = this;
+			OnDeleteRequested.Trigger(e);
+		});
+#endif
 		std::string nameStr = SaveState::GetSlotCustomName(saveStatePrefix_, slot_);
 
 		if (!nameStr.empty()) {
@@ -347,10 +370,18 @@ SaveSlotView::SaveSlotView(std::string_view saveStatePrefix, int slot, UI::Layou
 }
 
 void SaveSlotView::Draw(UIContext &dc) {
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	const Bounds bounds = GetBounds().Expand(3);
+	dc.Draw()->DrawRoundRect(bounds, 10, g_Config.iCurrentStateSlot == slot_ ? SwitchUI::FOCUS : SwitchUI::PANEL);
+	if (g_Config.iCurrentStateSlot == slot_) {
+		dc.FillRect(UI::Drawable(SwitchUI::ACCENT), Bounds(bounds.x, bounds.y + 12, 3, bounds.h - 24));
+	}
+#else
 	if (g_Config.iCurrentStateSlot == slot_) {
 		dc.FillRect(UI::Drawable(0x70000000), GetBounds().Expand(3));
 		dc.FillRect(UI::Drawable(0x70FFFFFF), GetBounds().Expand(3));
 	}
+#endif
 	UI::LinearLayout::Draw(dc);
 }
 
@@ -461,6 +492,23 @@ void GamePauseScreen::CreateSavestateControls(UI::LinearLayout *leftColumnItems,
 	leftColumnItems->SetSpacing(10.0);
 	for (int i = 0; i < g_Config.iSaveStateSlotCount; i++) {
 		SaveSlotView *slot = leftColumnItems->Add(new SaveSlotView(saveStatePrefix_, i, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, Gravity::G_HCENTER, Margins(0,0,0,0))));
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		if (i == std::clamp(g_Config.iCurrentStateSlot, 0, g_Config.iSaveStateSlotCount - 1)) {
+			root_->SetDefaultFocusView(slot->StateFocus());
+		}
+		slot->OnDeleteRequested.Add([this](UI::EventParams &e) {
+			const int index = static_cast<SaveSlotView *>(e.v)->GetSlot();
+			auto di = GetI18NCategory(I18NCat::DIALOG);
+			screenManager()->push(new MessagePopupScreen(di->T("Delete"), di->T("DeleteConfirmSaveState"), di->T("Delete"), di->T("Cancel"),
+														 [this, index](bool yes) {
+															 if (yes) {
+																 g_Config.iCurrentStateSlot = index;
+																 SaveState::DeleteSlot(saveStatePrefix_, index);
+																 RecreateViews();
+															 }
+														 }));
+		});
+#endif
 		slot->OnStateLoaded.Handle(this, &GamePauseScreen::OnState);
 		slot->OnStateSaved.Handle(this, &GamePauseScreen::OnState);
 		slot->OnLoadRequested.Add([this](UI::EventParams &e) {
@@ -501,14 +549,22 @@ void GamePauseScreen::CreateSavestateControls(UI::LinearLayout *leftColumnItems,
 
 	LinearLayout *buttonRow = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(Margins(10, 0, 0, 10)));
 	if (g_Config.bEnableStateUndo && !Achievements::HardcoreModeActive() && NetworkAllowSaveState()) {
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		auto *saveUndoButton = buttonRow->Add(SwitchUI::UndoButton(pa->T("Undo last save")));
+#else
 		UI::Choice *saveUndoButton = buttonRow->Add(new Choice(pa->T("Undo last save"), ImageID("I_NAVIGATE_BACK"), new LinearLayoutParams(WRAP_CONTENT, WRAP_CONTENT)));
+#endif
 		saveUndoButton->SetEnabled(SaveState::HasUndoLastSave(saveStatePrefix_));
 		saveUndoButton->OnClick.Add([this](UI::EventParams &e) {
 			SaveState::UndoLastSave(saveStatePrefix_);
 			RecreateViews();
 		});
 
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		auto *loadUndoButton = buttonRow->Add(SwitchUI::UndoButton(pa->T("Undo last load")));
+#else
 		UI::Choice *loadUndoButton = buttonRow->Add(new Choice(pa->T("Undo last load"), ImageID("I_NAVIGATE_BACK"), new LinearLayoutParams(WRAP_CONTENT, WRAP_CONTENT)));
+#endif
 		loadUndoButton->SetEnabled(SaveState::HasUndoLoad(saveStatePrefix_));
 		loadUndoButton->OnClick.Add([this](UI::EventParams &e) {
 			CloseAfterStateLoad([this](SaveState::Callback callback) {
@@ -536,6 +592,9 @@ void GamePauseScreen::CreateSavestateControls(UI::LinearLayout *leftColumnItems,
 }
 
 UI::Margins GamePauseScreen::RootMargins() const {
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	return UI::Margins(26, 4, 26, 8);
+#endif
 	if (System_GetPropertyInt(SYSPROP_DEVICE_TYPE) == DEVICE_TYPE_MOBILE && GetDeviceOrientation() == DeviceOrientation::Landscape) {
 		// Add some top margin on mobile so it isn't too close to the status bar, as we place buttons
 		// very close to the top of the screen.
@@ -559,7 +618,20 @@ void GamePauseScreen::CreateViews() {
 	auto di = GetI18NCategory(I18NCat::DIALOG);
 	auto co = GetI18NCategory(I18NCat::CONTROLS);
 
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	portrait = false;
+	auto *frame = new LinearLayout(ORIENT_VERTICAL);
+	frame->SetSpacing(12);
+	root_ = frame;
+	const auto info = g_gameInfoCache->GetInfo(nullptr, gamePath_, GameInfoFlags::PARAM_SFO);
+	frame->Add(SwitchUI::Header(gamePath_, info->GetTitle(), GPUBackendToString((GPUBackend)g_Config.iGPUBackend), true,
+								[this] { screenManager()->push(new GameScreen(gamePath_, true)); }));
+	auto *layoutRoot = frame->Add(new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT, 1.0f)));
+	layoutRoot->SetSpacing(20);
+#else
 	root_ = new LinearLayout(portrait ? ORIENT_VERTICAL : ORIENT_HORIZONTAL);
+	auto *layoutRoot = root_;
+#endif
 
 	if (portrait) {
 		((LinearLayout *)root_)->SetSpacing(0);
@@ -576,7 +648,7 @@ void GamePauseScreen::CreateViews() {
 			title = g_paramSFO.GetValueString("TITLE");
 		}
 		TopBar *topBar = new TopBar(*screenManager()->getUIContext(), TopBarFlags::ContextMenuButton, title);
-		root_->Add(topBar);
+		layoutRoot->Add(topBar);
 
 		topBar->OnContextMenuClick.Add([this, portrait](UI::EventParams &e) {
 			UI::View *srcView = e.v;
@@ -585,7 +657,9 @@ void GamePauseScreen::CreateViews() {
 	}
 
 	ViewGroup *saveScrollContainer = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(1.0f, scrollMargins));
-	root_->Add(saveScrollContainer);
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	layoutRoot->Add(saveScrollContainer);
+#endif
 
 	ScrollView *saveStateScroll = saveScrollContainer->Add(new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, FILL_PARENT, 1.0f)));
 	saveStateScroll->SetShadows(false);
@@ -668,9 +742,11 @@ void GamePauseScreen::CreateViews() {
 			LinearLayout *horiz = new LinearLayout(ORIENT_HORIZONTAL);
 			saveDataScrollItems->Add(horiz);
 			horiz->Add(new NoticeView(NoticeLevel::WARN, pa->T("Using save states is not recommended in this game"), "", new LinearLayoutParams(1.0f)));
+#if !PPSSPP_PLATFORM(SWITCH)
 			horiz->Add(new Button(di->T("More info")))->OnClick.Add([](UI::EventParams &e) {
 				System_LaunchUrl(LaunchUrlType::BROWSER_URL, "https://www.ppsspp.org/docs/troubleshooting/save-state-time-warps");
 			});
+#endif
 		}
 		LinearLayout *extraRow = nullptr;
 		CreateSavestateControls(saveDataScrollItems, &extraRow);
@@ -715,17 +791,28 @@ void GamePauseScreen::CreateViews() {
 		buttonColumn = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
 
 		middleColumn = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, ITEM_HEIGHT, Margins(10, 10, 10, 10)));
-		root_->Add(middleColumn);
-		root_->Add(buttonColumn);
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		layoutRoot->Add(middleColumn);
+#endif
+		layoutRoot->Add(buttonColumn);
 	} else {
 		middleColumn = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(ITEM_HEIGHT, FILL_PARENT, Margins(0, 10, 0, 15)));
-		root_->Add(middleColumn);
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		layoutRoot->Add(middleColumn);
+#endif
 		middleColumn->SetSpacing(0.0f);
 
 		ViewGroup *buttonColumnScroll = new ScrollView(ORIENT_VERTICAL, new LinearLayoutParams(320, FILL_PARENT, actionMenuMargins));
 		buttonColumn = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(WRAP_CONTENT, WRAP_CONTENT));
 		buttonColumnScroll->Add(buttonColumn);
-		root_->Add(buttonColumnScroll);
+		layoutRoot->Add(buttonColumnScroll);
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		layoutRoot->Add(saveScrollContainer);
+		saveScrollContainer->SetBG(Drawable(SwitchUI::PANEL));
+		static_cast<LinearLayout *>(saveScrollContainer)->SetPadding(Margins(14));
+		delete middleColumn;
+		middleColumn = nullptr;
+#endif
 	}
 
 	LinearLayout *rightColumnItems = new LinearLayout(ORIENT_VERTICAL);
@@ -753,8 +840,15 @@ void GamePauseScreen::CreateViews() {
 	}
 
 	if (!portrait) {
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		Choice *continueChoice = topGroup->Add(new Choice(pa->T("Resume"), ImageID("I_PLAY")));
+		if (!root_->GetDefaultFocusView()) {
+			root_->SetDefaultFocusView(continueChoice);
+		}
+#else
 		Choice *continueChoice = topGroup->Add(new Choice(pa->T("Continue"), ImageID("I_PLAY")));
 		root_->SetDefaultFocusView(continueChoice);
+#endif
 		continueChoice->OnClick.Handle<UIScreen>(this, &UIScreen::OnBack);
 	}
 
@@ -779,7 +873,8 @@ void GamePauseScreen::CreateViews() {
 	}
 
 #if PPSSPP_PLATFORM(SWITCH)
-	if (g_Config.bSwitchFrameGeneration && g_Config.iGPUBackend == (int)GPUBackend::VULKAN) {
+	if (g_Config.bSwitchFrameGeneration &&
+		(g_Config.iGPUBackend == (int)GPUBackend::VULKAN || g_Config.iGPUBackend == (int)GPUBackend::DEKO3D)) {
 		frameGenerationEnabled_ = SwitchLSFG_IsEnabled();
 		CheckBox *frameGeneration = rightColumnItems->Add(new CheckBox(&frameGenerationEnabled_, gr->T("Frame Generation")));
 		frameGeneration->SetEnabledFunc([this] {
@@ -823,12 +918,20 @@ void GamePauseScreen::CreateViews() {
 	if (!portrait) {
 		AddExtraOptions(mainGroup);
 	}
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	CheckBox *playBehind = mainGroup->Add(new CheckBox(&g_Config.bRunBehindPauseMenu, "Run game behind menu"));
+	playBehind->SetEnabledFunc([this] { return !MustRunBehind(); });
+#endif
 	Choice *exit;
 	if (g_Config.bPauseMenuExitsEmulator) {
 		auto di = GetI18NCategory(I18NCat::DIALOG);
 		exit = new Choice(di->T("Exit"), ImageID("I_EXIT"));
 	} else {
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+		exit = new Choice(pa->T("Exit to launcher"), ImageID("I_EXIT"));
+#else
 		exit = new Choice(pa->T("Exit to menu"), ImageID("I_EXIT"));
+#endif
 	}
 	exit->SetRoundCorners();
 
@@ -886,6 +989,11 @@ void GamePauseScreen::CreateViews() {
 	} else {
 		playButton_ = nullptr;
 	}
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	SwitchUI::CompactMenu(rightColumnItems);
+	frame->Add(SwitchUI::Footer(true));
+#endif
+
 }
 
 void GamePauseScreen::ShowContextMenu(UI::View *menuButton, bool portrait) {
@@ -907,10 +1015,12 @@ void GamePauseScreen::ShowContextMenu(UI::View *menuButton, bool portrait) {
 				FinishNextFrame(DR_BACK);  // resume
 			}
 		});
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 		auto dev = GetI18NCategory(I18NCat::DEVELOPER);
 		parent->Add(new Choice(dev->T("DevMenu"), ImageID("I_DEBUGGER")))->OnClick.Add([this](UI::EventParams &e) {
 			screenManager()->push(new DevMenuScreen(gamePath_, I18NCat::DEVELOPER));
 		});
+#endif
 		if (portrait) {
 			AddExtraOptions(parent);
 		}

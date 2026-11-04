@@ -648,7 +648,7 @@ void CreditsScreen::update() {
 	UpdateUIState(UISTATE_MENU);
 }
 
-void CreditsScroller::Draw(UIContext &dc) {
+std::vector<std::string> GetCreditsText() {
 	auto cr = GetI18NCategory(I18NCat::PSPCREDITS);
 
 	std::string specialthanksMaxim = "Maxim ";
@@ -801,11 +801,19 @@ void CreditsScroller::Draw(UIContext &dc) {
 	}
 	credits[0] = (const char *)temp;
 
+	std::vector<std::string> result;
+	for (const auto line : credits) { result.emplace_back(line); }
+	return result;
+}
+
+void CreditsScroller::Draw(UIContext &dc) {
+	const auto credits = GetCreditsText();
+
 	dc.Begin();
 
 	Bounds &bounds = bounds_;
 	bounds = bounds.Inset(10.f, 10.f);
-	const int numItems = ARRAY_SIZE(credits);
+	const int numItems = (int)credits.size();
 	int itemHeight = 36;
 	int contentsHeight = numItems * itemHeight + bounds.h + 200;
 

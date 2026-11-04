@@ -419,6 +419,18 @@ std::string GameInfo::GetTitle() {
 	}
 }
 
+bool GameInfo::TryGetMetadata(GameInfoMetadata *metadata) {
+	std::unique_lock<std::mutex> guard(lock, std::try_to_lock);
+	if (!guard.owns_lock() || !(hasFlags & GameInfoFlags::PARAM_SFO)) {
+		return false;
+	}
+	metadata->title = title.empty() ? filePath_.GetFilename() : title;
+	metadata->id = id;
+	metadata->region = region;
+	metadata->hasConfig = hasConfig;
+	return true;
+}
+
 std::string GameInfo::GetDBTitle() {
 	std::lock_guard<std::mutex> guard(lock);
 	// Without PARAM_SFO there's no id_version to look up, so don't bother.
@@ -681,8 +693,10 @@ public:
 					if (LoadReplacementImage(info_.get(), &info_->icon, "icon.png")) {
 						// Nothing more to do
 					} else if (pbp.GetSubFileSize(PBP_ICON0_PNG) > 0) {
+						std::string data;
+						pbp.GetSubFileAsString(PBP_ICON0_PNG, &data);
 						std::lock_guard<std::mutex> lock(info_->lock);
-						pbp.GetSubFileAsString(PBP_ICON0_PNG, &info_->icon.data);
+						info_->icon.data = std::move(data);
 					} else {
 						Path screenshot_jpg = GetSysDirectory(DIRECTORY_SCREENSHOT) / (info_->id + "_00000.jpg");
 						Path screenshot_png = GetSysDirectory(DIRECTORY_SCREENSHOT) / (info_->id + "_00000.png");
@@ -1151,6 +1165,45 @@ void GameInfoCache::PurgeType(IdentifiedFileType fileType) {
 			sleep_ms(10, "game-info-cache-purge-poll");
 		}
 	} while (retry);
+}
+
+std::shared_ptr<GameInfo> GameInfoCache::TryGetInfo(const Path &gamePath, GameInfoFlags wantFlags, GameInfoFlags *outHasFlags,
+													TaskPriority priority) {
+	if (outHasFlags) {
+		*outHasFlags = GameInfoFlags::EMPTY;
+	}
+	std::unique_lock<std::mutex> mapGuard(mapLock_, std::try_to_lock);
+	if (!mapGuard.owns_lock()) {
+		return nullptr;
+	}
+	auto &cached = info_[gamePath.ToString()];
+	if (!cached) {
+		cached = std::make_shared<GameInfo>(gamePath);
+	}
+	std::shared_ptr<GameInfo> info = cached;
+	mapGuard.unlock();
+	GameInfoFlags wanted;
+	{
+		std::unique_lock<std::mutex> guard(info->lock, std::try_to_lock);
+		if (!guard.owns_lock()) {
+			return info;
+		}
+		info->lastAccessedTime = time_now_d();
+		wantFlags |= GameInfoFlags::FILE_TYPE;
+		wanted = (GameInfoFlags)((int)wantFlags & ~(int)(info->hasFlags | info->pendingFlags));
+		// A pending file-type task may not have identified the file yet.
+		if (wanted != GameInfoFlags::EMPTY && !(info->hasFlags & GameInfoFlags::FILE_TYPE)) {
+			wanted |= GameInfoFlags::FILE_TYPE;
+		}
+		info->pendingFlags |= wanted;
+		if (outHasFlags) {
+			*outHasFlags = info->hasFlags;
+		}
+	}
+	if (wanted != GameInfoFlags::EMPTY) {
+		g_threadManager.EnqueueTask(new GameInfoWorkItem(gamePath, info, wanted, priority));
+	}
+	return info;
 }
 
 // Call on the main thread ONLY - that is from stuff called from NativeFrame.

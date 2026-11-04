@@ -389,6 +389,9 @@ static constexpr ConfigSetting generalSettings[] = {
 	ConfigSetting("Wow64WarningDismissed", SETTING(g_Config, bWow64WarningDismissed), false, CfgFlag::DEFAULT),
 #endif
 	ConfigSetting("Language", SETTING(g_Config, sLanguageIni), &DefaultLangRegion, CfgFlag::DEFAULT),
+#if PPSSPP_PLATFORM(SWITCH)
+	ConfigSetting("SteamGridDBAPIKey", SETTING(g_Config, sSteamGridDBAPIKey), "", CfgFlag::DEFAULT),
+#endif
 	ConfigSetting("ForceLagSync2", SETTING(g_Config, bForceLagSync), false, CfgFlag::PER_GAME)
 		.Label(I18NCat::SYSTEM, "Force real clock sync (slower, less lag)"),
 	ConfigSetting("DiscordRichPresence", SETTING(g_Config, bDiscordRichPresence), false, CfgFlag::DEFAULT)
@@ -1684,6 +1687,19 @@ const ConfigSettingRef *Config::FindSetting(const void *ptr) {
 	const std::map<const void *, ConfigSettingRef> &lut = getPtrLUT();
 	auto it = lut.find(ptr);
 	return it != lut.end() ? &it->second : nullptr;
+}
+
+const std::vector<ConfigSettingRef> &Config::GetSettings() {
+	static const std::vector<ConfigSettingRef> settings = [] {
+		std::vector<ConfigSettingRef> result;
+		for (const ConfigSectionMeta &meta : g_sectionMeta) {
+			for (size_t i = 0; i < meta.settingsCount; ++i) {
+				result.push_back({meta.configBlock, &meta.settings[i], meta.section});
+			}
+		}
+		return result;
+	}();
+	return settings;
 }
 
 int Config::GetDefaultValueInt(const int *configSetting) {

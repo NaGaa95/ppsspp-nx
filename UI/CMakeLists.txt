@@ -149,6 +149,15 @@ list(APPEND UISource
 # Headless and unit test builds never link this - they don't have a UI to show. See the
 # comment above add_subdirectory(UI) in the root CMakeLists.txt for why USE_DISCORD=1 has
 # to be defined before this add_subdirectory() call rather than in here.
+if(USE_LIBNX)
+	list(REMOVE_ITEM UISource Store.cpp RemoteISOScreen.cpp)
+	list(APPEND UISource SwitchUIStyle.h SwitchUIStyle.cpp)
+endif()
+
 add_library(ppsspp_ui STATIC ${UISource})
 target_link_libraries(ppsspp_ui Common Core)
 setup_target_project(ppsspp_ui UI)
+
+if(USE_LIBNX)
+	target_compile_definitions(ppsspp_ui PRIVATE PPSSPP_SWITCH_SDL_LAUNCHER)
+endif()

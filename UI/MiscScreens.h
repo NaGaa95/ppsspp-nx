@@ -135,3 +135,6 @@ protected:
 	void CreateDialogViews(UI::ViewGroup *parent) override;
 	const char *tag() const override { return "Credits"; }
 };
+
+// Shared credit text, rendered by each frontend in its own UI.
+std::vector<std::string> GetCreditsText();

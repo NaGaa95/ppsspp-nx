@@ -143,6 +143,12 @@
 #include "UI/EmuScreen.h"
 #include "UI/FirmwareScreen.h"
 #include "UI/GameInfoCache.h"
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+#include "SDL/SwitchLauncher.h"
+#include "SDL/SwitchTextDrawer.h"
+#include "Common/UI/Root.h"
+#include "UI/SwitchLibrary.h"
+#endif
 #include "UI/GameSettingsScreen.h"
 #include "UI/GPUDriverTestScreen.h"
 #include "UI/MiscScreens.h"
@@ -248,7 +254,9 @@ static void SetOutputsLive(bool live) {
 	g_outputRequestsDoneCond.notify_all();
 }
 
+#if !PPSSPP_PLATFORM(SWITCH)
 static int renderCounter = 0;
+#endif
 
 struct PendingMessage {
 	UIMessage message;
@@ -494,6 +502,7 @@ void PostLoadConfig() {
 #endif
 }
 
+#if !PPSSPP_PLATFORM(SWITCH)
 static void CheckFailedGPUBackends() {
 #ifdef _DEBUG
 	// If you're in debug mode, you probably don't want a fallback. If you're in release mode, use IGNORE below.
@@ -572,7 +581,12 @@ static void ClearFailedGPUBackends() {
 	File::Delete(failedBackendsFile);
 }
 
+#endif
+
 void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineOptions, const char *savegame_dir, const char *external_dir, const char *cache_dir) {
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	TextDrawer::SetFactory(&CreateSwitchTextDrawer);
+#endif
 	net::Init();  // This needs to happen before we load the config. So on Windows we also run it in Main. It's fine to call multiple times.
 
 	g_Config.Init();
@@ -885,7 +899,38 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 
 	ApplyAchievementsHostOverride();
 
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	UI::ConfigureMenuNavigation(false, .4, .17);
+	SwitchLibrary::Initialize();
+	if (g_Config.bRemoteShareOnStartup) {
+		System_RequestLocalNetworkPermission();
+		StartWebServer(WebServerFlags::DISCS);
+	}
+	std::optional<bool> launcherUmdAutoboot;
+	if (boot_filename.empty()) {
+		g_gameInfoCache = new GameInfoCache();
+		const auto launch = SwitchLauncher::Run();
+		if (launch.action == SwitchLauncher::Action::Launch) {
+			boot_filename = Path(launch.path);
+			boot_mountIso = Path(launch.mountIso);
+			launcherUmdAutoboot = launch.umdAutoboot;
+		} else if (launch.action == SwitchLauncher::Action::Restart) {
+			System_RestartApp("");
+		} else {
+			System_ExitApp();
+		}
+	}
+#endif
+
 	g_screenManager = new ScreenManager();
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	if (!boot_filename.empty()) {
+		g_screenManager->switchScreen(new EmuScreen(boot_filename, boot_mountIso, launcherUmdAutoboot));
+	} else {
+		g_screenManager->switchScreen(new MainScreen());
+	}
+#else
+
 	if (g_Config.memStickDirectory.empty()) {
 		INFO_LOG(Log::System, "No memstick directory! Asking for one to be configured.");
 		g_screenManager->switchScreen(new LogoScreen(AfterLogoScreen::MEMSTICK_SCREEN_INITIAL_SETUP));
@@ -917,15 +962,20 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 		g_screenManager->switchScreen(new MainScreen());
 	}
 
+#endif
+
 	g_screenManager->SetBackgroundOverlayScreens(new BackgroundScreen(), new OSDOverlayScreen());
+
 
 	// Easy testing
 	// screenManager->push(new GPUDriverTestScreen());
 
 	WebServerFlags flags = (WebServerFlags)0;
+#if !defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 	if (g_Config.bRemoteShareOnStartup) {
 		flags |= WebServerFlags::DISCS;
 	}
+#endif
 	if (g_Config.bRemoteDebuggerOnStartup) {
 		flags |= WebServerFlags::DEBUGGER;
 	}
@@ -939,9 +989,11 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 
 	// We do this here, instead of in NativeInitGraphics, because the display may be reset.
 	// When it's reset we don't want to forget all our managed things.
+#if !PPSSPP_PLATFORM(SWITCH)
 	CheckFailedGPUBackends();
-	SetGPUBackend((GPUBackend)g_Config.iGPUBackend);
 	renderCounter = 0;
+#endif
+	SetGPUBackend((GPUBackend)g_Config.iGPUBackend);
 
 	// Initialize retro achievements runtime.
 	Achievements::Initialize();
@@ -1048,7 +1100,9 @@ bool NativeInitGraphics(GraphicsContext *graphicsContext) {
 	}
 #endif
 
-	g_gameInfoCache = new GameInfoCache();
+	if (!g_gameInfoCache) {
+		g_gameInfoCache = new GameInfoCache();
+	}
 
 	if (gpu) {
 		PSP_CoreParameter().pixelWidth = g_display.pixel_xres;
@@ -1221,6 +1275,16 @@ void NativeFrame(GraphicsContext *graphicsContext) {
 
 	_dbg_assert_(graphicsContext != nullptr);
 	_dbg_assert_(g_screenManager != nullptr);
+#if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
+	static std::string textLanguage = g_Config.sLanguageIni;
+	if (textLanguage != g_Config.sLanguageIni) {
+		if (auto *drawer = CreateSwitchTextDrawer(g_screenManager->getDrawContext())) {
+			g_screenManager->getUIContext()->SetTextDrawer(drawer);
+		}
+		textLanguage = g_Config.sLanguageIni;
+	}
+#endif
+
 
 	g_GameManager.Update();
 
@@ -1415,10 +1479,12 @@ void NativeFrame(GraphicsContext *graphicsContext) {
 	// There might not be a meaningful distinction here for all backends..
 	g_frameTiming.PostSubmit();
 
+#if !PPSSPP_PLATFORM(SWITCH)
 	if (renderCounter < 10 && ++renderCounter == 10) {
 		// We're rendering fine, clear out failure info.
 		ClearFailedGPUBackends();
 	}
+#endif
 
 	g_draw->Present(g_frameTiming.PresentMode());
 
@@ -1674,7 +1740,8 @@ bool NativeKey(const KeyInput &key) {
 		}
 	}
 
-	bool passKeyThrough = false;
+	// Releases must reach the mapper even when a menu/debugger filters new presses.
+	bool passKeyThrough = (key.flags & KeyInputFlags::UP) != 0;
 	// The debugger toggle also goes through while imgui has the keyboard, so it can always be closed again.
 	if (((inputMode & InputMode::ImDebuggerToggle) || imguiHasKeyboard) && (key.flags & (KeyInputFlags::UP | KeyInputFlags::DOWN))) {
 		InputMapping mapping(key.deviceId, key.keyCode);
@@ -1700,11 +1767,6 @@ bool NativeKey(const KeyInput &key) {
 			}
 		} else if (inputMode & InputMode::Other) {
 			// yes this is different
-			passKeyThrough = true;
-		}
-	} else {
-		// Pass through only up events.
-		if (key.flags & KeyInputFlags::UP) {
 			passKeyThrough = true;
 		}
 	}
@@ -1837,6 +1899,13 @@ void NativeAxis(const AxisInput *axes, size_t count) {
 
 	if (g_screenManager->PassInputToMapper() & (InputMode::Other | InputMode::ImDebuggerToggle)) {
 		g_controlMapper.Axis(axes, count);
+	} else {
+		// A stick/trigger can be released while a settings screen owns input.
+		for (size_t i = 0; i < count; ++i) {
+			if (axes[i].value == 0.0f) {
+				g_controlMapper.Axis(&axes[i], 1);
+			}
+		}
 	}
 
 	QueuedEvent ev{};

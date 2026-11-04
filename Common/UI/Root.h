@@ -14,6 +14,8 @@ enum class FocusMove;
 
 // The ONLY global is the currently focused item.
 // Can be and often is null.
+// Configure before starting the input pump. Defaults preserve other frontends.
+void ConfigureMenuNavigation(bool horizontalStick, double initialDelay, double interval);
 void EnableFocusMovement(bool enable);
 bool IsFocusMovementEnabled();
 View *GetFocusedView();

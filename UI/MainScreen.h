@@ -40,7 +40,7 @@ struct HighlightedBackground {
 
 class MainScreen : public UIBaseScreen {
 public:
-	MainScreen();
+	explicit MainScreen(const Path &launchPath = Path());
 	~MainScreen();
 
 	bool isTopLevel() const override { return true; }
@@ -84,6 +84,7 @@ protected:
 	UI::TabHolder *tabHolder_ = nullptr;
 
 	Path restoreFocusGamePath_;
+	Path pendingLaunchPath_;
 	std::vector<GameBrowser *> gameBrowsers_;
 
 	std::vector<HighlightedBackground> highlightedBackgrounds_;
@@ -139,3 +140,6 @@ private:
 };
 
 void LaunchBuyGold(ScreenManager *screenManager);
+
+// Shared file routing for launchers: games, firmware updaters, UMD video, archives and update packages.
+void LaunchPSPFile(ScreenManager *screenManager, Screen *currentScreen, const Path &path);

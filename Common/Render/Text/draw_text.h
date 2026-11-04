@@ -91,6 +91,9 @@ public:
 
 	// Factory function that selects implementation.
 	static TextDrawer *Create(Draw::DrawContext *draw);
+	using Factory = TextDrawer *(*)(Draw::DrawContext *draw);
+	// Set during platform initialization, before UI or emulation threads create drawers.
+	static void SetFactory(Factory factory);
 
 	size_t GetStringCacheSize() const {
 		return cache_.size();

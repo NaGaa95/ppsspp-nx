@@ -383,14 +383,39 @@ void PopupMultiChoice::HandleClick(UI::EventParams &e) {
 	restoreFocus_ = HasFocus();
 
 	std::vector<std::string> choices;
+	std::vector<int> order;
 	for (int i = 0; i < numChoices_; i++) {
-		choices.push_back(std::string(TranslateChoice(i)));
+		order.push_back(i);
+	}
+	if (firstChoice_ >= 0 && firstChoice_ < numChoices_) {
+		std::rotate(order.begin(), order.begin() + firstChoice_, order.begin() + firstChoice_ + 1);
+	}
+	std::set<int> hidden;
+	std::map<int, ImageID> icons;
+	int selected = 0, defaultChoice = default_;
+	for (int i = 0; i < numChoices_; ++i) {
+		const int index = order[i];
+		choices.push_back(std::string(TranslateChoice(index)));
+		if (index == *value_ - minVal_) {
+			selected = i;
+		}
+		if (index == default_) {
+			defaultChoice = i;
+		}
+		if (hidden_.count(index)) {
+			hidden.insert(i);
+		}
+		if (icons_.count(index)) {
+			icons[i] = icons_.at(index);
+		}
 	}
 
-	ListPopupScreen *popupScreen = new ListPopupScreen(ChopTitle(text_), choices, *value_ - minVal_, [this](int num) {ChoiceCallback(num);});
-	popupScreen->SetHiddenChoices(hidden_);
-	popupScreen->SetChoiceIcons(icons_);
-	popupScreen->SetDefault(default_);
+	ListPopupScreen *popupScreen = new ListPopupScreen(ChopTitle(text_), choices, selected, [this, order](int num) {
+		ChoiceCallback(num >= 0 && num < (int)order.size() ? order[num] : -1);
+	});
+	popupScreen->SetHiddenChoices(hidden);
+	popupScreen->SetChoiceIcons(icons);
+	popupScreen->SetDefault(defaultChoice);
 	if (e.v)
 		popupScreen->SetPopupOrigin(e.v);
 	screenManager_->push(popupScreen);

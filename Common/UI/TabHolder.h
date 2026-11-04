@@ -33,6 +33,9 @@ public:
 	void EnableTab(int tab, bool enabled);
 
 	void AddBack(UIScreen *parent);
+	// Install on the enclosing root. Vertical moves stay in the current page;
+	// left returns to its tab and right restores the last focused option.
+	void EnablePaneNavigation(ViewGroup *root);
 
 	// Returns true if the tab wasn't created before (but is now).
 	bool SetCurrentTab(int tab, bool skipTween = false);

@@ -1,6 +1,10 @@
 #pragma once
 
+#include <functional>
+
 #include "UI/SimpleDialogScreen.h"
+
+UIScreen *CreateSwitchImagePickerScreen(const Path &start, std::function<void(const Path &)> selected);
 
 class SwitchLibraryScreen : public UISimpleBaseDialogScreen {
 public:

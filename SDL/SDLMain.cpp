@@ -34,6 +34,7 @@ SDLJoystick *joystick = NULL;
 #include "Common/System/Request.h"
 #include "Common/System/NativeApp.h"
 #include "Common/GPU/thin3d.h"
+#include "Common/System/OSD.h"
 #include "Common/Audio/AudioBackend.h"
 #include "Core/CmdLine.h"
 #include "Core/EmuThread.h"
@@ -93,6 +94,7 @@ SDLJoystick *joystick = NULL;
 #include <switch.h>
 #include "Common/GPU/Vulkan/SwitchLSFG.h"
 #include "Common/GPU/Deko3D/DekoContext.h"
+#include "UI/SwitchForwarderInstaller.h"
 #include "UI/SwitchLibrary.h"
 #include "UI/SwitchUpdate.h"
 #include "Common/SwitchSaltyNX.h"
@@ -176,7 +178,7 @@ GlobalUIState GetUIState();
 static constexpr double CURSOR_HIDE_DELAY = 0.5;
 static double g_lastCursorMoveTime = 0.0;
 
-static bool g_QuitRequested = false;
+static std::atomic<bool> g_QuitRequested{false};
 static bool g_RestartRequested = false;
 #if PPSSPP_PLATFORM(SWITCH)
 static std::string g_restartParams;
@@ -984,10 +986,15 @@ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string
 
 		if (R_SUCCEEDED(rc)) {
 			char buf[LIBNX_SWKBD_LIMIT] = {'\0'};
-			swkbdConfigMakePresetDefault(&kbd);
+			if (param3)
+				swkbdConfigMakePresetPassword(&kbd);
+			else
+				swkbdConfigMakePresetDefault(&kbd);
 			swkbdConfigSetType(&kbd, SwkbdType_All);
 
 			swkbdConfigSetHeaderText(&kbd, param1.c_str());
+			if (param2.empty())
+				swkbdConfigSetGuideText(&kbd, param1.c_str());
 			swkbdConfigSetInitialText(&kbd, param2.c_str());
 
 			rc = swkbdShow(&kbd, buf, sizeof(buf));
@@ -2278,6 +2285,7 @@ int main(int argc, char *argv[]) {
 		g_switchExecutablePath = "sdmc:/switch/ppsspp-nx/PPSSPP.nro";
 	}
 	SwitchUpdate_SetExecutablePath(g_switchExecutablePath);
+	SwitchForwarder_SetExecutablePath(g_switchExecutablePath);
 	std::string updateRecoveryError;
 	if (!SwitchUpdate_RecoverInstallation(&updateRecoveryError)) {
 		fprintf(stderr, "Update recovery failed: %s\n", updateRecoveryError.c_str());
@@ -2295,6 +2303,18 @@ int main(int argc, char *argv[]) {
 		g_socketInitialized = true;
 		g_nxlinkSocket = nxlinkStdio();
 	}
+#if PPSSPP_PLATFORM(SWITCH)
+	std::string forwarderLaunchError;
+	if (!cmdLineOptions.bootFilenames.empty()) {
+		std::string gamePath;
+		if (SwitchLibrary::ResolveForwarderTarget(cmdLineOptions.bootFilenames[0], &gamePath, &forwarderLaunchError)) {
+			cmdLineOptions.bootFilenames[0] = std::move(gamePath);
+		} else {
+			fprintf(stderr, "Forwarder launch failed: %s\n", forwarderLaunchError.c_str());
+			cmdLineOptions.bootFilenames.clear();
+		}
+	}
+#endif
 #else // HAVE_LIBNX
 	// Ignore sigpipe.
 	if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
@@ -2495,6 +2515,8 @@ int main(int argc, char *argv[]) {
 						 g_Config.fSwitchFrameGenerationFlowScale, g_Config.bSwitchFrameGenerationPerformance,
 						 g_Config.iGPUBackend == (int)GPUBackend::DEKO3D);
 	SwitchLibrary::Initialize();
+	if (!forwarderLaunchError.empty())
+		g_OSD.Show(OSDType::MESSAGE_ERROR, "Could not launch game", forwarderLaunchError, 8.0f);
 	File::CreateFullPath(Path("/switch/ppsspp-nx/cache/mesa"));
 	setenv("MESA_SHADER_CACHE_DIR", "/switch/ppsspp-nx/cache/mesa", 1);
 	setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 1);

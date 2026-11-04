@@ -1,0 +1,4 @@
+Lossless Scaling duck logo: THS / Lossless Scaling.
+Source: https://steamcommunity.com/app/993090
+Original image: https://shared.akamai.steamstatic.com/community_assets/images/apps/993090/42900f430ed7828d2dfa25f07ac02e3de96bc520.jpg
+The original 32 x 32 Steam artwork is stored as PNG without changing its pixels.

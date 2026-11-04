@@ -136,6 +136,19 @@ void UpdateNativeMenuKeys() {
 	std::vector<InputMapping> infoKeys;
 
 	// Mouse mapping might be problematic in UI, so let's ignore mouse for UI
+#if PPSSPP_PLATFORM(SWITCH)
+	// SDL's numbered codes describe physical Switch buttons, independently of PSP mappings.
+	const bool confirmWithCross = false;
+	confirmKeys.emplace_back(DEVICE_ID_ANY, NKCODE_BUTTON_3); // A (east)
+	cancelKeys.emplace_back(DEVICE_ID_ANY, NKCODE_BUTTON_2);  // B (south)
+	infoKeys.emplace_back(DEVICE_ID_ANY, NKCODE_BUTTON_1);	  // X (north)
+	tabLeft.emplace_back(DEVICE_ID_ANY, NKCODE_BUTTON_6);
+	tabRight.emplace_back(DEVICE_ID_ANY, NKCODE_BUTTON_5);
+	upKeys.emplace_back(DEVICE_ID_ANY, NKCODE_DPAD_UP);
+	downKeys.emplace_back(DEVICE_ID_ANY, NKCODE_DPAD_DOWN);
+	leftKeys.emplace_back(DEVICE_ID_ANY, NKCODE_DPAD_LEFT);
+	rightKeys.emplace_back(DEVICE_ID_ANY, NKCODE_DPAD_RIGHT);
+#else
 	const bool confirmWithCross = g_Config.iButtonPreference == PSP_SYSTEMPARAM_BUTTON_CROSS;
 
 	const int confirmKey = confirmWithCross ? CTRL_CROSS : CTRL_CIRCLE;
@@ -157,6 +170,7 @@ void UpdateNativeMenuKeys() {
 	downKeys.push_back(InputMapping(DEVICE_ID_ANY, NKCODE_DPAD_DOWN));
 	leftKeys.push_back(InputMapping(DEVICE_ID_ANY, NKCODE_DPAD_LEFT));
 	rightKeys.push_back(InputMapping(DEVICE_ID_ANY, NKCODE_DPAD_RIGHT));
+#endif
 #endif
 
 	// Push several hard-coded keys before submitting to native.
@@ -220,12 +234,16 @@ void UpdateNativeMenuKeys() {
 	SetTabLeftRightKeys(tabLeft, tabRight);
 	SetInfoKeys(infoKeys);
 
+#if PPSSPP_PLATFORM(SWITCH)
+	SetAnalogFlipY({});
+#else
 	std::unordered_map<InputDeviceID, int> flipYByDeviceId;
 	for (InputDeviceID deviceId : g_seenDeviceIds) {
 		auto analogs = MappedAxesForDevice(deviceId);
 		flipYByDeviceId[deviceId] = analogs.leftY.direction;
 	}
 	SetAnalogFlipY(flipYByDeviceId);
+#endif
 }
 
 static const KeyMap_IntStrPair key_names[] = {

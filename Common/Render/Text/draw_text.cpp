@@ -107,7 +107,7 @@ void TextDrawer::DrawString(DrawBuffer &target, const FontStyle &style, float sc
 
 	TextStringEntry *entry;
 
-	auto [iter, inserted] = cache_.try_emplace(LookupKey(style, str, align & FLAG_DROP_SHADOW));
+	auto [iter, inserted] = cache_.try_emplace(LookupKey(style, str, align & (FLAG_DROP_SHADOW | FLAG_NO_PREFIX)));
 	if (!inserted) {
 		entry = iter->second.get();
 		entry->lastUsedFrame = frameCount_;
@@ -358,7 +358,21 @@ size_t TextDrawer::GetCacheDataSize() const {
 	return sz;
 }
 
+static TextDrawer::Factory platformTextDrawerFactory;
+
+void TextDrawer::SetFactory(Factory factory) {
+	platformTextDrawerFactory = factory;
+}
+
 TextDrawer *TextDrawer::Create(Draw::DrawContext *draw) {
+	if (platformTextDrawerFactory) {
+		TextDrawer *drawer = platformTextDrawerFactory(draw);
+		if (drawer && !drawer->IsReady()) {
+			delete drawer;
+			return nullptr;
+		}
+		return drawer;
+	}
 	TextDrawer *drawer = nullptr;
 #if defined(__LIBRETRO__)
 	// No text drawer
