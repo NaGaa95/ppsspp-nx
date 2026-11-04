@@ -17,6 +17,7 @@
 
 #include <stdio.h>
 #include <malloc.h> // memalign
+#include <errno.h>
 #include <switch.h>
 
 #include "Common/MemArena.h"
@@ -27,9 +28,9 @@ static uintptr_t memorySrcBase = 0;
 static VirtmemReservation *memoryReservation = nullptr;
 static VirtmemReservation *memoryCodeReservation = nullptr;
 static bool memoryCodeMapped = false;
+static size_t memoryBackingSize = 0;
 
 static constexpr size_t PSP_ADDRESS_SPACE_SIZE = 0x10000000;
-static constexpr size_t PSP_BACKING_STORE_SIZE = PSP_ADDRESS_SPACE_SIZE;
 
 static void *ReserveVirtmem(size_t size, bool code, VirtmemReservation **reservation) {
 	virtmemLock();
@@ -40,7 +41,7 @@ static void *ReserveVirtmem(size_t size, bool code, VirtmemReservation **reserva
 }
 
 size_t MemArena::roundup(size_t x) {
-	return x;
+	return (x + 0xFFF) & ~(size_t)0xFFF;
 }
 
 bool MemArena::NeedsProbing() {
@@ -48,17 +49,28 @@ bool MemArena::NeedsProbing() {
 }
 
 bool MemArena::GrabMemSpace(size_t size) {
-	return true;
+	if (memorySrcBase || memoryCodeMapped || size == 0 || size > PSP_ADDRESS_SPACE_SIZE) {
+		return false;
+	}
+	memoryBackingSize = roundup(size);
+	errno = 0;
+	memorySrcBase = (uintptr_t)memalign(0x1000, memoryBackingSize);
+	return memorySrcBase != 0;
 }
 
 void MemArena::ReleaseSpace() {
-	if (memoryCodeMapped && R_FAILED(svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), (u64)memoryCodeBase, (u64)memorySrcBase, PSP_BACKING_STORE_SIZE))) {
-		printf("Failed to release view space...\n");
+	if (memoryCodeMapped) {
+		Result rc = svcUnmapProcessCodeMemory(envGetOwnProcessHandle(), (u64)memoryCodeBase, (u64)memorySrcBase, memoryBackingSize);
+		if (R_FAILED(rc)) {
+			// The heap pages remain mapped by the kernel. Reusing them would corrupt guest memory.
+			return;
+		}
 	}
 	memoryCodeMapped = false;
 
 	free((void *)memorySrcBase);
 	memorySrcBase = 0;
+	memoryBackingSize = 0;
 	virtmemLock();
 	if (memoryReservation) {
 		virtmemRemoveReservation(memoryReservation);
@@ -74,7 +86,7 @@ void MemArena::ReleaseSpace() {
 }
 
 void *MemArena::CreateView(s64 offset, size_t size, void *base) {
-	if (offset < 0 || (size_t)offset > PSP_BACKING_STORE_SIZE || size > PSP_BACKING_STORE_SIZE - (size_t)offset) {
+	if (!memoryCodeMapped || offset < 0 || (size_t)offset > memoryBackingSize || size > memoryBackingSize - (size_t)offset) {
 		return nullptr;
 	}
 	Result rc = svcMapProcessMemory(base, envGetOwnProcessHandle(), (u64)(memoryCodeBase + offset), size);
@@ -88,20 +100,26 @@ void *MemArena::CreateView(s64 offset, size_t size, void *base) {
 }
 
 void MemArena::ReleaseView(s64 offset, void *view, size_t size) {
-	if (R_FAILED(svcUnmapProcessMemory(view, envGetOwnProcessHandle(), (u64)(memoryCodeBase + offset), size))) {
+	Result rc = svcUnmapProcessMemory(view, envGetOwnProcessHandle(), (u64)(memoryCodeBase + offset), size);
+	if (R_FAILED(rc)) {
 		printf("Failed to unmap view...\n");
 	}
 }
 
 u8 *MemArena::Find4GBBase() {
-	memorySrcBase = (uintptr_t)memalign(0x1000, PSP_BACKING_STORE_SIZE);
+	if (memoryCodeMapped) {
+		return (u8 *)memoryBase;
+	}
+	if (!memorySrcBase || !memoryBackingSize) {
+		return nullptr;
+	}
 
 	if (!memoryBase) {
 		memoryBase = (uintptr_t)ReserveVirtmem(PSP_ADDRESS_SPACE_SIZE, false, &memoryReservation);
 	}
 
 	if (!memoryCodeBase) {
-		memoryCodeBase = (uintptr_t)ReserveVirtmem(PSP_BACKING_STORE_SIZE, true, &memoryCodeReservation);
+		memoryCodeBase = (uintptr_t)ReserveVirtmem(memoryBackingSize, true, &memoryCodeReservation);
 	}
 
 	if (!memorySrcBase || !memoryBase || !memoryCodeBase) {
@@ -109,14 +127,14 @@ u8 *MemArena::Find4GBBase() {
 		return nullptr;
 	}
 
-	if (R_FAILED(svcMapProcessCodeMemory(envGetOwnProcessHandle(), (u64)memoryCodeBase, (u64)memorySrcBase, PSP_BACKING_STORE_SIZE))) {
-		printf("Failed to map memory...\n");
+	Result rc = svcMapProcessCodeMemory(envGetOwnProcessHandle(), (u64)memoryCodeBase, (u64)memorySrcBase, memoryBackingSize);
+	if (R_FAILED(rc)) {
 		ReleaseSpace();
 		return nullptr;
 	}
 	memoryCodeMapped = true;
-	if (R_FAILED(svcSetProcessMemoryPermission(envGetOwnProcessHandle(), memoryCodeBase, PSP_BACKING_STORE_SIZE, Perm_Rx))) {
-		printf("Failed to set perms...\n");
+	rc = svcSetProcessMemoryPermission(envGetOwnProcessHandle(), memoryCodeBase, memoryBackingSize, Perm_Rx);
+	if (R_FAILED(rc)) {
 		ReleaseSpace();
 		return nullptr;
 	}

@@ -399,7 +399,15 @@ bool MemoryMap_Setup(MemMapSetupFlags flags) {
 	}
 
 	// Should return true...
-	return Memory_TryBase(flags);
+	const bool success = Memory_TryBase(flags);
+#if PPSSPP_PLATFORM(SWITCH)
+	if (!success) {
+		// Memory_TryBase has released its views; also release their backing allocation.
+		g_arena.ReleaseSpace();
+		base = nullptr;
+	}
+#endif
+	return success;
 }
 
 void MemoryMap_Shutdown() {
@@ -418,7 +426,7 @@ void MemoryMap_Shutdown() {
 			position = last_position;
 		}
 
-		if (*views[i].out_ptr)
+		if (*views[i].out_ptr && !CanIgnoreView(views[i]))
 			g_arena.ReleaseView(position, *views[i].out_ptr, views[i].size);
 		*views[i].out_ptr = nullptr;
 
