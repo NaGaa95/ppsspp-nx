@@ -134,6 +134,7 @@ int nwindowGetDimensions(NWindow *window, uint32_t *w, uint32_t *h) {
 #undef ERROR_LOG
 #define ERROR_LOG(...) assert(false)
 struct Context {
+	struct { void Invalidate() {} } resourceBindings_;
 	std::shared_ptr<Device> device_ = std::make_shared<Device>();
 	std::array<Frame, 3> frames_;
 	Framebuffer *target_ = nullptr;

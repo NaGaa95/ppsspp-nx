@@ -231,6 +231,36 @@ struct Upload {
 	DkBufExtents gpu{};
 	uint8_t *cpu = nullptr;
 };
+
+// Tracks graphics bindings emitted into the current command stream.
+struct ResourceBindings {
+	std::array<DkResHandle, MAX_TEXTURE_SLOTS> textures{};
+	std::array<DkBufExtents, 8> uniforms{};
+	bool texturesValid = false;
+
+	void Invalidate() {
+		texturesValid = false;
+		uniforms.fill({});
+	}
+
+	void Apply(dk::CmdBuf cmd, const std::array<DkResHandle, MAX_TEXTURE_SLOTS> &handles, const std::array<Upload, 8> &uploads) {
+		if (!texturesValid || textures != handles) {
+			cmd.bindTextures(DkStage_Fragment, 0, handles);
+			textures = handles;
+			texturesValid = true;
+		}
+		for (unsigned i = 0; i < uploads.size(); ++i) {
+			const auto &buffer = uploads[i].gpu;
+			auto &bound = uniforms[i];
+			if (buffer.addr && (buffer.addr != bound.addr || buffer.size != bound.size)) {
+				cmd.bindUniformBuffer(DkStage_Vertex, i, buffer.addr, buffer.size);
+				cmd.bindUniformBuffer(DkStage_Fragment, i, buffer.addr, buffer.size);
+				bound = buffer;
+			}
+		}
+	}
+};
+
 struct Frame {
 	dk::UniqueCmdBuf commands;
 	DkFence fence{};
@@ -336,7 +366,10 @@ public:
 		}
 	}
 	void UpdateDynamicUniformBuffer(const void *data, size_t size) override { BindUniform(0, data, size); }
-	void Invalidate(InvalidationFlags flags) override { stateDirty_ = true; }
+	void Invalidate(InvalidationFlags flags) override {
+		stateDirty_ = true;
+		resourceBindings_.Invalidate();
+	}
 	void BindPipeline(Pipeline *pipeline) override {
 		if (pipeline_ != pipeline) {
 			overrideRaster_ = false;
@@ -427,6 +460,7 @@ private:
 	std::array<Sampler *, MAX_TEXTURE_SLOTS> samplers_{};
 	std::array<AutoRef<Sampler>, MAX_TEXTURE_SLOTS> samplerRefs_{};
 	std::array<Upload, 8> uniforms_{};
+	ResourceBindings resourceBindings_;
 	InvalidationCallback invalidated_;
 	CullMode cullOverride_ = CullMode::NONE;
 	bool overrideRaster_ = false;
@@ -578,6 +612,7 @@ void Context::BeginFrame(DebugFlags flags) {
 	}
 	frame.retired.clear();
 	frame.commands.clear();
+	resourceBindings_.Invalidate();
 	frame.commandChunk = frame.uploadChunk = frame.uploadOffset = 0;
 	frame.imageCount = frame.samplerCount = 0;
 	frame.imageCache.clear();
@@ -654,6 +689,7 @@ void Context::Submit(bool wait) {
 		frame.submitted = false;
 		frame.retired.clear();
 		frame.commands.clear();
+		resourceBindings_.Invalidate();
 		frame.commandChunk = 0;
 		frame.commands.addMemory(frame.commandMemory[0], 0, dkMemBlockGetSize(frame.commandMemory[0]));
 		frame.commands.bindImageDescriptorSet(frame.descriptors.getGpuAddr(), IMAGE_DESCRIPTORS);
@@ -691,6 +727,7 @@ void Context::Wait() {
 }
 
 void Context::ResetRenderBindings() {
+	resourceBindings_.Invalidate();
 	target_ = nullptr;
 	targetBound_ = false;
 	targetRef_.reset(nullptr);
@@ -884,6 +921,7 @@ void Context::Present(PresentMode mode) {
 		}
 		bool generated = false;
 		if (decision.generate && frameGenerator_) {
+			resourceBindings_.Invalidate();
 			generated =
 				frameGenerator_->Generate(Commands(), generatedDisplay_->image, generatedDisplay_->Width(), generatedDisplay_->Height());
 			frameGenerationFailed_ = frameGenerator_->Failed();
@@ -1501,13 +1539,7 @@ bool Context::Apply() {
 	if (changed) {
 		cmd.barrier(DkBarrier_None, DkInvalidateFlags_Descriptors);
 	}
-	cmd.bindTextures(DkStage_Fragment, 0, handles);
-	for (unsigned i = 0; i < uniforms_.size(); ++i) {
-		if (uniforms_[i].gpu.addr) {
-			cmd.bindUniformBuffer(DkStage_Vertex, i, uniforms_[i].gpu.addr, uniforms_[i].gpu.size);
-			cmd.bindUniformBuffer(DkStage_Fragment, i, uniforms_[i].gpu.addr, uniforms_[i].gpu.size);
-		}
-	}
+	resourceBindings_.Apply(cmd, handles, uniforms_);
 	return true;
 }
 
@@ -1571,6 +1603,7 @@ bool Context::DispatchScale(ShaderModule *module, Deko3DUpload input, Texture *s
 	memcpy(uniforms.cpu, params, paramSize);
 	auto cmd = Commands();
 	cmd.barrier(DkBarrier_Primitives, DkInvalidateFlags_Image | DkInvalidateFlags_Shader);
+	resourceBindings_.Invalidate();
 	cmd.bindShaders(DkStageFlag_Compute, &shader->shader);
 	cmd.bindUniformBuffer(DkStage_Compute, 5, uniforms.gpu.addr, 256);
 	if (input.buffer) {

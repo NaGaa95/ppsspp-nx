@@ -190,6 +190,7 @@ constexpr int COMMAND_BUFFER_STATE = 1, RENDER_PASS_STATE = 2;
 }
 constexpr unsigned SCRATCH_PER_WARP = 32 * 1024, FRAME_COUNT = 3;
 struct Context {
+	struct { void Invalidate() {} } resourceBindings_;
 	std::shared_ptr<Device> device_ = device;
 	std::array<Ref<Image>, 3> backbuffers_;
 	Ref<Image> generatedDisplay_;
