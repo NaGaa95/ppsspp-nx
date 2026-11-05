@@ -19,6 +19,9 @@
 
 #include "Core/Dialog/PSPDialog.h"
 #include "Core/Dialog/SavedataParam.h"
+#if PPSSPP_PLATFORM(SWITCH)
+#include "Core/Dialog/GamedataInstallWorker.h"
+#endif
 
 struct SceUtilityGamedataInstallParam {
 	pspUtilityDialogCommon common;
@@ -36,6 +39,8 @@ struct SceUtilityGamedataInstallParam {
 class PSPGamedataInstallDialog: public PSPDialog {
 public:
 	PSPGamedataInstallDialog(UtilityDialogType type) : PSPDialog(type) {}
+	~PSPGamedataInstallDialog() override;
+	void WaitForIO();
 
 	int Init(u32 paramAddr);
 	int Update(int animSpeed) override;
@@ -52,11 +57,17 @@ protected:
 	}
 
 private:
-	void UpdateProgress();
+	void UpdateProgress(bool draw = true);
 	void RenderProgress(int percentage);
 	void OpenNextFile();
 	void CopyCurrentFileData();
-	void CloseCurrentFile();
+	void CloseCurrentFile(bool advance = true);
+#if PPSSPP_PLATFORM(SWITCH)
+	void FinishCopy(const GamedataInstallWorker::Result &result);
+	void StopCopy();
+	GamedataInstallWorker copyWorker_;
+	bool copyPending_ = false;
+#endif
 	void WriteSfoFile();
 
 	SceUtilityGamedataInstallParam request{};

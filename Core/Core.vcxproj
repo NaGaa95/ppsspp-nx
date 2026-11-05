@@ -915,6 +915,7 @@
     <ClInclude Include="Debugger\DebugInterface.h" />
     <ClInclude Include="Debugger\DisassemblyManager.h" />
     <ClInclude Include="Debugger\SymbolMap.h" />
+    <ClInclude Include="Dialog\GamedataInstallWorker.h" />
     <ClInclude Include="Dialog\PSPGamedataInstallDialog.h" />
     <ClInclude Include="Dialog\PSPDialog.h" />
     <ClInclude Include="Dialog\PSPMsgDialog.h" />

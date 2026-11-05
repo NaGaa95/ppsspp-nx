@@ -35,10 +35,12 @@ std::string saveBasePath = "ms0:/PSP/SAVEDATA/";
 // Guesses.
 const static int GAMEDATA_INIT_DELAY_US = 200000;
 const static int GAMEDATA_SHUTDOWN_DELAY_US = 2000;
+#if !PPSSPP_PLATFORM(SWITCH)
 const static u32 GAMEDATA_BYTES_PER_READ = 32768;
 // TODO: Could adjust based on real-time into frame?  Or eat cycles?
 // If this is too high, some games (e.g. Senjou no Valkyria 3) will lag.
 const static u32 GAMEDATA_READS_PER_UPDATE = 20;
+#endif
 
 const u32 PSP_UTILITY_GAMEDATA_MODE_SHOW_PROGRESS = 1;
 
@@ -56,6 +58,54 @@ static std::vector<std::string> GetPSPFileList(std::string_view dirpath) {
 	return FileList;
 }
 
+PSPGamedataInstallDialog::~PSPGamedataInstallDialog() {
+#if PPSSPP_PLATFORM(SWITCH)
+	StopCopy();
+#endif
+}
+
+void PSPGamedataInstallDialog::WaitForIO() {
+#if PPSSPP_PLATFORM(SWITCH)
+	GamedataInstallWorker::Result result;
+	if (copyWorker_.TakeResult(result, true)) {
+		FinishCopy(result);
+		if (param.IsValid()) {
+			UpdateProgress(false);
+		}
+	}
+#endif
+}
+
+#if PPSSPP_PLATFORM(SWITCH)
+void PSPGamedataInstallDialog::StopCopy() {
+	copyWorker_.Stop();
+	WaitForIO();
+	if (currentInputFile || currentOutputFile) {
+		CloseCurrentFile(false);
+	}
+}
+
+void PSPGamedataInstallDialog::FinishCopy(const GamedataInstallWorker::Result &result) {
+	copyPending_ = false;
+	currentInputBytesLeft -= (u32)result.copied;
+	allReadSize += result.copied;
+	if (result.error != GamedataInstallWorker::Error::None) {
+		ERROR_LOG(Log::sceUtility, "Game install %s failed after %zu bytes: %lld",
+			result.error == GamedataInstallWorker::Error::Read ? "read" : "write", result.copied, (long long)result.ioResult);
+		if (param.IsValid()) {
+			// Preserve a PSP error supplied by the filesystem, otherwise use a generic I/O failure.
+			const u32 code = (u32)result.ioResult;
+			param->common.result = code >= 0x80000000 && code != UINT32_MAX ? code : SCE_KERNEL_ERROR_ERRNO_IO_ERROR;
+			param.NotifyWrite("DialogResult");
+		}
+		CloseCurrentFile(false);
+		ChangeStatus(SCE_UTILITY_STATUS_FINISHED, 0);
+	} else if (!currentInputBytesLeft) {
+		CloseCurrentFile();
+	}
+}
+#endif
+
 int PSPGamedataInstallDialog::Init(u32 paramAddr) {
 	if (GetStatus() != SCE_UTILITY_STATUS_NONE) {
 		ERROR_LOG(Log::sceUtility, "A game install request is already running, not starting a new one");
@@ -68,6 +118,9 @@ int PSPGamedataInstallDialog::Init(u32 paramAddr) {
 		return check;
 	}
 
+#if PPSSPP_PLATFORM(SWITCH)
+	StopCopy();
+#endif
 	param.ptr = paramAddr;
 	inFileNames = GetPSPFileList("disc0:/PSP_GAME/INSDIR");
 	numFiles = (int)inFileNames.size();
@@ -103,11 +156,17 @@ int PSPGamedataInstallDialog::Update(int animSpeed) {
 		return SCE_ERROR_UTILITY_INVALID_STATUS;
 	// Only after loading a state from before it was saved.
 	if (!param.IsValid()) {
+#if PPSSPP_PLATFORM(SWITCH)
+		StopCopy();
+#endif
 		ChangeStatus(SCE_UTILITY_STATUS_FINISHED, 0);
 		return 0;
 	}
 
 	if (param->mode >= 2) {
+#if PPSSPP_PLATFORM(SWITCH)
+		StopCopy();
+#endif
 		param->common.result = SCE_ERROR_UTILITY_GAMEDATA_INVALID_MODE;
 		param.NotifyWrite("DialogResult");
 		ChangeStatus(SCE_UTILITY_STATUS_FINISHED, 0);
@@ -120,8 +179,10 @@ int PSPGamedataInstallDialog::Update(int animSpeed) {
 	// TODO: param->mode == 1 should show a prompt to confirm, then a progress bar.
 	// Any other mode (i.e. 0 or negative) should proceed and show no UI.
 
+#if !PPSSPP_PLATFORM(SWITCH)
 	// TODO: This should return error codes in some cases, like write failure.
 	// request.common.result must be updated for errors as well.
+#endif
 	
 	if (readFiles < numFiles) {
 		if (currentInputFile != 0 && currentOutputFile != 0) {
@@ -133,6 +194,9 @@ int PSPGamedataInstallDialog::Update(int animSpeed) {
 
 		UpdateProgress();
 	} else {
+#if PPSSPP_PLATFORM(SWITCH)
+		copyWorker_.Stop();
+#endif
 		WriteSfoFile();
 
 		// TODO: What is this?  Should one of these update per file or anything?
@@ -151,20 +215,26 @@ void PSPGamedataInstallDialog::OpenNextFile() {
 
 	currentInputFile = pspFileSystem.OpenFile(inputFileName, FILEACCESS_READ);
 	if (currentInputFile < 0) {
-		// TODO: Generate an error code?
 		ERROR_LOG(Log::sceUtility, "Unable to read from install file: %s", inFileNames[readFiles].c_str());
+#if PPSSPP_PLATFORM(SWITCH)
+		FinishCopy({0, GamedataInstallWorker::Error::Read, currentInputFile});
+#else
 		++readFiles;
 		currentInputFile = 0;
+#endif
 		return;
 	}
 	currentOutputFile = pspFileSystem.OpenFile(outputFileName, (FileAccess)(FILEACCESS_WRITE | FILEACCESS_CREATE | FILEACCESS_TRUNCATE));
 	if (currentOutputFile < 0) {
-		// TODO: Generate an error code?
 		ERROR_LOG(Log::sceUtility, "Unable to write to install file: %s", inFileNames[readFiles].c_str());
+#if PPSSPP_PLATFORM(SWITCH)
+		FinishCopy({0, GamedataInstallWorker::Error::Write, currentOutputFile});
+#else
 		pspFileSystem.CloseFile(currentInputFile);
 		currentInputFile = 0;
 		currentOutputFile = 0;
 		++readFiles;
+#endif
 		return;
 	}
 
@@ -172,6 +242,29 @@ void PSPGamedataInstallDialog::OpenNextFile() {
 }
 
 void PSPGamedataInstallDialog::CopyCurrentFileData() {
+#if PPSSPP_PLATFORM(SWITCH)
+	GamedataInstallWorker::Result result;
+	if (copyWorker_.TakeResult(result)) {
+		FinishCopy(result);
+		if (!currentInputFile || !currentOutputFile) {
+			return;
+		}
+	}
+	if (copyPending_) {
+		return;
+	}
+	if (!currentInputBytesLeft) {
+		CloseCurrentFile();
+		return;
+	}
+	const int input = currentInputFile, output = currentOutputFile;
+	// Reapply after savestate loading too, before a worker can use the restored handles.
+	pspFileSystem.SetFileReplayEnabled(input, false);
+	pspFileSystem.SetFileReplayEnabled(output, false);
+	copyPending_ = copyWorker_.Submit(std::min<size_t>(GamedataInstallWorker::BATCH_SIZE, currentInputBytesLeft),
+		[input](u8 *data, size_t bytes) { return (s64)pspFileSystem.ReadFile(input, data, bytes); },
+		[output](const u8 *data, size_t bytes) { return (s64)pspFileSystem.WriteFile(output, data, bytes); });
+#else
 	u8 buffer[GAMEDATA_BYTES_PER_READ];
 	for (u32 i = 0; i < GAMEDATA_READS_PER_UPDATE; ++i) {
 		if (currentInputBytesLeft <= 0) {
@@ -195,18 +288,21 @@ void PSPGamedataInstallDialog::CopyCurrentFileData() {
 	if (currentInputBytesLeft <= 0) {
 		CloseCurrentFile();
 	}
+#endif
 }
 
-void PSPGamedataInstallDialog::CloseCurrentFile() {
-	if (currentOutputFile >= 0)
+void PSPGamedataInstallDialog::CloseCurrentFile(bool advance) {
+	if (currentOutputFile > 0)
 		pspFileSystem.CloseFile(currentOutputFile);
 	currentOutputFile = 0;
 
-	if (currentInputFile >= 0)
+	if (currentInputFile > 0)
 		pspFileSystem.CloseFile(currentInputFile);
 	currentInputFile = 0;
 
-	++readFiles;
+	if (advance) {
+		++readFiles;
+	}
 }
 
 void PSPGamedataInstallDialog::WriteSfoFile() {
@@ -245,6 +341,9 @@ int PSPGamedataInstallDialog::Abort() {
 	const DialogStatus status = ReadStatus();
 	if (status == SCE_UTILITY_STATUS_NONE || status == SCE_UTILITY_STATUS_SHUTDOWN)
 		return SCE_ERROR_UTILITY_INVALID_STATUS;
+#if PPSSPP_PLATFORM(SWITCH)
+	StopCopy();
+#endif
 	if (param.IsValid()) {
 		param->common.result = 1;
 		param.NotifyWrite("DialogResult");
@@ -258,6 +357,9 @@ int PSPGamedataInstallDialog::Shutdown(bool force) {
 	if (GetStatus() != SCE_UTILITY_STATUS_FINISHED && !force)
 		return SCE_ERROR_UTILITY_INVALID_STATUS;
 
+#if PPSSPP_PLATFORM(SWITCH)
+	StopCopy();
+#endif
 	return PSPDialog::Shutdown(force);
 }
 
@@ -271,7 +373,7 @@ std::string PSPGamedataInstallDialog::GetGameDataInstallFileName(const SceUtilit
 	return GameDataInstallPath + filename;
 }
 
-void PSPGamedataInstallDialog::UpdateProgress() {
+void PSPGamedataInstallDialog::UpdateProgress(bool draw) {
 	// Update progress bar(if there is).
 	// We only should update progress[0] here as the max progress value is 100.
 	if (allFilesSize != 0)
@@ -279,7 +381,7 @@ void PSPGamedataInstallDialog::UpdateProgress() {
 	else 
 		progressValue = 100;
 
-	if (param->mode == PSP_UTILITY_GAMEDATA_MODE_SHOW_PROGRESS) {
+	if (draw && param->mode == PSP_UTILITY_GAMEDATA_MODE_SHOW_PROGRESS) {
 		RenderProgress(progressValue);
 	}
 
@@ -311,6 +413,7 @@ void PSPGamedataInstallDialog::RenderProgress(int percentage) {
 }
 
 void PSPGamedataInstallDialog::DoState(PointerWrap &p) {
+	WaitForIO();
 	auto s = p.Section("PSPGamedataInstallDialog", 0, 4);
 	if (!s)
 		return;

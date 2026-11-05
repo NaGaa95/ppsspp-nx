@@ -650,6 +650,9 @@ void __UtilityWaitForIO() {
 	if (saveDialog) {
 		saveDialog->WaitForIO();
 	}
+	if (gamedataInstallDialog) {
+		gamedataInstallDialog->WaitForIO();
+	}
 }
 
 void __UtilityShutdown() {
@@ -680,6 +683,7 @@ void __UtilityShutdown() {
 	delete netDialog;
 	delete screenshotDialog;
 	delete gamedataInstallDialog;
+	gamedataInstallDialog = nullptr;
 	delete npSigninDialog;
 	delete gameSharingDialog;
 	delete htmlViewerDialog;

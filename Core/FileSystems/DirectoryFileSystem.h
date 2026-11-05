@@ -65,6 +65,7 @@ public:
 	~DirectoryFileSystem();
 
 	void CloseAll();
+	void SetFileReplayEnabled(u32 handle, bool enabled) override;
 
 	void DoState(PointerWrap &p) override;
 	std::vector<PSPFileInfo> GetDirListing(std::string_view path, bool *exists = nullptr) override;

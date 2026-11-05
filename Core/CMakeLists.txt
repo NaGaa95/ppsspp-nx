@@ -320,6 +320,7 @@ add_library(Core STATIC
 	Debugger/Watch.h
 	Dialog/PSPDialog.cpp
 	Dialog/PSPDialog.h
+	Dialog/GamedataInstallWorker.h
 	Dialog/PSPGamedataInstallDialog.cpp
 	Dialog/PSPGamedataInstallDialog.h
 	Dialog/PSPMsgDialog.cpp

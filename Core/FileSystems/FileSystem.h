@@ -145,6 +145,8 @@ public:
 	virtual std::vector<PSPFileInfo> GetDirListing(std::string_view path, bool *exists = nullptr) = 0;
 	virtual int      OpenFile(std::string filename, FileAccess access, const char *devicename = nullptr) = 0;
 	virtual void     CloseFile(u32 handle) = 0;
+	// Host utility workers use private handles without emulated-time/replay bookkeeping.
+	virtual void     SetFileReplayEnabled(u32 handle, bool enabled) {}
 	virtual size_t   ReadFile(u32 handle, u8 *pointer, s64 size) = 0;
 	virtual size_t   ReadFile(u32 handle, u8 *pointer, s64 size, int &usec) = 0;
 	virtual size_t   WriteFile(u32 handle, const u8 *pointer, s64 size) = 0;

@@ -1893,6 +1893,9 @@
     <ClInclude Include="HLE\sceNetAdhocMatching.h">
       <Filter>HLE\Libraries</Filter>
     </ClInclude>
+    <ClInclude Include="Dialog\GamedataInstallWorker.h">
+      <Filter>Dialog</Filter>
+    </ClInclude>
     <ClInclude Include="Dialog\PSPGamedataInstallDialog.h">
       <Filter>Dialog</Filter>
     </ClInclude>

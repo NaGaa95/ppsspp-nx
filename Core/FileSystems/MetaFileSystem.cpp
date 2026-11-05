@@ -566,6 +566,13 @@ void MetaFileSystem::CloseFile(u32 handle)
 		sys->CloseFile(handle);
 }
 
+void MetaFileSystem::SetFileReplayEnabled(u32 handle, bool enabled) {
+	std::lock_guard<std::recursive_mutex> guard(lock);
+	if (IFileSystem *sys = GetHandleOwner(handle)) {
+		sys->SetFileReplayEnabled(handle, enabled);
+	}
+}
+
 size_t MetaFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size)
 {
 	std::lock_guard<std::recursive_mutex> guard(lock);

@@ -517,8 +517,7 @@ void DirectoryFileHandle::Close() {
 		if (SetEndOfFile(hFile) == 0) {
 			ERROR_LOG(Log::FileSystem, "Failed to truncate file to %d bytes", (int)needsTrunc_);
 		}
-#elif !PPSSPP_PLATFORM(SWITCH)
-		// Note: it's not great that Switch cannot truncate appropriately...
+#else
 		if (ftruncate(hFile, (off_t)needsTrunc_) != 0) {
 			ERROR_LOG(Log::FileSystem, "Failed to truncate file to %d bytes", (int)needsTrunc_);
 		}
@@ -772,6 +771,13 @@ int DirectoryFileSystem::Ioctl(u32 handle, u32 cmd, u32 indataPtr, u32 inlen, u3
 
 PSPDevType DirectoryFileSystem::DevType(u32 handle) {
 	return PSPDevType::FILE;
+}
+
+void DirectoryFileSystem::SetFileReplayEnabled(u32 handle, bool enabled) {
+	auto entry = entries.find(handle);
+	if (entry != entries.end()) {
+		entry->second.hFile.replay_ = enabled;
+	}
 }
 
 size_t DirectoryFileSystem::ReadFile(u32 handle, u8 *pointer, s64 size) {
