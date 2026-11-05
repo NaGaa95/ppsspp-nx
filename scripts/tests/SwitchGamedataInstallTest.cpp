@@ -85,7 +85,7 @@ struct FakeFileSystem {
 		if (readGate) { readGate(); }
 		if (readError) { return (size_t)(s64)readError; }
 		bytes = std::min({bytes, input.size() - readPosition, readLimit});
-		memcpy(data, input.data() + readPosition, bytes);
+		if (bytes) { memcpy(data, input.data() + readPosition, bytes); }
 		readPosition += bytes;
 		return bytes;
 	}
@@ -97,7 +97,7 @@ struct FakeFileSystem {
 		++writeCount;
 		maxWrite = std::max(maxWrite, bytes);
 		if (output.size() < writePosition + bytes) { output.resize(writePosition + bytes); }
-		memcpy(output.data() + writePosition, data, bytes);
+		if (bytes) { memcpy(output.data() + writePosition, data, bytes); }
 		writePosition += bytes;
 		return bytes;
 	}
