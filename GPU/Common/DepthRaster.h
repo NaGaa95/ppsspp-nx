@@ -91,6 +91,8 @@ public:
 	void Reserve(int vertices, int indices);
 	// Starts rasterizing the current batch (if it has draws) and makes an empty one current.
 	void Submit();
+	// Starts a bounded batch early so rasterization overlaps with producing later draws.
+	void SubmitIfReady();
 	// Submits the current batch and waits until all are rasterized.
 	void Wait();
 	// Waits until the batches already submitted are rasterized.

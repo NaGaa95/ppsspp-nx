@@ -1356,6 +1356,9 @@ void DrawEngineCommon::CommitDepthDraw(const DepthDraw &draw, int vertexCount, i
 	batch.indexCount += vertexCount;
 	batch.vertexCount += numDecoded;
 	batch.draws.push_back(draw);
+#if PPSSPP_PLATFORM(SWITCH)
+	depthWorker_->SubmitIfReady();
+#endif
 }
 
 void DrawEngineCommon::SubmitQueuedDepth() {

@@ -736,6 +736,12 @@ void DepthRasterWorker::Reserve(int vertices, int indices) {
 	}
 }
 
+void DepthRasterWorker::SubmitIfReady() {
+	if (current_->draws.size() >= 8 || current_->vertexCount >= 1024) {
+		Submit();
+	}
+}
+
 void DepthRasterWorker::Submit() {
 	if (current_->draws.empty()) {
 		return;
