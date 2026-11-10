@@ -1171,6 +1171,14 @@ static int DefaultAndroidAudioApi() {
 }
 
 static constexpr const char *androidAudioApiNames[] = { "AAudio", "OpenSL ES" };
+#if PPSSPP_PLATFORM(SWITCH)
+static constexpr AudioSyncMode defaultAudioSyncMode = AudioSyncMode::GRANULAR;
+static constexpr bool defaultFillAudioGaps = false;
+#else
+static constexpr AudioSyncMode defaultAudioSyncMode = AudioSyncMode::CLASSIC_PITCH;
+static constexpr bool defaultFillAudioGaps = true;
+#endif
+
 static constexpr const char *audioPlaybackModes[] = { "Smooth (reduces artifacts)", "Classic (lowest latency)" };
 
 static constexpr ConfigSetting soundSettings[] = {
@@ -1184,9 +1192,9 @@ static constexpr ConfigSetting soundSettings[] = {
 		.Label(I18NCat::AUDIO, "Low-latency audio (MMAP)"),
 	ConfigSetting("AudioBufferSize", SETTING(g_Config, iSDLAudioBufferSize), 256, CfgFlag::DEFAULT),
 
-	ConfigSetting("FillAudioGaps", SETTING(g_Config, bFillAudioGaps), true, CfgFlag::DEFAULT)
+	ConfigSetting("FillAudioGaps", SETTING(g_Config, bFillAudioGaps), defaultFillAudioGaps, CfgFlag::DEFAULT)
 		.Label(I18NCat::AUDIO, "Fill audio gaps"),
-	ConfigSetting("AudioSyncMode", SETTING(g_Config, iAudioPlaybackMode), (int)AudioSyncMode::CLASSIC_PITCH, CfgFlag::DEFAULT)
+	ConfigSetting("AudioSyncMode", SETTING(g_Config, iAudioPlaybackMode), (int)defaultAudioSyncMode, CfgFlag::DEFAULT)
 		.Label(I18NCat::AUDIO, "Playback mode").Choices(audioPlaybackModes),
 
 	// Legacy volume settings, these get auto upgraded through default handlers on the new settings. NOTE: Must be before the new ones in the order here.
