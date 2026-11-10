@@ -12,26 +12,21 @@
 #include "Common/TimeUtil.h"
 #include "Core/MemMap.h"
 
-DepthScissor DepthScissor::Tile(int tile, int numTiles) const {
+DepthScissor DepthScissor::Tile(int tile, int numTiles, int bufferWidth) const {
 	if (numTiles <= 1) {
 		return *this;
 	}
 	_dbg_assert_(tile >= 0 && tile < numTiles);
 
-	const int first = x1;
-	const int lastExclusive = x2 + 1;
-	const int width = lastExclusive - first;
-	const int rawStart = first + width * tile / numTiles;
-	const int rawEnd = first + width * (tile + 1) / numTiles;
-	const int start = tile == 0 ? first : (rawStart + 3) & ~3;
-	const int endExclusive = tile == numTiles - 1 ? lastExclusive : (rawEnd + 3) & ~3;
+	// The buffer is split at fixed columns (whole groups of four), so a pixel belongs to the same tile in
+	// every draw to it, whatever the scissor.
+	const int start = tile == 0 ? 0 : (bufferWidth * tile / numTiles + 3) & ~3;
+	const int endExclusive = tile == numTiles - 1 ? 0x10000 : (bufferWidth * (tile + 1) / numTiles + 3) & ~3;
 
-	DepthScissor scissor;
-	scissor.x1 = (u16)start;
-	scissor.x2 = (u16)(endExclusive - 1);
-	scissor.y1 = y1;
-	scissor.y2 = y2;
-	return scissor;
+	DepthScissor scissor = *this;
+	scissor.x1 = (u16)std::max((int)x1, start);
+	scissor.x2 = (u16)std::min((int)x2, endExclusive - 1);
+	return scissor;  // x1 > x2 if the scissor misses these columns.
 }
 
 // x1/x2 etc are the scissor rect.
@@ -104,8 +99,9 @@ enum class TriangleStat {
 constexpr int MIN_TWICE_TRI_AREA = 10;
 
 // A mix of ideas from Intel's sample and ryg's rasterizer blog series.
+// Only the groups of four pixels from tileX1 to tileX2 (multiples of four) are written.
 template<ZCompareMode compareMode, bool lowQ>
-void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthScissor scissor, const int *tx, const int *ty, const float *tz, bool skipEmptyBlocks) {
+void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthScissor scissor, int tileX1, int tileX2, const int *tx, const int *ty, const float *tz, bool skipEmptyBlocks) {
 	// Triangle setup. This is done using SIMD, four triangles at a time.
 	// 16x16->32 multiplications are doable on SSE2, which should be all we need.
 
@@ -184,15 +180,22 @@ void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthSc
 			stats[(int)TriangleStat::SmallOrBackface]++;  // Or zero area.
 			continue;
 		}
+		stats[(int)TriangleStat::OK]++;
 
 		const int minXT = minX[t] & ~3;
-		const int maxXT = maxX[t] & ~3;
+		const int maxXT = std::min(maxX[t] & ~3, tileX2);
+		// Where this tile's part of the rows starts, and how many groups the whole triangle has before that.
+		const int startXT = std::max(minXT, tileX1);
+		const int skippedGroups = (startXT - minXT) >> 2;
+		if (startXT > maxXT) {
+			continue;
+		}
 
 		const int minYT = minY[t];
 		const int maxYT = maxY[t];
 		// The coarse edge bounds must not cross a signed edge-function overflow.
 		auto inGuard = [](int value) { return (u32)value + 4096U <= 8192U; };
-		const bool canSkip = skipEmptyBlocks && (u32)maxXT - (u32)minXT >= 28 &&
+		const bool canSkip = skipEmptyBlocks && (u32)maxXT - (u32)startXT >= 28 &&
 			inGuard(x0[t]) && inGuard(x1[t]) && inGuard(x2[t]) &&
 			inGuard(y0[t]) && inGuard(y1[t]) && inGuard(y2[t]);
 		const int maxAhead12 = canSkip ? std::max(stepX12[t] * 7, 0) : 0;
@@ -217,6 +220,10 @@ void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthSc
 		Vec4F32 zrow = Vec4F32::Splat(zbase[t]) + Vec4F32FromS32(w1_row) * z_20[t] + Vec4F32FromS32(w2_row) * z_01[t];
 		Vec4F32 zdeltaX = Vec4F32::Splat(zdx[t]);
 		Vec4F32 zdeltaY = Vec4F32::Splat(zdy[t]);
+		// The edge functions are exact, so they can jump to the tile's first group.
+		w0_row += Vec4S32::Splat(stepX12[t] * skippedGroups);
+		w1_row += Vec4S32::Splat(stepX20[t] * skippedGroups);
+		w2_row += Vec4S32::Splat(stepX01[t] * skippedGroups);
 
 		Vec4S32 oneStepX12 = Vec4S32::Splat(stepX12[t]);
 		Vec4S32 oneStepY12 = Vec4S32::Splat(stepY12[t]);
@@ -231,11 +238,15 @@ void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthSc
 			Vec4S32 w1 = w1_row;
 			Vec4S32 w2 = w2_row;
 			Vec4F32 zs = zrow;
+			// Depth isn't, so repeat the whole row's additions (and their rounding).
+			for (int step = 0; step < skippedGroups; ++step) {
+				zs += zdeltaX;
+			}
 
 			uint16_t *rowPtr = depthBuf + stride * y;
 
 			bool rowEntered = false;
-			for (int x = minXT; x <= maxXT; x += stepXSize, w0 += oneStepX12, w1 += oneStepX20, w2 += oneStepX01, zs += zdeltaX) {
+			for (int x = startXT; x <= maxXT; x += stepXSize, w0 += oneStepX12, w1 += oneStepX20, w2 += oneStepX01, zs += zdeltaX) {
 				// If p is on or inside all edges for any pixels,
 				// render those pixels.
 				Vec4S32 signCalc = w0 | w1 | w2;
@@ -294,8 +305,6 @@ void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthSc
 				}
 			}
 		}
-
-		stats[(int)TriangleStat::OK]++;
 	}
 }
 
@@ -406,8 +415,9 @@ int DepthRasterClipIndexedRectangles(int *tx, int *ty, float *tz, const float *t
 	return outCount;
 }
 
-int DepthRasterClipIndexedTriangles(int *tx, int *ty, float *tz, const float *transformed, const uint16_t *indexBuffer, const DepthDraw &draw, const DepthScissor scissor, int maxOutCount) {
+int DepthRasterClipIndexedTriangles(int *tx, int *ty, float *tz, const float *transformed, const uint16_t *indexBuffer, const DepthDraw &draw, const DepthScissor scissor, int maxOutCount, bool updateStats, const DepthScissor *columnCull) {
 	int outCount = 0;
+	int earlySize = 0;
 
 	int flipCull = 0;
 	if (draw.cullEnabled && draw.cullMode == GE_CULL_CW) {
@@ -431,6 +441,8 @@ int DepthRasterClipIndexedTriangles(int *tx, int *ty, float *tz, const float *tr
 	Vec4S32 scissorY1 = Vec4S32::Splat((float)scissor.y1);
 	Vec4S32 scissorX2 = Vec4S32::Splat((float)scissor.x2);
 	Vec4S32 scissorY2 = Vec4S32::Splat((float)scissor.y2);
+	const Vec4S32 columnX1 = Vec4S32::Splat(columnCull ? (int)columnCull->x1 : 0);
+	const Vec4S32 columnX2 = Vec4S32::Splat(columnCull ? (int)columnCull->x2 : 0);
 
 	// Add cheap pre-projection pre-checks for bad triangle here. Not much we can do safely other than checking W.
 	auto validVert = [](const float *v) -> bool {
@@ -558,8 +570,20 @@ int DepthRasterClipIndexedTriangles(int *tx, int *ty, float *tz, const float *tr
 		// Still good for backface culling early and pretty cheap to compute.
 		Vec4F32 doubleTriArea = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0) - Vec4F32::Splat((float)(MIN_TWICE_TRI_AREA));
 		if (!AnyZeroSignBit(doubleTriArea)) {
-			gpuStats.perFrame.numDepthRasterEarlySize += 4;
+			earlySize += 4;
 			continue;
+		}
+
+		if (columnCull) {
+			// Drop the triangles that can't reach the columns. Not before the checks above: those look at all four
+			// triangles together, so they have to see the same ones as with the whole scissor.
+			const Vec4S32 inColumns = maxX.CompareGt(columnX1) & minX.CompareLt(columnX2);
+			if (!AnyZeroSignBit(Vec4S32::Splat(-1).AndNot(inColumns))) {
+				continue;  // None of the four.
+			}
+			x0 &= inColumns;
+			x1 &= inColumns;
+			x2 &= inColumns;
 		}
 
 		// Note: If any triangle is outside the guardband, (just) its X coords get zeroed, and it'll later get rejected.
@@ -585,15 +609,39 @@ int DepthRasterClipIndexedTriangles(int *tx, int *ty, float *tz, const float *tr
 		outCount += 12;
 	}
 
-	gpuStats.perFrame.numDepthRasterZCulled += planeCulled;
-	gpuStats.perFrame.numDepthEarlyBoxCulled += boxCulled;
+	if (updateStats) {
+		gpuStats.perFrame.numDepthRasterZCulled += planeCulled;
+		gpuStats.perFrame.numDepthEarlyBoxCulled += boxCulled;
+		gpuStats.perFrame.numDepthRasterEarlySize += earlySize;
+	}
 	return outCount;
 }
 
+int DepthRasterClip(int *tx, int *ty, float *tz, const float *transformed, const uint16_t *indexBuffer, const DepthDraw &draw, const DepthScissor columns, int maxOutCount, bool updateStats) {
+	if (draw.prim == GE_PRIM_RECTANGLES) {
+		return DepthRasterClipIndexedRectangles(tx, ty, tz, transformed, indexBuffer, draw, columns);
+	}
+	if (draw.prim != GE_PRIM_TRIANGLES) {
+		_dbg_assert_(false);
+		return 0;
+	}
+	// The clipper only roughly culls (strict compares on rounded bounds). With a margin around the columns, it
+	// keeps everything that can reach them, and the rasterizer clamps exactly.
+	DepthScissor cull = columns;
+	cull.x1 = (u16)std::max((int)draw.scissor.x1, (int)columns.x1 - 8);
+	cull.x2 = (u16)std::min((int)draw.scissor.x2, (int)columns.x2 + 8);
+	const bool narrower = cull.x1 != draw.scissor.x1 || cull.x2 != draw.scissor.x2;
+	return DepthRasterClipIndexedTriangles(tx, ty, tz, transformed, indexBuffer, draw, draw.scissor, maxOutCount, updateStats, narrower ? &cull : nullptr);
+}
+
 // Rasterizes screen-space vertices.
-void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, const int *ty, const float *tz, int count, const DepthDraw &draw, const DepthScissor scissor, bool lowQ, bool updateStats, bool skipEmptyBlocks) {
+void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, const int *ty, const float *tz, int count, const DepthDraw &draw, const DepthScissor scissor, bool lowQ, bool updateStats, bool skipEmptyBlocks, const DepthScissor *columns) {
 	// Prim should now be either TRIANGLES or RECTs.
 	_dbg_assert_(draw.prim == GE_PRIM_RECTANGLES || draw.prim == GE_PRIM_TRIANGLES);
+	// Triangles are culled against the whole scissor, so the columns only limit which groups get written.
+	const DepthScissor written = columns ? *columns : scissor;
+	const int tileX1 = written.x1 & ~3;
+	const int tileX2 = written.x2 & ~3;
 
 	switch (draw.prim) {
 	case GE_PRIM_RECTANGLES:
@@ -601,7 +649,7 @@ void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, con
 			uint16_t z = (uint16_t)tz[i + 1];  // depth from second vertex
 			// TODO: Should clip coordinates to the scissor rectangle.
 			// We remove the subpixel information here.
-			DepthRasterRect(depth, depthStride, scissor, tx[i], ty[i], tx[i + 1], ty[i + 1], z, draw.compareMode);
+			DepthRasterRect(depth, depthStride, written, tx[i], ty[i], tx[i + 1], ty[i + 1], z, draw.compareMode);
 		}
 		if (updateStats) {
 			gpuStats.perFrame.numDepthRasterPrims += count / 2;
@@ -616,21 +664,21 @@ void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, con
 			case ZCompareMode::Greater:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Greater, true>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
+					DepthRaster4Triangles<ZCompareMode::Greater, true>(stats, depth, depthStride, scissor, tileX1, tileX2, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
 			case ZCompareMode::Less:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Less, true>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
+					DepthRaster4Triangles<ZCompareMode::Less, true>(stats, depth, depthStride, scissor, tileX1, tileX2, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
 			case ZCompareMode::Always:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Always, true>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
+					DepthRaster4Triangles<ZCompareMode::Always, true>(stats, depth, depthStride, scissor, tileX1, tileX2, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
@@ -640,21 +688,21 @@ void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, con
 			case ZCompareMode::Greater:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Greater, false>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
+					DepthRaster4Triangles<ZCompareMode::Greater, false>(stats, depth, depthStride, scissor, tileX1, tileX2, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
 			case ZCompareMode::Less:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Less, false>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
+					DepthRaster4Triangles<ZCompareMode::Less, false>(stats, depth, depthStride, scissor, tileX1, tileX2, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
 			case ZCompareMode::Always:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Always, false>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
+					DepthRaster4Triangles<ZCompareMode::Always, false>(stats, depth, depthStride, scissor, tileX1, tileX2, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
@@ -676,11 +724,31 @@ void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, con
 // the mirrors.
 static constexpr u32 VRAM_OFFSET_MASK = 0x001FFFFF;
 
-DepthRasterWorker::DepthRasterWorker(int maxVerts, int maxIndices) : maxVerts_(maxVerts), maxIndices_(maxIndices) {
-	// x, y and z, each with room for a group of four triangles past the end.
-	screenVerts_ = (int *)AllocateMemoryPages((maxVerts_ * sizeof(int) + 384) * 3, MEM_PROT_READ | MEM_PROT_WRITE);
+// A scissor reaching past the stride writes into the next rows, which are other tiles' columns there.
+// So the first tile does the whole draw, with the others waiting before and after it.
+static bool DepthDrawWraps(const DepthDraw &draw) {
+	return draw.scissor.x2 >= draw.depthStride;
+}
+
+// Which tile owns a pixel depends on the buffer's address and stride.
+static u64 DepthBufferKey(const DepthDraw &draw) {
+	return ((u64)draw.depthAddr << 16) | draw.depthStride | ((u64)DepthDrawWraps(draw) << 63);
+}
+
+// The width that tiles split: the screen's, or the stride if that's narrower.
+static int DepthTileWidth(const DepthDraw &draw) {
+	return std::min((int)draw.depthStride, 480);
+}
+
+DepthRasterWorker::DepthRasterWorker(int maxVerts, int maxIndices, int numTiles) : maxVerts_(maxVerts), maxIndices_(maxIndices), tiles_(std::max(numTiles, 1)) {
+	for (TileThread &tile : tiles_) {
+		// x, y and z, each with room for a group of four triangles past the end.
+		tile.screenVerts = (int *)AllocateMemoryPages((maxVerts_ * sizeof(int) + 384) * 3, MEM_PROT_READ | MEM_PROT_WRITE);
+	}
 	current_ = NewBatch();
-	thread_ = std::thread([this] { Run(); });
+	for (int i = 0; i < (int)tiles_.size(); ++i) {
+		tiles_[i].thread = std::thread([this, i] { Run(i); });
+	}
 }
 
 DepthRasterWorker::~DepthRasterWorker() {
@@ -689,12 +757,16 @@ DepthRasterWorker::~DepthRasterWorker() {
 		std::lock_guard<std::mutex> guard(mutex_);
 		quit_ = true;
 	}
-	work_.notify_one();
-	thread_.join();
+	work_.notify_all();
+	for (TileThread &tile : tiles_) {
+		tile.thread.join();
+	}
 	for (DepthBatch *batch : all_) {
 		FreeBatch(batch);
 	}
-	FreeMemoryPages(screenVerts_, (maxVerts_ * sizeof(int) + 384) * 3);
+	for (TileThread &tile : tiles_) {
+		FreeMemoryPages(tile.screenVerts, (maxVerts_ * sizeof(int) + 384) * 3);
+	}
 }
 
 DepthBatch *DepthRasterWorker::NewBatch() {
@@ -774,8 +846,13 @@ void DepthRasterWorker::Submit() {
 			busyRanges_.emplace_back(low, high);
 		}
 	}
+	current_->pendingTiles = (int)tiles_.size();
+	current_->firstDraw = submittedDraws_;
+	current_->previousBuffer = lastBuffer_;
+	submittedDraws_ += current_->draws.size();
+	lastBuffer_ = DepthBufferKey(current_->draws.back());
 	queue_.push_back(current_);
-	work_.notify_one();
+	work_.notify_all();
 	if (free_.empty() && all_.size() < MAX_BATCHES) {
 		lock.unlock();
 		current_ = NewBatch();
@@ -799,7 +876,7 @@ void DepthRasterWorker::WaitForSubmitted() {
 		return;
 	}
 	std::unique_lock<std::mutex> lock(mutex_);
-	done_.wait(lock, [this] { return queue_.empty() && running_ == 0; });
+	done_.wait(lock, [this] { return queue_.empty(); });
 }
 
 void DepthRasterWorker::WaitIfWriting(u32 addr, u32 size) {
@@ -818,7 +895,7 @@ void DepthRasterWorker::WaitIfWriting(u32 addr, u32 size) {
 		overlaps = overlaps || (low < range.second && low + size > range.first);
 	}
 	if (busy_ && overlaps) {
-		done_.wait(lock, [this] { return queue_.empty() && running_ == 0; });
+		done_.wait(lock, [this] { return queue_.empty(); });
 	}
 }
 
@@ -830,63 +907,104 @@ void DepthRasterWorker::TakeTimes(double *cull, double *raster) {
 	rasterTime_ = 0.0;
 }
 
-void DepthRasterWorker::Run() {
-	SetCurrentThreadAffinity(ThreadAffinityRole::COMPUTE);
-	SetCurrentThreadName("DepthRaster");
+void DepthRasterWorker::Run(int tile) {
+	// Further tiles go to the render core, which Deko3D leaves almost idle.
+	SetCurrentThreadAffinity(tile == 0 ? ThreadAffinityRole::COMPUTE : ThreadAffinityRole::RENDER_CORE_COMPUTE);
+	SetCurrentThreadName(tile == 0 ? "DepthRaster" : "DepthRasterTile");
+	TileThread &self = tiles_[tile];
 	std::unique_lock<std::mutex> lock(mutex_);
 	while (true) {
-		work_.wait(lock, [this] { return quit_ || !queue_.empty(); });
+		work_.wait(lock, [&] { return quit_ || self.next < queueStart_ + queue_.size(); });
 		if (quit_) {
 			break;
 		}
-		DepthBatch *batch = queue_.front();
-		queue_.erase(queue_.begin());
-		running_++;
+		DepthBatch *batch = queue_[self.next - queueStart_];
 		lock.unlock();
 
 		double cull = 0.0, raster = 0.0;
-		Rasterize(*batch, &cull, &raster);
+		Rasterize(*batch, tile, &cull, &raster);
 
 		lock.lock();
-		running_--;
+		self.next++;
 		cullTime_ += cull;
 		rasterTime_ += raster;
-		free_.push_back(batch);
-		if (queue_.empty() && running_ == 0) {
-			busy_ = false;
+		if (--batch->pendingTiles == 0) {
+			// Every tile goes through the queue in order, so the last to finish a batch finishes the oldest.
+			_dbg_assert_(batch == queue_.front());
+			queue_.pop_front();
+			queueStart_++;
+			free_.push_back(batch);
+			if (queue_.empty()) {
+				busy_ = false;
+			}
+			done_.notify_all();
 		}
-		done_.notify_all();
 	}
 }
 
-void DepthRasterWorker::Rasterize(const DepthBatch &batch, double *cull, double *raster) {
-	int *tx = screenVerts_;
-	int *ty = screenVerts_ + maxVerts_;
-	float *tz = (float *)(screenVerts_ + maxVerts_ * 2);
-	for (const DepthDraw &draw : batch.draws) {
+void DepthRasterWorker::Rasterize(const DepthBatch &batch, int tile, double *cull, double *raster) {
+	const int numTiles = (int)tiles_.size();
+	int *tx = tiles_[tile].screenVerts;
+	int *ty = tx + maxVerts_;
+	float *tz = (float *)(tx + maxVerts_ * 2);
+	u64 previousBuffer = batch.previousBuffer;
+	for (size_t i = 0; i < batch.draws.size(); ++i) {
+		const DepthDraw &draw = batch.draws[i];
+		if (numTiles > 1) {
+			if (i != 0) {
+				FinishDraw(tile, batch.firstDraw + i);
+			}
+			// Tiles own the same columns as long as the buffer stays the same. Before one changes, all earlier
+			// draws must be done, since the columns can be elsewhere in memory now.
+			const u64 buffer = DepthBufferKey(draw);
+			if (buffer != previousBuffer) {
+				WaitForTiles(batch.firstDraw + i);
+				previousBuffer = buffer;
+			}
+		}
 		const float *vertices = batch.transformed + 4 * draw.vertexOffset;
 		const uint16_t *indices = batch.indices + draw.indexOffset;
-		const DepthScissor tileScissor = draw.scissor.Tile(0, 1);
+		const bool whole = numTiles == 1 || DepthDrawWraps(draw);
+		const DepthScissor columns = whole ? draw.scissor : draw.scissor.Tile(tile, numTiles, DepthTileWidth(draw));
+		if (tile != 0 && (whole || columns.x1 > columns.x2)) {
+			continue;  // The scissor misses this tile's columns.
+		}
 
 		double start = time_now_d();
-		int outVertCount = 0;
-		switch (draw.prim) {
-		case GE_PRIM_RECTANGLES:
-			outVertCount = DepthRasterClipIndexedRectangles(tx, ty, tz, vertices, indices, draw, tileScissor);
-			break;
-		case GE_PRIM_TRIANGLES:
-			outVertCount = DepthRasterClipIndexedTriangles(tx, ty, tz, vertices, indices, draw, tileScissor, maxVerts_);
-			break;
-		default:
-			_dbg_assert_(false);
-			break;
-		}
+		// With several tiles, the first counts the stats (for its columns).
+		const int outVertCount = DepthRasterClip(tx, ty, tz, vertices, indices, draw, columns, maxVerts_, tile == 0);
 		double mid = time_now_d();
 		*cull += mid - start;
 		if (outVertCount > 0 && Memory::IsValid4AlignedAddress(draw.depthAddr)) {
 			u16 *depthPtr = (uint16_t *)Memory::GetPointerWriteUnchecked(draw.depthAddr);
-			DepthRasterScreenVerts(depthPtr, draw.depthStride, tx, ty, tz, outVertCount, draw, tileScissor, batch.lowQ);
+			DepthRasterScreenVerts(depthPtr, draw.depthStride, tx, ty, tz, outVertCount, draw, draw.scissor, batch.lowQ, tile == 0, true, &columns);
 			*raster += time_now_d() - mid;
 		}
 	}
+	if (numTiles > 1 && !batch.draws.empty()) {
+		FinishDraw(tile, batch.firstDraw + batch.draws.size());
+	}
+}
+
+void DepthRasterWorker::WaitForTiles(u64 draw) {
+	std::unique_lock<std::mutex> lock(mutex_);
+	auto caughtUp = [&] {
+		for (const TileThread &tile : tiles_) {
+			if (tile.drawsDone < draw) {
+				return false;
+			}
+		}
+		return true;
+	};
+	if (!caughtUp()) {
+		tileProgress_.wait(lock, caughtUp);
+	}
+}
+
+void DepthRasterWorker::FinishDraw(int tile, u64 draws) {
+	{
+		std::lock_guard<std::mutex> guard(mutex_);
+		tiles_[tile].drawsDone = draws;
+	}
+	tileProgress_.notify_all();
 }

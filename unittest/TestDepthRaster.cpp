@@ -64,6 +64,86 @@ void ReferenceCoverage(std::vector<u8> &covered, int x0, int y0, int x1, int y1,
 	}
 }
 
+// Clipping and rasterizing each tile's columns of the scissor on its own, as the worker's tile threads do,
+// gives the same depth buffer as doing the whole scissor at once.
+int CheckTiledDepth(RasterRng &rng, int *changedPixels) {
+	constexpr int MAX_PRIMS = 40;
+	constexpr int MAX_OUT = 1024;
+	alignas(16) float transformed[MAX_PRIMS * 3 * 4];
+	u16 indices[MAX_PRIMS * 3];
+	alignas(16) int tx[MAX_OUT + 12];
+	alignas(16) int ty[MAX_OUT + 12];
+	alignas(16) float tz[MAX_OUT + 12];
+	std::vector<u16> initial(BUF_W * BUF_H), whole, tiled;
+	int mismatches = 0;
+	for (int trial = 0; trial < 600; trial++) {
+		DepthScissor scissor;
+		if (trial % 5 == 0) {
+			scissor.x1 = (u16)rng.Range(0, 400);
+			scissor.x2 = (u16)(scissor.x1 + rng.Range(0, 12));
+		} else {
+			scissor.x1 = (u16)rng.Range(0, 100);
+			scissor.x2 = (u16)rng.Range(380, 479);
+		}
+		scissor.y1 = (u16)rng.Range(0, 60);
+		scissor.y2 = (u16)rng.Range(200, 270);
+		DepthDraw draw{};
+		draw.prim = trial % 7 == 0 ? GE_PRIM_RECTANGLES : GE_PRIM_TRIANGLES;
+		draw.compareMode = draw.prim == GE_PRIM_RECTANGLES ? ZCompareMode::Always : (ZCompareMode)(trial % 3);
+		draw.cullEnabled = trial % 2 == 0;
+		draw.cullMode = (trial / 2) % 2 ? GE_CULL_CW : GE_CULL_CCW;
+		draw.scissor = scissor;
+		const bool lowQ = trial % 4 == 1;
+		const int bufferWidth = trial % 2 ? 480 : 256;
+
+		const int vertsPerPrim = draw.prim == GE_PRIM_RECTANGLES ? 2 : 3;
+		const int prims = rng.Range(1, MAX_PRIMS);
+		const int size = trial % 3 == 0 ? 8 : trial % 3 == 1 ? 60 : 300;
+		for (int p = 0; p < prims; p++) {
+			const int cx = rng.Range(-40, 520);
+			const int cy = rng.Range(-40, 300);
+			for (int v = 0; v < vertsPerPrim; v++) {
+				const int i = p * vertsPerPrim + v;
+				// Projected by the clipper, so scale by w. Some vertices are behind the camera.
+				const float w = rng.Next() % 64 == 0 ? -1.0f : 0.5f + (rng.Next() % 1024) / 512.0f;
+				transformed[i * 4 + 0] = (float)(cx + rng.Range(-size, size)) * w;
+				transformed[i * 4 + 1] = (float)(cy + rng.Range(-size, size)) * w;
+				transformed[i * 4 + 2] = (float)rng.Range(1, 65535) * w;
+				transformed[i * 4 + 3] = w;
+				indices[i] = (u16)i;
+			}
+		}
+		draw.vertexCount = prims * vertsPerPrim;
+
+		for (auto &value : initial) {
+			value = (u16)rng.Next();
+		}
+		whole = initial;
+		int count = DepthRasterClip(tx, ty, tz, transformed, indices, draw, scissor, MAX_OUT, false);
+		DepthRasterScreenVerts(whole.data(), BUF_W, tx, ty, tz, count, draw, scissor, lowQ, false);
+		for (size_t i = 0; i < whole.size(); i++) {
+			*changedPixels += whole[i] != initial[i];
+		}
+		for (int numTiles : {2, 3}) {
+			tiled = initial;
+			for (int tile = 0; tile < numTiles; tile++) {
+				const DepthScissor columns = scissor.Tile(tile, numTiles, bufferWidth);
+				if (tile != 0 && columns.x1 > columns.x2) {
+					continue;
+				}
+				count = DepthRasterClip(tx, ty, tz, transformed, indices, draw, columns, MAX_OUT, false);
+				DepthRasterScreenVerts(tiled.data(), BUF_W, tx, ty, tz, count, draw, scissor, lowQ, false, true, &columns);
+			}
+			if (tiled != whole) {
+				if (mismatches++ < 10) {
+					printf("Tiled depth differs: trial=%d tiles=%d prim=%d compare=%d lowQ=%d scissor=%d-%d\n", trial, numTiles, (int)draw.prim, (int)draw.compareMode, lowQ, scissor.x1, scissor.x2);
+				}
+			}
+		}
+	}
+	return mismatches;
+}
+
 }  // namespace
 
 // The depth rasterizer covers exactly the pixels a per-pixel edge test does. All triangles are at one depth, so
@@ -152,6 +232,11 @@ bool TestDepthRaster() {
 	}
 	printf("%d pixels covered; %d interpolated depth buffers match the original traversal\n", pixels, interpolatedCases);
 	EXPECT_EQ_INT(interpolatedCases, 1200);
+	int tiledChanged = 0;
+	const int tiledMismatches = CheckTiledDepth(rng, &tiledChanged);
+	printf("Tiled depth raster: %d mismatches, %d pixels written\n", tiledMismatches, tiledChanged);
+	EXPECT_EQ_INT(tiledMismatches, 0);
+	EXPECT_TRUE(tiledChanged > 1000000);
 	if (getenv("PPSSPP_BENCH_DEPTH")) {
 		DepthDraw draw{};
 		draw.prim = GE_PRIM_TRIANGLES;

@@ -16,6 +16,7 @@
 #include "GPU/Common/DepthRaster.h"
 
 using namespace std::chrono_literals;
+#define _dbg_assert_(value) assert(value)
 
 // The worker's allocation, affinity and VRAM classification dependencies are controlled here.
 constexpr int MEM_PROT_READ = 1, MEM_PROT_WRITE = 2;
@@ -63,8 +64,14 @@ struct RasterGate {
 	}
 } gate;
 
-std::array<u16, 128> output{};
-int processed = 0;
+// One result per tile thread: each goes through every batch, in order.
+int tiles = 1;
+std::array<std::array<u16, 128>, 2> outputs{};
+std::array<int, 2> processed{};
+void Reset() {
+	outputs = {};
+	processed = {};
+}
 void Apply(std::array<u16, 128> &buffer, int value) {
 	const int x = value % buffer.size();
 	buffer[x] = (u16)(buffer[x] * 33 + value);
@@ -72,13 +79,14 @@ void Apply(std::array<u16, 128> &buffer, int value) {
 
 // This callback deliberately overlaps writes between draws: FIFO ordering affects the result.
 // Pixel coverage/interpolation are checked separately by TestDepthRaster and its sanitizer fixture.
-void DepthRasterWorker::Rasterize(const DepthBatch &batch, double *, double *) {
+void DepthRasterWorker::Rasterize(const DepthBatch &batch, int tile, double *, double *) {
+	assert(tile >= 0 && tile < tiles);
 	gate.Enter();
 	for (const auto &draw : batch.draws) {
 		const int value = (int)batch.transformed[draw.vertexOffset * 4];
 		assert(batch.indices[draw.indexOffset] == value);
-		Apply(output, value);
-		++processed;
+		Apply(outputs[tile], value);
+		++processed[tile];
 	}
 }
 
@@ -110,15 +118,16 @@ void Check(int count) {
 	for (int i = 1; i <= count; ++i) {
 		Apply(reference, i);
 	}
-	assert(output == reference);
-	assert(processed == count);
+	for (int tile = 0; tile < tiles; ++tile) {
+		assert(outputs[tile] == reference);
+		assert(processed[tile] == count);
+	}
 }
 
 void Ordered(bool early) {
-	output = {};
-	processed = 0;
+	Reset();
 	gate.Reset(early);
-	DepthRasterWorker worker(2048, 2048);
+	DepthRasterWorker worker(2048, 2048, tiles);
 	for (int i = 1; i <= 37; ++i) {
 		Append(worker, i, early);
 		if (early && i == 8) {
@@ -137,10 +146,9 @@ void Ordered(bool early) {
 }
 
 void Backpressure() {
-	output = {};
-	processed = 0;
+	Reset();
 	gate.Reset(true);
-	DepthRasterWorker worker(2048, 2048);
+	DepthRasterWorker worker(2048, 2048, tiles);
 	std::atomic<int> committed{0};
 	auto producer = std::async(std::launch::async, [&] {
 		for (int i = 1; i <= 1100; ++i) {
@@ -161,28 +169,32 @@ void Backpressure() {
 	Check(1100);
 }
 
-int main(int argc, char **argv) {
-	assert(argc == 2);
+void Scenarios() {
 	Ordered(false);
 	Ordered(true);
 	Backpressure();
-	output = {};
-	processed = 0;
+	Reset();
 	gate.Reset(false);
 	{
-		DepthRasterWorker worker(2048, 2048);
+		DepthRasterWorker worker(2048, 2048, tiles);
 		for (int i = 1; i <= 9; ++i) {
 			Append(worker, i, true);
 		}
 	}  // Queued work and the partial batch must complete before their storage is freed.
 	Check(9);
-	output = {};
-	processed = 0;
+	Reset();
 	{
-		DepthRasterWorker worker(2048, 2048);
+		DepthRasterWorker worker(2048, 2048, tiles);
 		Append(worker, 1, true, 1024);
 		assert(worker.Current().draws.empty());
 		worker.Wait();
 		Check(1);
+	}
+}
+
+int main(int argc, char **argv) {
+	assert(argc == 2);
+	for (tiles = 1; tiles <= 2; ++tiles) {
+		Scenarios();
 	}
 }

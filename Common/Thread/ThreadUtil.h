@@ -27,6 +27,8 @@ enum class ThreadAffinityRole {
 	COMPUTE,
 	IO,
 	BACKGROUND,
+	// Low-priority compute on the render core, so it only takes the time a render thread leaves.
+	RENDER_CORE_COMPUTE,
 };
 
 void SetCurrentThreadAffinity(ThreadAffinityRole role);

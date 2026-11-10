@@ -42,13 +42,17 @@ double time_now_d() {
 struct {
     struct {
         int numDepthRasterPrims = 0, numDepthRasterNoPixels = 0, numDepthRasterTooSmall = 0;
+        int numDepthRasterEarlySize = 0, numDepthRasterZCulled = 0, numDepthEarlyBoxCulled = 0;
     } perFrame;
 } gpuStats;
 '''
+fixture += definition('DepthScissor DepthScissor::Tile(') + '\n'
 fixture += definition('static void DepthRasterRect(') + '\n'
 start = source.index('alignas(16) static const int zero123')
 fixture += source[start:source.index('// A mix of ideas', start)]
 fixture += 'template<ZCompareMode compareMode, bool lowQ>\n' + definition('void DepthRaster4Triangles(') + '\n'
+for signature in ('int DepthRasterClipIndexedRectangles(', 'int DepthRasterClipIndexedTriangles(', 'int DepthRasterClip('):
+    fixture += definition(signature) + '\n'
 fixture += definition('void DepthRasterScreenVerts(') + '\n'
 fixture += test[test.index('namespace {'):]
 fixture += '\nint main(int argc, char **argv) { assert(argc == 2); bool ok = TestDepthRaster(); return ok ? 0 : 1; }\n'
@@ -61,4 +65,4 @@ with tempfile.TemporaryDirectory(prefix='ppsspp-depth-raster-') as directory:
                     '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-I' + str(root),
                     str(cpp), '-o', str(executable)], check=True)
     subprocess.run([str(executable), str(folder)], check=True)
-    print('Depth sanitizer checks passed: production kernels, scalar coverage, exact interpolated output.')
+    print('Depth sanitizer checks passed: production kernels, scalar coverage, exact interpolated output and tiles matching whole-scissor output.')

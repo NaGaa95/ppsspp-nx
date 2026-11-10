@@ -135,6 +135,11 @@ void SetCurrentThreadAffinity(ThreadAffinityRole role) {
 		affinityMask = 1U << workerCore;
 		priority = 63;
 		break;
+	case ThreadAffinityRole::RENDER_CORE_COMPUTE:
+		idealCore = renderCore;
+		affinityMask = 1U << renderCore;
+		priority = 63;
+		break;
 	}
 
 	if (!affinityMask) {

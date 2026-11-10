@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -33,7 +34,8 @@ struct DepthScissor {
 	u16 x2;
 	u16 y2;
 
-	DepthScissor Tile(int tile, int numTiles) const;
+	// The part of the scissor in one of numTiles column ranges of a buffer.
+	DepthScissor Tile(int tile, int numTiles, int bufferWidth) const;
 };
 
 struct DepthDraw {
@@ -57,13 +59,17 @@ struct DepthDraw {
 class VertexDecoder;
 struct TransformedVertex;
 
-// maxOutCount is the capacity of each of tx/ty/tz, in elements.
-int DepthRasterClipIndexedTriangles(int *tx, int *ty, float *tz, const float *transformed, const uint16_t *indexBuffer, const DepthDraw &draw, const DepthScissor scissor, int maxOutCount);
+// maxOutCount is the capacity of each of tx/ty/tz, in elements. With columnCull, triangles outside its X range
+// are dropped too.
+int DepthRasterClipIndexedTriangles(int *tx, int *ty, float *tz, const float *transformed, const uint16_t *indexBuffer, const DepthDraw &draw, const DepthScissor scissor, int maxOutCount, bool updateStats = true, const DepthScissor *columnCull = nullptr);
 int DepthRasterClipIndexedRectangles(int *tx, int *ty, float *tz, const float *transformed, const uint16_t *indexBuffer, const DepthDraw &draw, const DepthScissor scissor);
+// Projects and culls a draw for rasterizing the columns of its scissor (from DepthScissor::Tile, or all of it).
+int DepthRasterClip(int *tx, int *ty, float *tz, const float *transformed, const uint16_t *indexBuffer, const DepthDraw &draw, const DepthScissor columns, int maxOutCount, bool updateStats);
 void DecodeAndTransformForDepthRaster(float *dest, const float *worldviewproj, const void *vertexData, int indexLowerBound, int indexUpperBound, const VertexDecoder *dec, u32 vertTypeID);
 void TransformPredecodedForDepthRaster(float *dest, const float *worldviewproj, const void *decodedVertexData, const VertexDecoder *dec, int count);
 void ConvertPredecodedThroughForDepthRaster(float *dest, const void *decodedVertexData, const VertexDecoder *dec, int count);
-void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, const int *ty, const float *tz, int count, const DepthDraw &draw, const DepthScissor scissor, bool lowQ, bool updateStats = true, bool skipEmptyBlocks = true);
+// With columns (from scissor.Tile()), only those are written, with the same result as rasterizing the whole scissor.
+void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, const int *ty, const float *tz, int count, const DepthDraw &draw, const DepthScissor scissor, bool lowQ, bool updateStats = true, bool skipEmptyBlocks = true, const DepthScissor *columns = nullptr);
 
 // A batch of queued depth draws, with their transformed vertices and indices.
 struct DepthBatch {
@@ -75,14 +81,18 @@ struct DepthBatch {
 	int vertexCapacity = 0;
 	int indexCapacity = 0;
 	bool lowQ = false;
+	int pendingTiles = 0;  // Tiles that haven't finished this batch yet.
+	u64 firstDraw = 0;  // Sequence number of the first draw.
+	u64 previousBuffer = 0;  // DepthBufferKey of the draw before it.
 };
 
-// Rasterizes batches of depth draws on a thread of its own, in the order they're submitted, so
+// Rasterizes batches of depth draws on threads of its own, in the order they're submitted, so
 // that it overlaps with emulating the CPU and the rest of the GE. The PSP memory it writes is only
 // the depth buffers of the draws, so anything reading those has to Wait() first (or WaitIfWriting).
 class DepthRasterWorker {
 public:
-	DepthRasterWorker(int maxVerts, int maxIndices);
+	// Each of numTiles threads rasterizes one column range (DepthScissor::Tile) of every batch.
+	DepthRasterWorker(int maxVerts, int maxIndices, int numTiles = 1);
 	~DepthRasterWorker();
 
 	// The batch to add draws to.
@@ -106,18 +116,30 @@ public:
 private:
 	DepthBatch *NewBatch();
 	static void FreeBatch(DepthBatch *batch);
-	void Run();
-	void Rasterize(const DepthBatch &batch, double *cull, double *raster);
+	void Run(int tile);
+	void Rasterize(const DepthBatch &batch, int tile, double *cull, double *raster);
+
+	void WaitForTiles(u64 draw);
+	void FinishDraw(int tile, u64 draws);
+
+	struct TileThread {
+		std::thread thread;
+		int *screenVerts = nullptr;
+		u64 next = 0;  // Sequence number of the next batch to rasterize.
+		u64 drawsDone = 0;
+	};
 
 	const int maxVerts_;
 	const int maxIndices_;
-	int *screenVerts_ = nullptr;
+	std::vector<TileThread> tiles_;
 
 	std::vector<DepthBatch *> all_;
 	std::vector<DepthBatch *> free_;
-	std::vector<DepthBatch *> queue_;  // Oldest first.
+	std::deque<DepthBatch *> queue_;  // Submitted and not finished by every tile, oldest first.
+	u64 queueStart_ = 0;  // Sequence number of queue_.front().
+	u64 submittedDraws_ = 0;
+	u64 lastBuffer_ = 0;
 	DepthBatch *current_ = nullptr;
-	int running_ = 0;  // Batches taken off the queue and not yet done.
 
 	// The depth buffer bytes the submitted, unfinished batches can write.
 	// The depth buffers being written (VRAM offsets, end exclusive), and their span, which only grows
@@ -134,5 +156,5 @@ private:
 	std::mutex mutex_;
 	std::condition_variable work_;
 	std::condition_variable done_;
-	std::thread thread_;
+	std::condition_variable tileProgress_;
 };

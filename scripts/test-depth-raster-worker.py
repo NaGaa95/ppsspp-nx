@@ -27,4 +27,4 @@ with tempfile.TemporaryDirectory(prefix='ppsspp-depth-worker-') as directory:
                     '-fno-omit-frame-pointer', '-I' + str(root),
                     str(cpp), '-o', str(executable)], check=True)
     subprocess.run([str(executable), str(folder)], timeout=60, check=True)
-    print('Depth worker checks passed: early overlap, FIFO results, vertex threshold, bounded queue backpressure, VRAM waits and destructor drain.')
+    print('Depth worker checks passed with one and two tiles: early overlap, FIFO results per tile, vertex threshold, bounded queue backpressure, VRAM waits and destructor drain.')
