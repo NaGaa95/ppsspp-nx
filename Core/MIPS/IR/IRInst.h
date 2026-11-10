@@ -273,6 +273,8 @@ enum class IROp : uint8_t {
 	LogIRBlock,
 
 	Nop,
+	VfpuRngSeed,  // Seed RCX0..7 from the raw bits of src1 (FPR).
+	VfpuRng,      // Generate into dest (FPR); src1 is vrndi/vrndf1/vrndf2 (1/2/3).
 	Bad,
 };
 

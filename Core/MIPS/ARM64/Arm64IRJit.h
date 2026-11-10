@@ -94,6 +94,7 @@ private:
 	void CompIR_FRound(IRInst inst) override;
 	void CompIR_FSat(IRInst inst) override;
 	void CompIR_FSpecial(IRInst inst) override;
+	void CompIR_VfpuRng(IRInst inst) override;
 	void CompIR_FStore(IRInst inst) override;
 	void CompIR_Generic(IRInst inst) override;
 	void CompIR_HiLo(IRInst inst) override;

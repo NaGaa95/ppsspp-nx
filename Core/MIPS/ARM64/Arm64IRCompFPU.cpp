@@ -571,6 +571,36 @@ void Arm64JitBackend::CompIR_FSpecial(IRInst inst) {
 	}
 }
 
+void Arm64JitBackend::CompIR_VfpuRng(IRInst inst) {
+	CONDITIONAL_DISABLE;
+	regs_.FlushBeforeCall();
+	const int rcxOffset = offsetof(MIPSState, vfpuCtrl) + VFPU_CTRL_RCX0 * sizeof(u32);
+	if (inst.op == IROp::VfpuRngSeed) {
+		if (regs_.IsFPRMapped(inst.src1)) {
+			const int lane = regs_.GetFPRLane(inst.src1);
+			if (lane == 0) {
+				fp_.FMOV(W0, regs_.F(inst.src1));
+			} else {
+				fp_.DUP(32, Q0, regs_.F(inst.src1), lane);
+				fp_.FMOV(W0, S0);
+			}
+		} else {
+			LDR(INDEX_UNSIGNED, W0, CTXREG, offsetof(MIPSState, f) + inst.src1 * sizeof(u32));
+		}
+		ADDI2R(X1, CTXREG, rcxOffset, SCRATCH2_64);
+		QuickCallFunction(SCRATCH2_64, &vrnd_init);
+	} else {
+		ADDI2R(X0, CTXREG, rcxOffset, SCRATCH2_64);
+		QuickCallFunction(SCRATCH2_64, &vrnd_generate);
+		if (inst.src1 != 1) {
+			ANDI2R(W0, W0, 0x007FFFFF, SCRATCH1);
+			ORRI2R(W0, W0, inst.src1 == 2 ? 0x3F800000 : 0x40000000, SCRATCH1);
+		}
+		regs_.MapFPR(inst.dest, MIPSMap::NOINIT);
+		fp_.FMOV(regs_.F(inst.dest), W0);
+	}
+}
+
 void Arm64JitBackend::CompIR_RoundingMode(IRInst inst) {
 	CONDITIONAL_DISABLE;
 

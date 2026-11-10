@@ -272,6 +272,8 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst, const IRInst *chainArena) {
 		dispatch[(int)IROp::FExp2] = &&L_FExp2;
 		dispatch[(int)IROp::FLog2] = &&L_FLog2;
 		dispatch[(int)IROp::FSinCos] = &&L_FSinCos;
+		dispatch[(int)IROp::VfpuRngSeed] = &&L_VfpuRngSeed;
+		dispatch[(int)IROp::VfpuRng] = &&L_VfpuRng;
 		dispatch[(int)IROp::FHalfToFloat] = &&L_FHalfToFloat;
 		dispatch[(int)IROp::ShlImm] = &&L_ShlImm;
 		dispatch[(int)IROp::ShrImm] = &&L_ShrImm;
@@ -990,6 +992,18 @@ u32 IRInterpret(MIPSState *mips, const IRInst *inst, const IRInst *chainArena) {
 			vfpu_sincos(mips->f[inst->src1], s, c);
 			mips->f[inst->dest] = s;
 			mips->f[inst->dest + 1] = c;
+			IR_NEXT;
+		}
+		IR_CASE(VfpuRngSeed)
+			vrnd_init(mips->fi[inst->src1], mips->vfpuCtrl + VFPU_CTRL_RCX0);
+			IR_NEXT;
+		IR_CASE(VfpuRng)
+		{
+			u32 value = vrnd_generate(mips->vfpuCtrl + VFPU_CTRL_RCX0);
+			if (inst->src1 != 1) {
+				value = (value & 0x007FFFFF) | (inst->src1 == 2 ? 0x3F800000 : 0x40000000);
+			}
+			mips->fi[inst->dest] = value;
 			IR_NEXT;
 		}
 		IR_CASE(FHalfToFloat)

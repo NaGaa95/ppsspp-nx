@@ -4392,6 +4392,7 @@ TestItem availableTests[] = {
 	TEST_ITEM(MeWait),
 	TEST_ITEM(MeDmacplus),
 	TEST_ITEM(CPUEquivalence),
+	TEST_ITEM(VFPURandomJit),
 	TEST_ITEM(CPURoundingMode),
 	TEST_ITEM(VFPUDotJit),
 	TEST_ITEM(VFPUMatrixTranspose),

@@ -28,5 +28,6 @@ bool TestMeInterrupts();
 bool TestMeWait();
 bool TestMeDmacplus();
 bool TestCPUEquivalence();
+bool TestVFPURandomJit();
 bool TestCPURoundingMode();
 bool TestVFPUDotJit();

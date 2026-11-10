@@ -1633,6 +1633,29 @@ namespace MIPSComp {
 		}
 	}
 
+	void IRFrontend::Comp_Vrnds(MIPSOpcode op) {
+		CONDITIONAL_DISABLE(VFPU_VEC);
+		if (js.HasUnknownPrefix() || js.prefixS != 0xE4) {
+			DISABLE;
+		}
+		// The seed comes from VS; VD does not participate.
+		ir.Write(IROp::VfpuRngSeed, 0, vfpuBase + voffset[_VS]);
+	}
+
+	void IRFrontend::Comp_VrndX(MIPSOpcode op) {
+		CONDITIONAL_DISABLE(VFPU_VEC);
+		if (js.HasUnknownPrefix() || js.prefixD != 0) {
+			DISABLE;
+		}
+		const VectorSize sz = GetVecSize(op);
+		u8 dregs[4];
+		GetVectorRegsPrefixD(dregs, sz, _VD);
+		// Keep the interpreter's RNG sequence and reverse lane assignment.
+		for (int i = GetNumVectorElements(sz) - 1; i >= 0; --i) {
+			ir.Write(IROp::VfpuRng, dregs[i], (op >> 16) & 0x1F);
+		}
+	}
+
 	void IRFrontend::Comp_Vmfvc(MIPSOpcode op) {
 		CONDITIONAL_DISABLE(VFPU_XFER);
 

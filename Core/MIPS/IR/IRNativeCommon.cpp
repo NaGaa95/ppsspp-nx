@@ -459,6 +459,11 @@ void IRNativeBackend::CompileIRInst(IRInst inst) {
 		CompIR_FSpecial(inst);
 		break;
 
+	case IROp::VfpuRngSeed:
+	case IROp::VfpuRng:
+		CompIR_VfpuRng(inst);
+		break;
+
 	case IROp::Interpret:
 		CompIR_Interpret(inst);
 		break;

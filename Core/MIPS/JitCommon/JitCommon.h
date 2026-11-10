@@ -83,6 +83,8 @@ namespace MIPSComp {
 		virtual void Comp_Mftv(MIPSOpcode op) = 0;
 		virtual void Comp_Vmfvc(MIPSOpcode op) = 0;
 		virtual void Comp_Vmtvc(MIPSOpcode op) = 0;
+		virtual void Comp_Vrnds(MIPSOpcode op) { Comp_Generic(op); }
+		virtual void Comp_VrndX(MIPSOpcode op) { Comp_Generic(op); }
 		virtual void Comp_Vmmov(MIPSOpcode op) = 0;
 		virtual void Comp_VScl(MIPSOpcode op) = 0;
 		virtual void Comp_Vmmul(MIPSOpcode op) = 0;

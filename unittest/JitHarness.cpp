@@ -1754,6 +1754,93 @@ static void ApplyFuzzHostExtensions() {
 	}
 }
 
+bool TestVFPURandomJit() {
+	SetupJitHarness();
+	const bool oldSkipDeadbeef = g_Config.bSkipDeadbeefFilling;
+	g_Config.bSkipDeadbeefFilling = true;
+	bool success = true;
+	unsigned checked = 0;
+	for (unsigned seed = 1; seed <= 8; ++seed) {
+		FuzzCase test = GenerateFuzzCase(seed, "v", {});
+		for (unsigned i = VFPU_CTRL_RCX0; i <= VFPU_CTRL_RCX7; ++i) {
+			test.init.vfpuCtrl[i] = 0xFEDCBA98U * (seed + i);
+		}
+		test.init.fcr31 = (seed & 3) | ((seed & 4) ? (1U << 24) : 0);
+		for (u32 size : {0U, 0x80U, 0x8000U, 0x8080U}) {
+			for (u32 dest : {0U, 0x21U, 0x42U, 0x63U}) {
+				for (u32 prefix : {0U, 1U, 0x100U, 0xF00U}) {
+					// Read a noncanonical RCX state, seed from VS (VD is ignored), then keep drawing.
+					// A nondefault D prefix exercises the interpreter's last-lane mask/saturation.
+					const std::vector<u32> code = {
+						0xDC0000E4, 0xDD0000E4, 0xDE000000,
+						0xD0210000 | size | dest,
+						0xD0220000 | size | (dest ^ 1),
+						// Keep a packed vector live across the call, including a seed in each lane.
+						0xD8000000 | (FUZZ_BASE_REG << 21),
+						0xD0200000 | (((dest & 3) << 5) << 8) | 0x7F,
+						0xD0230000 | size | dest,
+						0xDE000000 | prefix,
+						0xD0220000 | size | (dest ^ 1),
+						// Nondefault S prefix on the seed must retain its interpreter semantics.
+						0xDC0100E4, 0xD0200000 | (dest << 8),
+						0xD0210000 | size | dest,
+					};
+					FuzzState reference{}, actual{};
+					mipsr4k.UpdateCore(CPUCore::INTERPRETER);
+					RunFuzzCase(code, test.init, &reference);
+					for (CPUCore core : {CPUCore::IR_INTERPRETER, CPUCore::JIT}) {
+						mipsr4k.UpdateCore(core);
+						RunFuzzCase(code, test.init, &actual);
+						if (core == CPUCore::JIT && seed == 1 && size == 0 && dest == 0 && prefix == 0) {
+							bool compiledSeed = false, compiledRandom = false;
+							auto *cache = mipsr4k.jit->GetBlockCacheDebugInterface();
+							for (int i = 0; i < cache->GetNumBlocks(); ++i) {
+								const auto info = cache->GetBlockDebugInfo(i);
+								for (const auto &line : info.irDisasm) {
+									compiledSeed |= line.find("VfpuRngSeed") != std::string::npos;
+									compiledRandom |= line.find("VfpuRng ") != std::string::npos;
+								}
+							}
+							if (!compiledSeed || !compiledRandom) {
+								printf("VFPU RNG test did not reach the compiled RNG path.\n");
+								success = false;
+							}
+						}
+						std::string diff;
+						if (DiffFuzzStates(reference, actual, &diff) != 0 ||
+							memcmp(reference.v, actual.v, sizeof(reference.v)) != 0) {
+							printf("VFPU RNG mismatch: core=%s seed=%u size=%04x dest=%02x prefix=%03x\n%s",
+								CoreName(core), seed, size, dest, prefix, diff.c_str());
+							success = false;
+						}
+						++checked;
+					}
+				}
+			}
+		}
+	}
+	if (getenv("PPSSPP_BENCH_VRND")) {
+		const FuzzState init = GenerateFuzzCase(7, "v", {}).init;
+		std::vector<u32> code{0xDC0000E4, 0xDD0000E4, 0xDE000000};
+		for (int i = 0; i < 32; ++i) {
+			code.insert(code.end(), {0xD0200000, 0xD0220001, 0xD0220002, 0xD0220003, 0xD0220004});
+		}
+		mipsr4k.UpdateCore(CPUCore::INTERPRETER);
+		mipsr4k.UpdateCore(CPUCore::JIT);
+		FuzzState result;
+		RunFuzzCase(code, init, &result);
+		for (int round = 0; round < 3; ++round) {
+			const double blocks = CallsPerSecond([&] { RunFuzzCase(code, init, &result, true); }, 0.5, 1000);
+			printf("VFPU RNG cached benchmark round %d: %.0f instructions/s\n", round + 1, blocks * 160);
+		}
+	}
+	mipsr4k.UpdateCore(CPUCore::INTERPRETER);
+	DestroyJitHarness();
+	g_Config.bSkipDeadbeefFilling = oldSkipDeadbeef;
+	printf("VFPU RNG: %u core comparisons, register layouts, vector sizes, RCX state, prefixes and cycles.\n", checked);
+	return success;
+}
+
 bool TestCPUEquivalence() {
 	SetupJitHarness();
 	g_Config.bFastMemory = true;

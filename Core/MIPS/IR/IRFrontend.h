@@ -66,6 +66,8 @@ public:
 	void Comp_Mftv(MIPSOpcode op) override;
 	void Comp_Vmfvc(MIPSOpcode op) override;
 	void Comp_Vmtvc(MIPSOpcode op) override;
+	void Comp_Vrnds(MIPSOpcode op) override;
+	void Comp_VrndX(MIPSOpcode op) override;
 	void Comp_Vmmov(MIPSOpcode op) override;
 	void Comp_VScl(MIPSOpcode op) override;
 	void Comp_Vmmul(MIPSOpcode op) override;

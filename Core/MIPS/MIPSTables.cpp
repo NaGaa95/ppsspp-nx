@@ -601,10 +601,10 @@ static const MIPSInstruction tableVFPU4Jump[32] = // 110100 xxxxx ..... . ......
 
 static const MIPSInstruction tableVFPU7[32] = // 110100 00001 xxxxx . ....... . .......
 {
-	INSTR("vrnds", JITFUNC(Comp_Generic), Dis_Vrnds, Int_Vrnds, IN_OTHER|OUT_OTHER|IS_VFPU|OUT_EAT_PREFIX),
-	INSTR("vrndi", JITFUNC(Comp_Generic), Dis_VrndX, Int_VrndX, IN_OTHER|OUT_OTHER|IS_VFPU|OUT_EAT_PREFIX),
-	INSTR("vrndf1", JITFUNC(Comp_Generic), Dis_VrndX, Int_VrndX, IN_OTHER|OUT_OTHER|IS_VFPU|OUT_EAT_PREFIX),
-	INSTR("vrndf2", JITFUNC(Comp_Generic), Dis_VrndX, Int_VrndX, IN_OTHER|OUT_OTHER|IS_VFPU|OUT_EAT_PREFIX),
+	INSTR("vrnds", JITFUNC(Comp_Vrnds), Dis_Vrnds, Int_Vrnds, IN_OTHER|OUT_OTHER|IS_VFPU|OUT_EAT_PREFIX),
+	INSTR("vrndi", JITFUNC(Comp_VrndX), Dis_VrndX, Int_VrndX, IN_OTHER|OUT_OTHER|IS_VFPU|OUT_EAT_PREFIX),
+	INSTR("vrndf1", JITFUNC(Comp_VrndX), Dis_VrndX, Int_VrndX, IN_OTHER|OUT_OTHER|IS_VFPU|OUT_EAT_PREFIX),
+	INSTR("vrndf2", JITFUNC(Comp_VrndX), Dis_VrndX, Int_VrndX, IN_OTHER|OUT_OTHER|IS_VFPU|OUT_EAT_PREFIX),
 
 	INVALID, INVALID, INVALID, INVALID,
 	//8

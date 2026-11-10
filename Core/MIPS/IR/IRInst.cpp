@@ -187,6 +187,9 @@ static const IRMeta irMeta[] = {
 	{ IROp::Vec2Pack32To16, "Vec2Pack32To16", "F2" },
 	{ IROp::Vec2Pack31To16, "Vec2Pack31To16", "F2" },
 
+	// RNG calls change RCX0..7 even when the generated value is unused.
+	{ IROp::VfpuRngSeed, "VfpuRngSeed", "_F", IRFLAG_BARRIER },
+	{ IROp::VfpuRng, "VfpuRng", "FI", IRFLAG_BARRIER },
 	{ IROp::Interpret, "Interpret", "_C", IRFLAG_BARRIER },
 	{ IROp::Downcount, "Downcount", "_C" },
 	{ IROp::ExitToPC, "ExitToPC", "", IRFLAG_EXIT },

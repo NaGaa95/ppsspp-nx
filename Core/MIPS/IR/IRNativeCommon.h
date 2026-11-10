@@ -154,6 +154,7 @@ protected:
 	virtual void CompIR_FRound(IRInst inst) = 0;
 	virtual void CompIR_FSat(IRInst inst) = 0;
 	virtual void CompIR_FSpecial(IRInst inst) = 0;
+	virtual void CompIR_VfpuRng(IRInst inst) { CompIR_Generic(inst); }
 	virtual void CompIR_FStore(IRInst inst) = 0;
 	virtual void CompIR_Generic(IRInst inst) = 0;
 	virtual void CompIR_HiLo(IRInst inst) = 0;
