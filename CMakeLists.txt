@@ -391,7 +391,7 @@ endif()
 # naett wraps a native HTTPS implementation per platform: WinHTTP on Windows, the Java
 # APIs on Android, NSURLSession on macOS, and libcurl elsewhere.
 if(USE_LIBNX)
-	set(PPSSPP_SWITCH_RELEASE_VERSION "1.0.1" CACHE STRING "PPSSPP Switch release version")
+	set(PPSSPP_SWITCH_RELEASE_VERSION "1.1.0" CACHE STRING "PPSSPP Switch release version")
 	add_compile_definitions(PPSSPP_SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION}")
 	find_path(SWITCH_CURL_INCLUDE_DIR curl/curl.h REQUIRED)
 	find_library(SWITCH_CURL_LIBRARY NAMES curl REQUIRED)

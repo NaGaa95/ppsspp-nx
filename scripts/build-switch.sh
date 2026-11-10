@@ -71,7 +71,7 @@ done
 [[ -n "$UAM_HOST_PYTHON" ]] || { echo "Deko3D requires host Python with Mako. Install python-mako or set UAM_PYTHON." >&2; exit 1; }
 
 JOBS="${JOBS:-16}"
-SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION:-1.0.1}"
+SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION:-1.1.0}"
 
 case "$JOBS" in
 	''|*[!0-9]*) echo "JOBS must be a positive integer" >&2; exit 2 ;;
