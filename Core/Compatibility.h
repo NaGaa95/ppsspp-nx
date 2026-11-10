@@ -79,6 +79,7 @@ struct CompatFlags {
 	bool ForceMax60FPS;
 	bool GoWFramerateHack60;
 	bool FramerateHack30;
+	bool LimitFrameRateTo30;
 	bool HideISOFiles;
 	bool ForceSoftwareRenderer;
 	bool DarkStalkersPresentHack;
@@ -116,6 +117,7 @@ struct CompatFlags {
 	bool ForceEnableGPUReadback;
 	bool UseFFMPEGFindStreamInfo;
 	bool SoftwareRasterDepth;
+	bool DepthRasterNoCallbackWait;
 	bool DisableHLESceFont;
 	bool ForceHLEPsmf;
 	bool SaveStatesNotRecommended;

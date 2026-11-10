@@ -20,7 +20,6 @@
 #include "Common/UI/ScreenManager.h"
 #include "Common/UI/View.h"
 #include "UI/DeveloperSettingsPages.h"
-#include "UI/FirmwareScreen.h"
 #include "UI/RemoteISOScreen.h"
 #include "UI/RetroAchievementScreens.h"
 #include "UI/SavedataScreen.h"
@@ -66,7 +65,4 @@ void BuildToolsSettings(SettingsPage *page) {
 		host->PageScreenManager()->push(new RemoteISOScreen(host->PageGamePath()));
 	});
 #endif
-	page->Choice({ I18NCat::SYSTEM, "PSP Firmware" }).OpensScreen().OnClick([host](UI::EventParams &) {
-		host->PageScreenManager()->push(new FirmwareScreen(host->PageGamePath()));
-	});
 }

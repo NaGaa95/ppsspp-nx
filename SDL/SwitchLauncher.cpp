@@ -1263,7 +1263,7 @@ void Launcher::AchievementBrowser(Entry *entry) {
 		return std::vector<Row>{
 			{"Achievements", ">",
 			 [&](int) {
-				 auto *list = rc_client_create_achievement_list(client, RC_CLIENT_ACHIEVEMENT_CATEGORY_CORE_AND_UNOFFICIAL,
+				 auto *list = rc_client_create_achievement_list(client, RC_CLIENT_ACHIEVEMENT_CATEGORY_PROMOTED_AND_UNPROMOTED,
 																RC_CLIENT_ACHIEVEMENT_LIST_GROUPING_LOCK_STATE);
 				 std::vector<Row> rows;
 				 if (list) {

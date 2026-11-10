@@ -276,15 +276,15 @@ void ThreadManager::Init(int numRealCores, int numLogicalCoresPerCpu) {
 #if PPSSPP_PLATFORM(SWITCH)
 	numComputeThreads_ = 1;
 #else
-	numComputeThreads_ = numRealCores * numLogicalCoresPerCpu;
+	numComputeThreads_ = std::min(32, numRealCores * numLogicalCoresPerCpu);
 #endif
 	// Double it for the IO blocking threads.
-	int numThreads = numComputeThreads_ + std::max(MIN_IO_BLOCKING_THREADS, numComputeThreads_);
-	numThreads_ = numThreads;
+	const int numIOThreads = std::min(32, std::max(MIN_IO_BLOCKING_THREADS, numComputeThreads_) * 2);
+	numThreads_ = numComputeThreads_ + numIOThreads;
 
 	INFO_LOG(Log::System, "ThreadManager::Init(compute threads: %d, all: %d)", numComputeThreads_, numThreads_);
 
-	for (int i = 0; i < numThreads; i++) {
+	for (int i = 0; i < numThreads_; i++) {
 		TaskThreadContext *thread = new TaskThreadContext();
 		thread->cancelled.store(false);
 		thread->type = i < numComputeThreads_ ? TaskType::CPU_COMPUTE : TaskType::IO_BLOCKING;

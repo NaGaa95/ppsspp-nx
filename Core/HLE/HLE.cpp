@@ -46,6 +46,7 @@
 #include "Core/HLE/sceKernelModule.h"
 #include "Core/HLE/sceFont.h"
 #include "Core/FileSystems/MetaFileSystem.h"
+#include "Core/HDRemaster.h"
 #include "Core/HLE/HLE.h"
 
 enum {
@@ -132,6 +133,7 @@ static const HLEModuleMeta g_moduleMeta[] = {
 	{"sceMp3_Library", "sceMp3", DisableHLEFlags::sceMp3},
 	{"sceNetAdhocctl_Library"},
 	{"sceNetAdhocDownload_Library"},
+	{"sceNetAdhocDiscover_Library", "sceNetAdhocDiscover", DisableHLEFlags::sceNetAdhocDiscover},
 	{"sceNetAdhocMatching_Library"},
 	{"sceNetApDialogDummy_Library"},
 	{"sceNetAdhoc_Library"},
@@ -424,7 +426,11 @@ void HLECheckModuleAvailability() {
 
 	// libfont.prx/sceFont is shipped on game discs but reads its fonts from flash0:/font and has
 	// nothing to fall back on, so the fonts are required.
-	if (AlwaysDisableHLEFlags() & DisableHLEFlags::sceFont) {
+	if (g_RemasterHLEFonts) {
+		// Overrides the setting and the compat flag too.
+		g_unavailableDisableFlags |= DisableHLEFlags::sceFont;
+		INFO_LOG(Log::HLE, "This HD remaster needs the HLE sceFont and our fonts.");
+	} else if (AlwaysDisableHLEFlags() & DisableHLEFlags::sceFont) {
 		if (!NandFontsComplete()) {
 			g_unavailableDisableFlags |= DisableHLEFlags::sceFont;
 			INFO_LOG(Log::HLE, "flash0:/font doesn't have this firmware's fonts - using the HLE sceFont rather than the disc's.");

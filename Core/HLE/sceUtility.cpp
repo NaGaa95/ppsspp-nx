@@ -86,6 +86,11 @@ static const int atrac3PlusModuleDeps[] = {0x0300, 0};
 static const int mpegBaseModuleDeps[] = {0x0300, 0};
 static const int mp4ModuleDeps[] = {0x0300, 0};
 
+static u32 vshHtmlViewerWorkspaceAddr;
+static u32 vshHtmlViewerWorkspaceSize;
+
+static constexpr const char *VSH_HTMLVIEWER_WORKSPACE_TAG = "VSH htmlviewer workspace";
+
 // Loading the firmware's module for a library we've been told not to HLE.
 //
 // This is the path for a game that brings no copy of its own. One that does loads it directly and
@@ -1412,7 +1417,7 @@ static int sceUtilityGetNetParamLatestID(u32 idAddr) {
 //TODO: Implement all sceUtilityScreenshot* for real, it doesn't seem to be complex
 //but it requires more investigation
 static int sceUtilityScreenshotInitStart(u32 paramAddr) {
-	return hleReportWarning(Log::sceUtility, UtilityInitStart(UtilityDialogType::SCREENSHOT, screenshotDialog, paramAddr));
+	return hleLogInfo(Log::sceUtility, UtilityInitStart(UtilityDialogType::SCREENSHOT, screenshotDialog, paramAddr));
 }
 
 static int sceUtilityScreenshotShutdownStart() {
@@ -1634,7 +1639,14 @@ static u32 sceUtilityLoadNetModule(MIPSState *mips, u32 module) {
 		mod_list.push_back("flash0:/kd/pspnet_adhocctl.prx");
 		mod_list.push_back("flash0:/kd/pspnet_adhoc_matching.prx");
 		mod_list.push_back("flash0:/kd/pspnet_adhoc_download.prx");
-		mod_list.push_back("flash0:/kd/pspnet_adhoc_discover.prx");
+		if (GetEffectiveDisableHLEFlags() & DisableHLEFlags::sceNetAdhocDiscover) {
+			static const FirmwareModule modules[] = {
+				{ "flash0:/kd/pspnet_adhoc_discover.prx", "sceNetAdhocDiscover_Library" },
+			};
+			LoadFirmwareModules(0x10002, "sceNetAdhocDiscover", DisableHLEFlags::sceNetAdhocDiscover, modules, ARRAY_SIZE(modules));
+		} else {
+			mod_list.push_back("flash0:/kd/pspnet_adhoc_discover.prx");
+		}
 	}
 
 	for (const char *mod_path : mod_list) {
@@ -1786,6 +1798,34 @@ static u32 sceUtilityUnloadUsbModule(u32 module) {
 	return hleLogWarning(Log::sceUtility, 0, "UNIMPL");
 }
 
+static u32 VshHtmlViewerAcquireWorkspace(u32 stateAddr, u32 ownerAddr) {
+	if (!Memory::IsValidRange(stateAddr, 12))
+		return 0;
+
+	u32 workspaceAddr = Memory::ReadUnchecked_U32(stateAddr);
+	u32 workspaceSize = Memory::ReadUnchecked_U32(stateAddr + 4);
+
+	if (workspaceAddr == 0) {
+		workspaceSize =
+			Memory::g_MemorySize > 0x023FFFFF ? 0x00C00000 : 0x00800000;
+
+		workspaceAddr = userMemory.Alloc(
+			workspaceSize, false, VSH_HTMLVIEWER_WORKSPACE_TAG);
+
+		if (workspaceAddr == (u32)-1)
+			return 0;
+
+		vshHtmlViewerWorkspaceAddr = workspaceAddr;
+		vshHtmlViewerWorkspaceSize = workspaceSize;
+
+		Memory::WriteUnchecked_U32(workspaceAddr, stateAddr);
+		Memory::WriteUnchecked_U32(workspaceSize, stateAddr + 4);
+	}
+
+	Memory::WriteUnchecked_U32(ownerAddr, stateAddr + 8);
+	return workspaceAddr;
+}
+
 const HLEFunction sceUtility[] = {
 	{0X1579A159, &WrapU_U<sceUtilityLoadNetModule>,                "sceUtilityLoadNetModule",                'x', "x"  },
 	{0X64D50C56, &WrapU_U<sceUtilityUnloadNetModule>,              "sceUtilityUnloadNetModule",              'x', "x"  },
@@ -1931,6 +1971,8 @@ const HLEFunction sceUtility[] = {
 	{0xC0DE0001, &WrapI_I<UtilityFinishDialog>,                    "__UtilityFinishDialog",                  'i', "i"  },
 	{0xC0DE0002, &WrapI_I<UtilityWorkUs>,                          "__UtilityWorkUs",                        'i', "i"  },
 	{0xC0DE0003, &WrapI_I<UtilityInitDialog>,                      "__UtilityInitDialog",                    'i', "i"  },
+
+	{0xC0DE0004, &WrapU_UU<VshHtmlViewerAcquireWorkspace>,         "__VshHtmlViewerAcquireWorkspace", 'x', "xx"},
 };
 
 void Register_sceUtility()

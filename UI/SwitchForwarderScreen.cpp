@@ -140,7 +140,7 @@ public:
 		dc.Draw()->DrawImageCenterTexel(dc.GetTheme().whiteImage, bounds_.x, bounds_.y, bounds_.x2(), bounds_.y2(), 0xFF101010);
 		if (!texture_) {
 			if (failed_)
-				dc.DrawText("Preview unavailable", bounds_.centerX(), bounds_.centerY(), dc.GetTheme().infoStyle.fgColor, ALIGN_CENTER);
+				dc.DrawText(dc.GetTheme().uiFont, "Preview unavailable", bounds_.centerX(), bounds_.centerY(), dc.GetTheme().infoStyle.fgColor, ALIGN_CENTER);
 			return;
 		}
 		float x = bounds_.x;

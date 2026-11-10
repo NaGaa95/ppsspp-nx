@@ -122,6 +122,7 @@ static const IRMeta irMeta[] = {
 	{ IROp::FLog2, "FLog2", "FF" },
 	{ IROp::FHalfToFloat, "FHalfToFloat", "FFI" },
 	{ IROp::FSinCos, "FSinCos", "2F" },
+	{ IROp::FFloatToHalf2, "FFloatToHalf2", "FFF" },
 	{ IROp::FNeg, "FNeg", "FF" },
 	{ IROp::FSign, "FSign", "FF" },
 	{ IROp::FAbs, "FAbs", "FF" },
@@ -231,16 +232,6 @@ void InitIR() {
 	for (size_t i = 0; i < ARRAY_SIZE(irMeta); i++) {
 		metaIndex[(int)irMeta[i].op] = &irMeta[i];
 	}
-}
-
-void IRWriter::Write(IROp op, u8 dst, u8 src1, u8 src2, u32 constant) {
-	IRInst inst;
-	inst.op = op;
-	inst.dest = dst;
-	inst.src1 = src1;
-	inst.src2 = src2;
-	inst.constant = constant;
-	insts_.push_back(inst);
 }
 
 void IRWriter::WriteFC(IROp op, u8 dst, u8 src1, u8 src2, float fconstant) {
@@ -385,10 +376,6 @@ void DisassembleParam(char *buf, int bufSize, u8 param, char type, u32 constant)
 		snprintf(buf, bufSize, "?");
 		break;
 	}
-}
-
-const IRMeta *GetIRMeta(IROp op) {
-	return metaIndex[(int)op];
 }
 
 void DisassembleIR(char *buf, size_t bufsize, IRInst inst) {

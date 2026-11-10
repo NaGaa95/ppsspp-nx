@@ -12,7 +12,8 @@ for it:
 | Doc | When you need it |
 |---|---|
 | [docs/building.md](docs/building.md) | Build commands for every target (VS/MSBuild, CMake, UWP, legacy Android NDK, libretro), unit tests, pspautotests |
-| [docs/android-device-testing.md](docs/android-device-testing.md) | Running a build on a real Android device or a Quest over adb: installing the build you think you are, forcing activity recreates, measuring retained activities, VR |
+| [docs/android-device-testing.md](docs/android-device-testing.md) | Running a build on a real Android device or a Quest over adb: installing the build you think you are, forcing activity recreates, measuring retained activities, VR, running the C++ unit tests on a device (`Tools/android_unittest.py`), starting the app with options (`Tools/android_run.py`), and the storage tests that exercise content URIs in the app (`Tools/android_storage_test.py`) |
+| [docs/android-todo.md](docs/android-todo.md) | Known Android Java issues found in reviews and not fixed yet - check before reviewing or changing that code |
 | [docs/debugging.md](docs/debugging.md) | Driving the WebSocket debugger and PPSSPPHeadless from a script, measuring a commercial game with headless, comparing binaries' speed (`Tools/headless_bench.py`), finding a game's hot JIT blocks (`--jit-profile`), breakpoint reliability per CPU backend, debugging a game that works on hardware, finding and hashing a game function (like its own `memcpy`) for `ReplaceTables` when hardware backends miss CPU writes to VRAM |
 | [docs/DebuggerThreading.md](docs/DebuggerThreading.md) | `Core_RunOnCPUThread` / `g_frameMutex` / shutdown-lock rules - required reading before touching debugger code |
 | [docs/HLEModules.md](docs/HLEModules.md) | Adding an HLE module or function, and the seven build files a new source file goes in |
@@ -37,6 +38,7 @@ for it:
 | [docs/kernel-hle-review.md](docs/kernel-hle-review.md) | Findings from a review pass over `Core/HLE/sceKernel*.cpp`, and what was verified clean |
 | [docs/shader-compilation.md](docs/shader-compilation.md) | Shader/pipeline compile stutter: where the time goes on MoltenVK (Metal's MSL compile, not glslang), the caches involved, how game-specific shaders are, and how to measure a cold start |
 | [docs/metal-backend.md](docs/metal-backend.md) | The Metal backend: shader translation, the render manager (recording, replay, pass merging), programmable blending, how it was tested against Vulkan, and what isn't done |
+| [docs/lag-sync.md](docs/lag-sync.md) | How lag sync ("Force real clock sync") paces emulation every millisecond and falls back to bursting, and how to benchmark it on a platform (speed near the host's limit, CPU cost, sleep lateness) |
 | [docs/async-savestates.md](docs/async-savestates.md) | How savestate compression and file I/O run on a worker thread: the save/load/rewind pipelines, ordering, memory rules, what stays synchronous, and testing slots with the `game.state.*` debugger commands |
 
 ## General instructions
@@ -68,10 +70,13 @@ for it:
    the bytes instead, e.g. `python -c "d=open(F,'rb').read(); print(d.count(b'\r\n'), d.count(b'\n'))"`,
    and treat git's "LF will be replaced by CRLF the next time Git touches it" as the warning it is
    rather than autocrlf noise.
-6. **Don't feed Python to `bash -c` via a heredoc when the code needs a literal backslash in its
-   *output*.** Git Bash strips one level of escaping on the way in even with a quoted delimiter
-   (`<<'PY'`), so `"\\n"` reaches Python as `"\n"` and writes a real newline into the file - no error,
-   just a patch that quietly did nothing. Use the Edit tool, or write the script to a file and run it.
+6. **On Windows, never put a backslash in a heredoc.** Not in a search string, a replacement, a regex
+   or a bytes literal; not even with a quoted delimiter (`<<'PY'`). The Bash tool passes the command
+   to Git Bash as a `bash -c` argument, and the MSYS runtime turns every `\\` into `\` before bash
+   parses it (single quotes don't help either), so the script that runs is not the one you wrote. No
+   error, just a patch that quietly did nothing. Use the Edit tool, or Write the script to a file and
+   run `python file.py`, which is not affected. A hook in `.claude/settings.json` refuses such
+   commands. Details: [docs/patching-files.md](docs/patching-files.md).
    Details and the other two failure shapes: [docs/patching-files.md](docs/patching-files.md).
 
 7. **NEVER run more than one PSP hardware operation at a time.** There is one PSP. Every
@@ -215,6 +220,12 @@ SDL/SDLMain.cpp
 UWP/PPSSPP_UWPMain.cpp
 android/jni/app-android.cpp
 libretro/libretro.cpp
+
+**Never include `Common/GPU/Vulkan/VulkanLoader.h` directly from `UI/`.** On Linux the Vulkan headers
+bring in X11, whose definitions (`Screen` among them) break `Common/UI/Screen.h`. Windows and Android
+builds don't show it, so it only fails on CI. The same goes for including UI headers (`View.h`, `Screen.h`) in a
+file that has the Vulkan ones. Put what UI code needs in a header without Vulkan includes, like
+`Common/GPU/Vulkan/VulkanDriverVars.h`, or pass the value in from the UI side.
 
 ## Reverse-engineering the firmware
 

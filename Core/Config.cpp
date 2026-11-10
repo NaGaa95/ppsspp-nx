@@ -229,10 +229,10 @@ static int GameBrowserViewFromGridView(int legacyGridView, GameBrowserViewMode d
 	return (int)(legacyGridView ? GameBrowserViewMode::GRID : GameBrowserViewMode::LIST);
 }
 
-// Recent, Games and Homebrew switch everyone to the large list, ignoring the old setting. Remote keeps it.
-static int DefaultGameBrowserView1() { return (int)GameBrowserViewMode::LARGE_LIST; }
-static int DefaultGameBrowserView2() { return (int)GameBrowserViewMode::LARGE_LIST; }
-static int DefaultGameBrowserView3() { return (int)GameBrowserViewMode::LARGE_LIST; }
+// Recent, Games and Homebrew switch everyone to the list, ignoring the old setting. Remote keeps it.
+static int DefaultGameBrowserView1() { return (int)GameBrowserViewMode::LIST; }
+static int DefaultGameBrowserView2() { return (int)GameBrowserViewMode::LIST; }
+static int DefaultGameBrowserView3() { return (int)GameBrowserViewMode::LIST; }
 static int DefaultGameBrowserView4() { return GameBrowserViewFromGridView(g_Config.iLegacyGridView4, GameBrowserViewMode::LIST); }
 
 static float DefaultGameGridScale() {
@@ -248,7 +248,10 @@ static float DefaultUISaturation() {
 }
 
 static int DefaultUIScaleFactor() {
-#if PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(LINUX) || PPSSPP_PLATFORM(MAC)
+// Android also return true on Linux, so we check it separately first. It was never intended for it to get -1.
+#if PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(IOS)
+	return 0;
+#elif PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(LINUX) || PPSSPP_PLATFORM(MAC)
 	return -1;
 #else
 	return 0;
@@ -393,7 +396,7 @@ static constexpr ConfigSetting generalSettings[] = {
 	ConfigSetting("SteamGridDBAPIKey", SETTING(g_Config, sSteamGridDBAPIKey), "", CfgFlag::DEFAULT),
 #endif
 	ConfigSetting("ForceLagSync2", SETTING(g_Config, bForceLagSync), false, CfgFlag::PER_GAME)
-		.Label(I18NCat::SYSTEM, "Force real clock sync (slower, less lag)"),
+		.Label(I18NCat::SYSTEM, "Low-latency CPU timing"),
 	ConfigSetting("DiscordRichPresence", SETTING(g_Config, bDiscordRichPresence), false, CfgFlag::DEFAULT)
 		.Label(I18NCat::NETWORKING, "Send Discord Presence information"),
 	ConfigSetting("UISound", SETTING(g_Config, bUISound), &DefaultUISound, CfgFlag::DEFAULT)
@@ -450,6 +453,7 @@ static constexpr ConfigSetting generalSettings[] = {
 	ConfigSetting("ShowRegionOnGameIcon", SETTING(g_Config, bShowRegionOnGameIcon), false, CfgFlag::DEFAULT),
 	ConfigSetting("ShowIDOnGameIcon", SETTING(g_Config, bShowIDOnGameIcon), false, CfgFlag::DEFAULT),
 	ConfigSetting("GameGridScale", SETTING(g_Config, fGameGridScale), &DefaultGameGridScale, CfgFlag::DEFAULT),
+	ConfigSetting("GameListScale", SETTING(g_Config, fGameListScale), &DefaultGameGridScale, CfgFlag::DEFAULT),
 	ConfigSetting("GridView4", SETTING(g_Config, iLegacyGridView4), -1, &LegacyGridViewToString, &LegacyGridViewFromString, CfgFlag::DONT_SAVE),
 	// These must come after GridView*, which their defaults are taken from.
 	ConfigSetting("GameBrowserView1", SETTING(g_Config, iGameBrowserView1), &DefaultGameBrowserView1, CfgFlag::DEFAULT),
@@ -490,7 +494,7 @@ static constexpr ConfigSetting generalSettings[] = {
 	ConfigSetting("RemoteISOSharedDir", SETTING(g_Config, sRemoteISOSharedDir), "", CfgFlag::DEFAULT),
 	ConfigSetting("RemoteISOShareType", SETTING(g_Config, iRemoteISOShareType), (int)RemoteISOShareType::RECENT, CfgFlag::DEFAULT),
 	ConfigSetting("AskForExitConfirmationAfterSeconds", SETTING(g_Config, iAskForExitConfirmationAfterSeconds), 300, CfgFlag::PER_GAME)
-		.Label(I18NCat::SYSTEM, "Ask for exit confirmation after seconds").Range(0, 1200).Units("s").ZeroLabel("Off"),
+		.Label(I18NCat::SYSTEM, "Ask for exit confirmation after seconds").Range(0, 1200).Units("seconds").ZeroLabel("Off"),
 
 #if PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(IOS)
 	ConfigSetting("ScreenRotation", SETTING(g_Config, iScreenRotation), ROTATION_AUTO, CfgFlag::DEFAULT),
@@ -646,7 +650,8 @@ const char * const vulkanDefaultBlacklist[] = {
 
 static int DefaultGPUBackend() {
 	if (IsVREnabled()) {
-		return (int)GPUBackend::OPENGL;
+		// Falls back to OpenGL if the runtime can't take a Vulkan session (VulkanMayBeAvailable).
+		return (int)GPUBackend::VULKAN;
 	}
 
 #if PPSSPP_PLATFORM(UWP)
@@ -694,9 +699,6 @@ static int DefaultGPUBackend() {
 	return (int)GPUBackend::OPENGL;
 #endif
 
-#elif PPSSPP_PLATFORM(TVOS) && !defined(__LIBRETRO__)
-	// Metal hasn't been tried on tvOS yet.
-	return (int)GPUBackend::VULKAN;
 #elif PPSSPP_PLATFORM(IOS) && !defined(__LIBRETRO__)
 	return (int)GPUBackend::METAL;
 #endif
@@ -953,6 +955,7 @@ static constexpr const char *androidHwScaleNames[] = { "Native device resolution
 static constexpr const char *frameSkipNames[] = { "Off", "1", "2", "3", "4" };
 static constexpr const char *skipGPUReadbackModeNames[] = { "No", "Skip", "Copy to texture" };
 static constexpr const char *depthRasterModeNames[] = { "Auto", "Low", "Off", "Always on" };
+static constexpr const char *frameRateLimit30Names[] = { "Auto", "Always", "Off" };
 static constexpr const char *bloomHackNames[] = { "Off", "Safe", "Balanced", "Aggressive" };
 static constexpr const char *inflightFramesNames[] = { "No buffer", "Up to 1", "Up to 2" };
 static constexpr const char *texScalingTypeNames[] = { "xBRZ", "Hybrid", "Bicubic", "Hybrid + Bicubic" };
@@ -1102,6 +1105,8 @@ static constexpr ConfigSetting graphicsSettings[] = {
 		.Label(I18NCat::GRAPHICS, "Buffer graphics commands").Choices(inflightFramesNames, 1),
 	ConfigSetting("RenderDuplicateFrames", SETTING(g_Config, bRenderDuplicateFrames), false, CfgFlag::PER_GAME)
 		.Label(I18NCat::GRAPHICS, "Render duplicate frames to 60hz"),
+	ConfigSetting("LimitFrameRateTo30", SETTING(g_Config, iLimitFrameRateTo30), (int)FrameRateLimit30::AUTO, CfgFlag::PER_GAME | CfgFlag::REPORT)
+		.Label(I18NCat::GRAPHICS, "Limit framerate to 30 fps").Choices(frameRateLimit30Names),
 
 	ConfigSetting("MultiThreading", SETTING(g_Config, bRenderMultiThreading), true, CfgFlag::DEFAULT)
 		.Label(I18NCat::DEVELOPER, "Multi-threaded rendering"),
@@ -1171,14 +1176,6 @@ static int DefaultAndroidAudioApi() {
 }
 
 static constexpr const char *androidAudioApiNames[] = { "AAudio", "OpenSL ES" };
-#if PPSSPP_PLATFORM(SWITCH)
-static constexpr AudioSyncMode defaultAudioSyncMode = AudioSyncMode::GRANULAR;
-static constexpr bool defaultFillAudioGaps = false;
-#else
-static constexpr AudioSyncMode defaultAudioSyncMode = AudioSyncMode::CLASSIC_PITCH;
-static constexpr bool defaultFillAudioGaps = true;
-#endif
-
 static constexpr const char *audioPlaybackModes[] = { "Smooth (reduces artifacts)", "Classic (lowest latency)" };
 
 static constexpr ConfigSetting soundSettings[] = {
@@ -1192,9 +1189,9 @@ static constexpr ConfigSetting soundSettings[] = {
 		.Label(I18NCat::AUDIO, "Low-latency audio (MMAP)"),
 	ConfigSetting("AudioBufferSize", SETTING(g_Config, iSDLAudioBufferSize), 256, CfgFlag::DEFAULT),
 
-	ConfigSetting("FillAudioGaps", SETTING(g_Config, bFillAudioGaps), defaultFillAudioGaps, CfgFlag::DEFAULT)
+	ConfigSetting("FillAudioGaps", SETTING(g_Config, bFillAudioGaps), true, CfgFlag::DEFAULT)
 		.Label(I18NCat::AUDIO, "Fill audio gaps"),
-	ConfigSetting("AudioSyncMode", SETTING(g_Config, iAudioPlaybackMode), (int)defaultAudioSyncMode, CfgFlag::DEFAULT)
+	ConfigSetting("AudioSyncMode", SETTING(g_Config, iAudioPlaybackMode), (int)AudioSyncMode::GRANULAR, CfgFlag::DEFAULT)
 		.Label(I18NCat::AUDIO, "Playback mode").Choices(audioPlaybackModes),
 
 	// Legacy volume settings, these get auto upgraded through default handlers on the new settings. NOTE: Must be before the new ones in the order here.
@@ -1211,6 +1208,7 @@ static constexpr ConfigSetting soundSettings[] = {
 		.Label(I18NCat::AUDIO, "Reverb volume").Range(VOLUME_OFF, 2 * VOLUMEHI_FULL).Units("%").ZeroLabel("Disabled"),
 	ConfigSetting("AltSpeedRelativeVolume", SETTING(g_Config, iAltSpeedVolume), VOLUMEHI_FULL, CfgFlag::PER_GAME)
 		.Label(I18NCat::AUDIO, "Alternate speed volume").Range(VOLUME_OFF, VOLUMEHI_FULL).Units("%").ZeroLabel("Mute"),
+	ConfigSetting("ReverbFilter", SETTING(g_Config, bReverbFilter), true, CfgFlag::PER_GAME),
 	ConfigSetting("AchievementVolume", SETTING(g_Config, iAchievementVolume), &DefaultAchievementVolume, CfgFlag::PER_GAME)
 		.Label(I18NCat::AUDIO, "Achievement sound volume").Range(VOLUME_OFF, VOLUMEHI_FULL).Units("%").ZeroLabel("Mute"),
 	ConfigSetting("UIVolume", SETTING(g_Config, iUIVolume), 75, CfgFlag::DEFAULT)
@@ -1573,6 +1571,17 @@ static constexpr ConfigSetting systemParamSettings[] = {
 	ConfigSetting("XmbThemeWallpaperMode", SETTING(g_Config, iXmbThemeWallpaperMode), 0, CfgFlag::DEFAULT),
 	ConfigSetting("XmbThemeSystemColor", SETTING(g_Config, iXmbThemeSystemColor), 0, CfgFlag::DEFAULT),
 	ConfigSetting("XmbThemeCustomThemeMode", SETTING(g_Config, iXmbThemeCustomThemeMode), 0, CfgFlag::DEFAULT),
+	ConfigSetting("XmbVideoMenuLanguage", SETTING(g_Config, sXmbVideoMenuLanguage), "en", CfgFlag::DEFAULT),
+	ConfigSetting("XmbVideoAudioLanguage", SETTING(g_Config, sXmbVideoAudioLanguage), "00", CfgFlag::DEFAULT),
+	ConfigSetting("XmbVideoSubtitleLanguage", SETTING(g_Config, sXmbVideoSubtitleLanguage), "en", CfgFlag::DEFAULT),
+	ConfigSetting("XmbVideoAppendedVolume", SETTING(g_Config, iXmbVideoAppendedVolume), 0, CfgFlag::DEFAULT),
+	ConfigSetting("XmbVideoLRButtonEnable", SETTING(g_Config, bXmbVideoLRButtonEnable), true, CfgFlag::DEFAULT),
+	ConfigSetting("XmbVideoListPlayMode", SETTING(g_Config, bXmbVideoListPlayMode), true, CfgFlag::DEFAULT),
+	ConfigSetting("XmbVideoTitleDisplayMode", SETTING(g_Config, iXmbVideoTitleDisplayMode), 0, CfgFlag::DEFAULT),
+	ConfigSetting("XmbPhotoSlideshowSpeed", SETTING(g_Config, iXmbPhotoSlideshowSpeed), 1, CfgFlag::DEFAULT),
+	ConfigSetting("XmbCharsetOem", SETTING(g_Config, iXmbCharsetOem), 5, CfgFlag::DEFAULT),
+	ConfigSetting("XmbCharsetAnsi", SETTING(g_Config, iXmbCharsetAnsi), 19, CfgFlag::DEFAULT),
+	ConfigSetting("XmbLockPassword", SETTING(g_Config, sXmbLockPassword), "0000", CfgFlag::DEFAULT),
 	ConfigSetting("MemStickSize", SETTING(g_Config, iMemStickSizeGB), 16, CfgFlag::DEFAULT)
 		.Label(I18NCat::SYSTEM, "Memory Stick size").Range(1, 32).Units("GB"),
 	ConfigSetting("FuseID", SETTING(g_Config, sFuseID), "", CfgFlag::DEFAULT),

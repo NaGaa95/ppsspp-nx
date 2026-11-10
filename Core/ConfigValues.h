@@ -193,7 +193,9 @@ enum class DisableHLEFlags : int {
 	sceSfmt19937 = (1 << 14),
 	sceHeap = (1 << 15),
 	sceParseUri = (1 << 16),
-	Count = 17,
+	// Runs flash0:/kd/pspnet_adhoc_discover.prx on top of our adhocctl. For checking our HLE against.
+	sceNetAdhocDiscover = (1 << 17),
+	Count = 18,
 	// TODO: Some of the networking libraries may be interesting candidates, like HTTP.
 };
 ENUM_CLASS_BITOPS(DisableHLEFlags);
@@ -301,6 +303,12 @@ enum class DebugOverlay : int {
 	JIT_STATS,
 };
 
+enum class FrameRateLimit30 : int {
+	AUTO = 0,  // Games with the LimitFrameRateTo30 compat flag.
+	ALWAYS = 1,
+	OFF = 2,
+};
+
 // Android-only for now
 enum class DisplayFramerateMode : int {
 	DEFAULT,
@@ -322,6 +330,5 @@ enum class RemoteISOShareType : int {
 
 enum class GameBrowserViewMode : int {
 	GRID = 0,
-	LIST = 1,
-	LARGE_LIST = 2,  // XMB-style, with full size icons and the ICON1.PMF video.
+	LIST = 1,  // XMB-style, with full size icons and the ICON1.PMF video. Old configs may have 2 (the large list) here.
 };

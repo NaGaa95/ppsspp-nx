@@ -72,8 +72,6 @@ static Draw::InputLayout *CreateLayout(Draw::DrawContext *draw, const DecVtxForm
 		}
 	};
 	if (format) {
-		attr(PspAttributeLocation::W1, format->w0fmt, format->w0off);
-		attr(PspAttributeLocation::W2, format->w1fmt, format->w1off);
 		attr(PspAttributeLocation::TEXCOORD, format->uvfmt, format->uvoff);
 		attr(PspAttributeLocation::COLOR0, format->c0fmt, format->c0off);
 		attr(PspAttributeLocation::COLOR1, format->c1fmt, format->c1off);

@@ -298,7 +298,7 @@ bool ImposeArt::Parse(const std::vector<uint8_t> &file, int pspLanguage) {
 		const uint32_t w = r.U32(rec + 16);
 		const uint32_t h = r.U32(rec + 20);
 		const uint32_t offset = r.U32(rec + 24);
-		if (!r.ok || palette >= NUM_PALETTES || w == 0 || h == 0 || x + w > PSP_W || y + h > PSP_H || (w * h + 1) / 2 != size) {
+		if (!r.ok || palette >= NUM_PALETTES || w == 0 || h == 0 || w > PSP_W || x > PSP_W - w || h > PSP_H || y > PSP_H - h || (w * h + 1) / 2 != size) {
 			return false;
 		}
 		const size_t pixels = block + TEXT_RECORDS + (size_t)offset;
@@ -783,7 +783,6 @@ void ImposeHomeScreen::Draw(UIContext &dc, const Bounds &screen) {
 	// No firmware: the same screen with our font, at the firmware's positions (English layout).
 	auto di = GetI18NCategory(I18NCat::DIALOG);
 	const UI::Theme &theme = dc.GetTheme();
-	dc.SetFontStyle(theme.uiFont);
 	auto FitText = [&](std::string_view text, const Bounds &bounds, uint32_t color, int align) {
 		// Scale the font to the bitmap's height, then squeeze if the translation is longer.
 		float w, h;
@@ -794,7 +793,7 @@ void ImposeHomeScreen::Draw(UIContext &dc, const Bounds &screen) {
 		}
 		dc.SetFontScale(scale, scale);
 		const float x = (align & ALIGN_HCENTER) ? bounds.centerX() : bounds.x;
-		dc.DrawText(text, x, bounds.centerY(), color, (align & ALIGN_HCENTER) ? ALIGN_CENTER : (ALIGN_LEFT | ALIGN_VCENTER));
+		dc.DrawText(theme.uiFont, text, x, bounds.centerY(), color, (align & ALIGN_HCENTER) ? ALIGN_CENTER : (ALIGN_LEFT | ALIGN_VCENTER));
 	};
 
 	// Status bar: the clock right-aligned at the top, the battery as its level in quarters.
@@ -815,7 +814,7 @@ void ImposeHomeScreen::Draw(UIContext &dc, const Bounds &screen) {
 		dc.MeasureText(theme.uiFont, 1.0f, 1.0f, clock, &w, &h);
 		const float scale = h > 0.0f ? 15.0f * sy / h : 1.0f;
 		dc.SetFontScale(scale, scale);
-		dc.DrawText(clock, screen.x + (clockRight - 6.0f) * sx, screen.y + 12.5f * sy, 0xFFFFFFFF, ALIGN_RIGHT | ALIGN_VCENTER);
+		dc.DrawText(theme.uiFont, clock, screen.x + (clockRight - 6.0f) * sx, screen.y + 12.5f * sy, 0xFFFFFFFF, ALIGN_RIGHT | ALIGN_VCENTER);
 	}
 
 	// The lines above and below the question.

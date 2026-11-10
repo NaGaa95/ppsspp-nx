@@ -57,4 +57,6 @@ private:
 	bool glslangInitialized_ = false;
 	int offscreenWidth_ = 0;
 	int offscreenHeight_ = 0;
+	// Presenting to an OpenXR swapchain instead of the window.
+	bool vr_ = false;
 };

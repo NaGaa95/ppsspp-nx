@@ -66,10 +66,9 @@ public:
 	}
 	void Draw(UIContext &dc) override {
 		const auto b = GetBounds();
-		dc.SetFontStyle(dc.GetTheme().uiFontSmall);
 		const bool active = SwitchLSFG_IsEnabled();
 		dc.Draw()->DrawImageStretch(ImageID("I_LSFG_LOGO"), b.x, b.centerY() - 14, b.x + 28, b.centerY() + 14, 0xFFFFFFFF);
-		dc.DrawText(GetI18NCategory(I18NCat::DIALOG)->T(active ? "On" : "Off"), b.x + 36, b.centerY(), StatusColor(active), ALIGN_VCENTER);
+		dc.DrawText(dc.GetTheme().uiFontSmall, GetI18NCategory(I18NCat::DIALOG)->T(active ? "On" : "Off"), b.x + 36, b.centerY(), StatusColor(active), ALIGN_VCENTER);
 	}
 };
 
@@ -122,14 +121,13 @@ public:
 			const float scale = std::min(114.f / logoWidth, 20.f / logoHeight);
 			dc.Draw()->DrawImage(ImageID("I_LOGO"), bounds.x + 6, bounds.centerY(), scale, TEXT, ALIGN_LEFT | ALIGN_VCENTER);
 		}
-		dc.SetFontStyle(dc.GetTheme().uiFontSmall);
 		auto di = GetI18NCategory(I18NCat::DIALOG);
 		float x = bounds.x2() - 12;
 		auto hint = [&](ImageID image, std::string_view key, std::string_view caption) {
 			float tw, th;
 			dc.MeasureText(dc.GetTheme().uiFontSmall, 1.f, 1.f, caption, &tw, &th);
 			x -= tw;
-			dc.DrawText(caption, x, bounds.centerY(), DIM, ALIGN_VCENTER);
+			dc.DrawText(dc.GetTheme().uiFontSmall, caption, x, bounds.centerY(), DIM, ALIGN_VCENTER);
 			x -= 44;
 			dc.Draw()->DrawRoundRect(Bounds(x, bounds.centerY() - 15, 34, 30), 6, PANEL);
 			if (image.isValid()) {
@@ -141,7 +139,7 @@ public:
 				dc.FillRect(UI::Drawable(TEXT), Bounds(x + 14, bounds.centerY() - 9, 6, 18));
 				dc.FillRect(UI::Drawable(TEXT), Bounds(x + 8, bounds.centerY() - 3, 18, 6));
 			} else {
-				dc.DrawText(key, x + 17, bounds.centerY(), TEXT, ALIGN_CENTER);
+				dc.DrawText(dc.GetTheme().uiFontSmall, key, x + 17, bounds.centerY(), TEXT, ALIGN_CENTER);
 			}
 			x -= 22;
 		};

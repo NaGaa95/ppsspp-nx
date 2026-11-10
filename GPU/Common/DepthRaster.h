@@ -60,6 +60,7 @@ struct DepthDraw {
 // So, we can be quite inaccurate without any issues, and skip a lot of functionality.
 
 class VertexDecoder;
+struct DecVtxFormat;
 struct TransformedVertex;
 
 // maxOutCount is the capacity of each of tx/ty/tz, in elements. With columnCull, triangles outside its X range
@@ -69,7 +70,7 @@ int DepthRasterClipIndexedRectangles(int *tx, int *ty, float *tz, const float *t
 // Projects and culls a draw for rasterizing the columns of its scissor (from DepthScissor::Tile, or all of it).
 int DepthRasterClip(int *tx, int *ty, float *tz, const float *transformed, const uint16_t *indexBuffer, const DepthDraw &draw, const DepthScissor columns, int maxOutCount, bool updateStats);
 void DecodeAndTransformForDepthRaster(float *dest, const float *worldviewproj, const void *vertexData, int indexLowerBound, int indexUpperBound, const VertexDecoder *dec, u32 vertTypeID);
-void TransformPredecodedForDepthRaster(float *dest, const float *worldviewproj, const void *decodedVertexData, const VertexDecoder *dec, int count);
+void TransformPredecodedForDepthRaster(float *dest, const float *worldviewproj, const void *decodedVertexData, const DecVtxFormat &fmt, int count);
 void ConvertPredecodedThroughForDepthRaster(float *dest, const void *decodedVertexData, const VertexDecoder *dec, int count);
 // With columns (from scissor.Tile()), only those are written, with the same result as rasterizing the whole scissor.
 void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, const int *ty, const float *tz, int count, const DepthDraw &draw, const DepthScissor scissor, bool lowQ, bool updateStats = true, bool skipEmptyBlocks = true, const DepthScissor *columns = nullptr);

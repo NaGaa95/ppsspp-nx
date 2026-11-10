@@ -844,7 +844,7 @@ static u32 sceIoAssign(u32 alias_addr, u32 physical_addr, u32 filesystem_addr, i
 			perm = "unhandled";
 			break;
 	}
-	WARN_LOG_REPORT(Log::sceIo, "sceIoAssign(%s, %s, %s, %s, %08x, %i)", alias.c_str(), physical_dev.c_str(), filesystem_dev.c_str(), perm.c_str(), arg_addr, argSize);
+	INFO_LOG(Log::sceIo, "sceIoAssign(%s, %s, %s, %s, %08x, %i)", alias.c_str(), physical_dev.c_str(), filesystem_dev.c_str(), perm.c_str(), arg_addr, argSize);
 	return 0;
 }
 
@@ -1049,8 +1049,13 @@ static u32 npdrmRead(FileNode *f, u8 *data, int size) {
 	block  = pgd->file_offset/pgd->block_size;
 	offset = pgd->file_offset%pgd->block_size;
 
-	if (size > (int)pgd->data_size)
-		size = (int)pgd->data_size;
+	// Unsigned: data_size comes from the (forgeable) header, and a value over 2^31 turned the
+	// clamp into a huge read. Only what's left of the file can be read, too.
+	const u32 available = pgd->file_offset < pgd->data_size ? pgd->data_size - pgd->file_offset : 0;
+	if (size < 0)
+		size = 0;
+	if ((u32)size > available)
+		size = (int)available;
 	remain_size = size;
 
 	KirkState *kirk = __ChnnlsvKirkState();
@@ -1141,6 +1146,11 @@ static bool __IoRead(int &result, int id, u32 data_addr, int size, int &us) {
 			NotifyMemInfo(MemBlockFlags::WRITE, data_addr, size, tag.c_str(), tag.size());
 			u8 *data = (u8 *)Memory::GetPointerUnchecked(data_addr);
 			u32 validSize = Memory::ClampValidSizeAt(data_addr, size);
+			// Block devices count the size in sectors, so clamp what that many sectors cover.
+			if ((pspFileSystem.DevType(f->handle) & PSPDevType::BLOCK) != 0) {
+				const u32 bytes = (u32)std::min<u64>((u64)size * 2048, 0xFFFFFFFF);
+				validSize = Memory::ClampValidSizeAt(data_addr, bytes) / 2048;
+			}
 			if (f->npdrm) {
 				result = npdrmRead(f, data, validSize);
 				currentMIPS->InvalidateICacheRangeDeferred(data_addr, validSize);
@@ -1773,6 +1783,16 @@ static u32 IoOpenFatSearch(u32 argAddr, int argLen);
 static u32 IoGetstatFatComponentPath(u32 argAddr, int argLen);
 static u32 IoOpenFatComponentPath(u32 argAddr, int argLen);
 
+// Devctl 0x02425856: sets the code page for 8.3 names. From fatms.prx (6.61), which passes the
+// word to sceCodepage_driver_b0ae63aa. The XMB sets it at boot and from System Settings >
+// Character Set. We keep host file names, so there's nothing to do.
+static u32 IoSetFatCodepage(u32 argAddr, int argLen) {
+	if (!Memory::IsValid4AlignedAddress(argAddr) || argLen != 4) {
+		return hleLogError(Log::sceIo, SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT);
+	}
+	return hleLogDebug(Log::sceIo, 0, "set code page %d", Memory::ReadUnchecked_U32(argAddr));
+}
+
 static u32 sceIoDevctl(const char *name, int cmd, u32 argAddr, int argLen, u32 outPtr, int outLen) {
 	if (strcmp(name, "emulator:")) {
 		DEBUG_LOG(Log::sceIo,"sceIoDevctl(\"%s\", %08x, %08x, %i, %08x, %i)", name, cmd, argAddr, argLen, outPtr, outLen);
@@ -2027,8 +2047,7 @@ static u32 sceIoDevctl(const char *name, int cmd, u32 argAddr, int argLen, u32 o
 			}
 			break;
 		case 0x02425856:
-			// Used by VSH, no clue what it should do. Let's just return 0.
-			return hleLogError(Log::sceIo, 0, "Unknown memstick devctl: %08x", cmd);
+			return IoSetFatCodepage(argAddr, argLen);
 		case 0x02415864:
 			// Directory search, used by the VSH media browsers before 3.80.
 			return IoOpenFatSearch(argAddr, argLen);
@@ -2064,6 +2083,8 @@ static u32 sceIoDevctl(const char *name, int cmd, u32 argAddr, int argLen, u32 o
 	if (!strcmp(name, "fatms0:"))
 	{
 		switch (cmd) {
+		case 0x02425856:
+			return IoSetFatCodepage(argAddr, argLen);
 		case 0x0240d81e:
 			// TODO: Invalidate MS driver file table cache (nop)
 			break;
@@ -2751,21 +2772,23 @@ static u32 sceIoDread(MIPSState *mips, int id, u32 dirent_addr) {
 			// write d_private for supporting Custom BGM
 			// ref JPCSP https://code.google.com/p/jpcsp/source/detail?r=3468
 			if (Memory::IsValidAddress(entry->d_private)){
+				// What's written depends on the layout, so check each one's whole range below.
 				if (sceKernelGetCompiledSdkVersion() <= 0x0307FFFF){
 					// d_private is pointing to an area of unknown size
 					// - [0..12] "8.3" file name (null-terminated), could be empty.
 					// - [13..???] long file name (null-terminated)
-
-					strcpy_limit((char*)Memory::GetPointerUnchecked(entry->d_private), shortName.c_str(), 13);
-					strcpy_limit((char*)Memory::GetPointerUnchecked(entry->d_private + 13), (const char*)entry->d_name, ARRAY_SIZE(entry->d_name));
+					if (Memory::IsValidRange(entry->d_private, 13 + (u32)ARRAY_SIZE(entry->d_name))) {
+						strcpy_limit((char*)Memory::GetPointerUnchecked(entry->d_private), shortName.c_str(), 13);
+						strcpy_limit((char*)Memory::GetPointerUnchecked(entry->d_private + 13), (const char*)entry->d_name, ARRAY_SIZE(entry->d_name));
+					}
 				}
 				else {
 					// d_private is pointing to an area of total size 1044
 					// - [0..3] size of area
 					// - [4..19] "8.3" file name (null-terminated), could be empty.
 					// - [20..???] long file name (null-terminated)
-					auto size = Memory::ReadUnchecked_U32(entry->d_private);
-					if (size >= 1044) {
+					auto size = Memory::IsValidRange(entry->d_private, 4) ? Memory::ReadUnchecked_U32(entry->d_private) : 0;
+					if (size >= 1044 && Memory::IsValidRange(entry->d_private, 1044)) {
 						strcpy_limit((char*)Memory::GetPointerUnchecked(entry->d_private + 4), shortName.c_str(), 16);
 						strcpy_limit((char*)Memory::GetPointerUnchecked(entry->d_private + 20), (const char*)entry->d_name, ARRAY_SIZE(entry->d_name));
 					}
@@ -3083,7 +3106,7 @@ int __IoIoctl(u32 id, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 out
 		u8 pgd_header[0x90]{};
 		u8 pgd_magic[4] = {0x00, 0x50, 0x47, 0x44};
 
-		if (Memory::IsValidAddress(indataPtr) && inlen == 16) {
+		if (Memory::IsValidRange(indataPtr, 16) && inlen == 16) {
 			memcpy(keybuf, Memory::GetPointerUnchecked(indataPtr), 16);
 			key_ptr = keybuf;
 		}else{
@@ -3094,6 +3117,11 @@ int __IoIoctl(u32 id, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 out
 		pspFileSystem.SeekFile(f->handle, (s32)f->pgd_offset, FILEMOVE_BEGIN);
 		pspFileSystem.ReadFile(f->handle, pgd_header, 0x90);
 		KirkState *kirk = __ChnnlsvKirkState();
+		// Calling this again would otherwise leak the previous one.
+		if (f->pgdInfo) {
+			pgd_close(f->pgdInfo);
+			f->pgdInfo = nullptr;
+		}
 		f->pgdInfo = pgd_open(kirk, pgd_header, 2, key_ptr);
 		if (!f->pgdInfo) {
 			f->npdrm = false;
@@ -3276,7 +3304,8 @@ int __IoIoctl(u32 id, u32 cmd, u32 indataPtr, u32 inlen, u32 outdataPtr, u32 out
 		//if (GetIOTimingMethod() == IOTIMING_REALISTIC) // Need a check for io timing method?
 		usec += 15000;// Fantasy Golf Pangya Portable(KS) needs a delay over 15000us.
 
-		if (Memory::IsValidAddress(indataPtr) && inlen >= 4) {
+		// The whole struct is read, whatever inlen says.
+		if (Memory::IsValidRange(indataPtr, 16) && inlen >= 4) {
 			struct SeekInfo {
 				u64_le offset;
 				u32_le unk;

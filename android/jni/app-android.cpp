@@ -61,6 +61,7 @@ struct JNIEnv {};
 #define JNI_VERSION_1_6 16
 #endif
 
+#include "Common/Data/Text/I18n.h"
 #include "Common/Log.h"
 #include "Common/LogReporting.h"
 
@@ -173,6 +174,10 @@ static float g_safeInsetLeft = 0.0;
 static float g_safeInsetRight = 0.0;
 static float g_safeInsetTop = 0.0;
 static float g_safeInsetBottom = 0.0;
+static float g_navBarInsetLeft = 0.0;
+static float g_navBarInsetRight = 0.0;
+static float g_navBarInsetTop = 0.0;
+static float g_navBarInsetBottom = 0.0;
 static bool g_hasCameraCutout = false;
 static bool g_hasAccelerometer = false;
 static bool g_hasGyro = false;
@@ -400,6 +405,14 @@ float System_GetPropertyFloat(SystemProperty prop) {
 		return g_safeInsetTop * display_scale_y * g_display.dpi_scale_y;
 	case SYSPROP_DISPLAY_SAFE_INSET_BOTTOM:
 		return g_safeInsetBottom * display_scale_y * g_display.dpi_scale_y;
+	case SYSPROP_DISPLAY_NAVBAR_INSET_LEFT:
+		return g_navBarInsetLeft * display_scale_x * g_display.dpi_scale_x;
+	case SYSPROP_DISPLAY_NAVBAR_INSET_RIGHT:
+		return g_navBarInsetRight * display_scale_x * g_display.dpi_scale_x;
+	case SYSPROP_DISPLAY_NAVBAR_INSET_TOP:
+		return g_navBarInsetTop * display_scale_y * g_display.dpi_scale_y;
+	case SYSPROP_DISPLAY_NAVBAR_INSET_BOTTOM:
+		return g_navBarInsetBottom * display_scale_y * g_display.dpi_scale_y;
 	default:
 		return -1;
 	}
@@ -793,6 +806,14 @@ extern "C" void Java_org_ppsspp_ppsspp_NativeApp_init
 
 	bFirstResume = true;
 
+	// Before the graphics context: Vulkan has to know what OpenXR needs from its instance and device,
+	// and VulkanMayBeAvailable whether the runtime takes a Vulkan session at all.
+	if (IsVREnabled()) {
+		Version gitVer(PPSSPP_GIT_VERSION);
+		InitVROnAndroid(gJvm, ppssppActivity, systemName.c_str(), gitVer.ToInteger(), "PPSSPP");
+		SetVRCallbacks(NativeAxis, NativeKey, NativeTouch);
+	}
+
 	// In debug mode, don't allow creating software Vulkan devices (reject by VulkanMaybeAvailable).
 	// Needed for #16931.
 #ifdef NDEBUG
@@ -819,10 +840,15 @@ retry:
 		GraphicsContext *ctx = new VulkanGraphicsContext();
 		std::string errorMessage;
 		if (!ctx->InitAPI(nullptr, &g_Config.sVulkanDevice, &errorMessage)) {
+			delete ctx;
+			// Only fall back to OpenGL when the system's driver doesn't work either.
+			if (VulkanDisableCustomDriver()) {
+				ERROR_LOG(Log::System, "Failed to initialize Vulkan with a custom driver, retrying with the system's: %s", errorMessage.c_str());
+				goto retry;
+			}
 			ERROR_LOG(Log::System, "Failed to initialize Vulkan, switching to OpenGL: %s", errorMessage.c_str());
 			g_Config.iGPUBackend = (int)GPUBackend::OPENGL;
 			SetGPUBackend(GPUBackend::OPENGL);
-			delete ctx;
 			goto retry;
 		}
 		((VulkanContext *)ctx->GetAPIContext())->SetCbGetDrawSize([]() {
@@ -839,10 +865,12 @@ retry:
 		goto retry;
 	}
 
-	if (IsVREnabled()) {
-		Version gitVer(PPSSPP_GIT_VERSION);
-		InitVROnAndroid(gJvm, ppssppActivity, systemName.c_str(), gitVer.ToInteger(), "PPSSPP");
-		SetVRCallbacks(NativeAxis, NativeKey, NativeTouch);
+	// Here rather than where the driver failed, which can be before the translations are loaded.
+	const std::string failedDriver = VulkanTakeFailedCustomDriver();
+	if (!failedDriver.empty()) {
+		auto gr = GetI18NCategory(I18NCat::GRAPHICS);
+		g_OSD.Show(OSDType::MESSAGE_ERROR, gr->T("The custom Vulkan driver failed to load. Switching back to default."), failedDriver, 10.0f);
+		g_Config.Save("CustomDriverFailed");
 	}
 }
 
@@ -941,6 +969,11 @@ extern "C" void Java_org_ppsspp_ppsspp_NativeApp_shutdown(JNIEnv *, jclass) {
 			renderer_inited = false;
 		} else {
 			INFO_LOG(Log::G3D, "Not shutting down renderer - not initialized");
+		}
+
+		// The instance belongs to this activity. A restart (recreate) creates a new one in this process.
+		if (IsVREnabled()) {
+			ShutdownVR();
 		}
 
 		NativeShutdown();
@@ -1397,9 +1430,11 @@ extern "C" jboolean Java_org_ppsspp_ppsspp_NativeApp_mouseWheelEvent(
 	if (!renderer_inited)
 		return false;
 	// TODO: Mousewheel should probably be an axis instead.
-	int wheelDelta = y * 30.0f;
-	if (wheelDelta > 500) wheelDelta = 500;
-	if (wheelDelta < -500) wheelDelta = -500;
+	// AXIS_VSCROLL is in notches.
+	const int maxDelta = 16 * WHEEL_DELTA_PER_NOTCH;
+	int wheelDelta = y * (float)WHEEL_DELTA_PER_NOTCH;
+	if (wheelDelta > maxDelta) wheelDelta = maxDelta;
+	if (wheelDelta < -maxDelta) wheelDelta = -maxDelta;
 
 	KeyInput key;
 	key.deviceId = DEVICE_ID_MOUSE;
@@ -1457,13 +1492,17 @@ extern "C" void JNICALL Java_org_ppsspp_ppsspp_NativeApp_sendMessageFromJava(JNI
 	} else if (msg == "safe_insets") {
 		// INFO_LOG(Log::System, "Got insets: %s", prm.c_str());
 		// We don't bother with supporting exact rectangular regions. Safe insets are good enough.
-		int left, right, top, bottom, cutout;
-		if (5 == sscanf(prm.c_str(), "%d:%d:%d:%d:%d", &left, &right, &top, &bottom, &cutout)) {
+		int left, right, top, bottom, cutout, navLeft, navRight, navTop, navBottom;
+		if (9 == sscanf(prm.c_str(), "%d:%d:%d:%d:%d:%d:%d:%d:%d", &left, &right, &top, &bottom, &cutout, &navLeft, &navRight, &navTop, &navBottom)) {
 			g_safeInsetLeft = (float)left;
 			g_safeInsetRight = (float)right;
 			g_safeInsetTop = (float)top;
 			g_safeInsetBottom = (float)bottom;
 			g_hasCameraCutout = cutout != 0;
+			g_navBarInsetLeft = (float)navLeft;
+			g_navBarInsetRight = (float)navRight;
+			g_navBarInsetTop = (float)navTop;
+			g_navBarInsetBottom = (float)navBottom;
 		}
 	} else if (msg == "sensors") {
 		int accelerometer, gyro;

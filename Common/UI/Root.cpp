@@ -24,6 +24,7 @@ bool focusForced;
 static bool scrollFocusedIntoView;
 
 static std::function<void(UISound)> soundCallback;
+static std::function<void(View *)> disabledActivationCallback;
 
 // Repeat key handling below.
 // TODO: Figure out where this should really live.
@@ -235,6 +236,16 @@ static void MoveFocus(ViewGroup *root, FocusMove direction) {
 
 void SetSoundCallback(std::function<void(UISound)> func) {
 	soundCallback = func;
+}
+
+void SetDisabledActivationCallback(std::function<void(View *)> func) {
+	disabledActivationCallback = func;
+}
+
+void NotifyDisabledActivation(View *view) {
+	if (disabledActivationCallback) {
+		disabledActivationCallback(view);
+	}
 }
 
 void PlayUISound(UISound sound) {

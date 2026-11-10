@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "Core/Config.h"
+#include "Core/ConfigValues.h"
 #include "Core/CmdLine.h"
 #include "Core/WebServer.h"
 #include "Core/Util/PathUtil.h"
@@ -216,7 +217,7 @@ const char *g_ExceptionActionValues[] = {
 static const CommandLineParam g_autoParams[] = {
 	{POFF(fullscreen), CmdParamType::Bool, "fullscreen", '\0', "Force full screen mode", CmdLineMode::Application},
 	{POFF(fullscreen), CmdParamType::BoolInverse, "windowed", '\0', "Force windowed mode", CmdLineMode::Application},
-	{POFF(startScreen), CmdParamType::String, "start-screen", '\0', "Start on a specific screen (e.g. 'gamesettings', 'touchscreentest', 'firmware')", CmdLineMode::Application},
+	{POFF(startScreen), CmdParamType::String, "start-screen", '\0', "Start on a specific screen (e.g. 'gamesettings', 'touchscreentest', 'colortest', 'firmware', 'memstick', 'storagetest')", CmdLineMode::Application},
 	{POFF(escapeExit), CmdParamType::Bool, "escape-exit", '\0', "Escape key exits the application", CmdLineMode::Application},
 	{POFF(gameWindow), CmdParamType::Bool, "game-window", '\0', "Show the game in a second window, for testing multiple outputs (Vulkan, or Metal on Mac)", CmdLineMode::Application},
 	{POFF(pauseMenuExit), CmdParamType::Bool, "pause-menu-exit", '\0', "Exit the application when the game ends, instead of returning to the menu", CmdLineMode::Application},
@@ -230,6 +231,7 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(bench), CmdParamType::Bool, "bench", 'b', "Enable benchmark mode", CmdLineMode::Headless},
 	{POFF(oldAtrac), CmdParamType::Bool, "old-atrac", '\0', "Use old ATRAC decoder"},
 	{POFF(jitProfile), CmdParamType::String, "jit-profile", '\0', "Profile the CPU core and write its hottest blocks to FILE on exit"},
+	{POFF(jitBench), CmdParamType::Int, "jit-bench", '\0', "After N flips, recompile every block in the JIT cache a few times and log how long it took"},
 	{POFF(memStickInserted), CmdParamType::BoolInverse, "no-memstick", '\0', "Run with the memory stick removed"},
 	{POFF(log), CmdParamType::String, "log", '\0', "Output log to FILE", CmdLineMode::Application},
 	{POFF(enableLogging), CmdParamType::Bool, "log", '\0', "Full log output, not just emulated printfs", CmdLineMode::Headless},
@@ -267,6 +269,8 @@ static const CommandLineParam g_autoParams[] = {
 	{POFF(adhocLossPercent), CmdParamType::Int, "adhoc-loss", '\0', "Drop this percentage of the ad hoc datagrams received"},
 	{POFF(lagSync), CmdParamType::Bool, "lag-sync", '\0', "Keep emulated time in step with the wall clock every millisecond, not every frame (the Force real clock sync setting)"},
 	{POFF(frameStats), CmdParamType::Bool, "frame-stats", '\0', "Print flips per emulated second at the end of the run, counted from --state's load", CmdLineMode::Headless},
+	{POFF(audioSinkPeriod), CmdParamType::Int, "audio-sink", '\0', "Pull audio like an output device, FRAMES at 48 kHz at a time, and print the buffer's stats at the end (with --realtime)", CmdLineMode::Headless},
+	{POFF(audioGranular), CmdParamType::Bool, "audio-granular", '\0', "Mix audio with the granular mixer instead of the classic resampler (the Audio sync mode setting)"},
 	{POFF(maxScreenshotError), CmdParamType::Double, "max-mse", '\0', "Maximum allowed MSE error for screenshot comparison", CmdLineMode::Headless},
 	{POFF(mountIso), CmdParamType::String, "mount", 'm', "Mount ISO/CSO on umd1: when booting an ELF/PBP or --vsh"},
 	{POFF(unpackUpdater), CmdParamType::String, "unpack-updater", '\0', "Unpack the firmware in an updater EBOOT.PBP into DIR and exit", CmdLineMode::Headless},
@@ -563,6 +567,17 @@ CommandLineParseResult CommandLineOptions::Parse(int argc, const char *argv[], C
 			}
 		} else if (startsWith(argv[i], "--")) {
 			PRINT_STDERR("Error: Unknown parameter: %s\n", argv[i]);
+			if (mode == CmdLineMode::Application) {
+				// Ignore bad parameters - but inform the user in the Windows debug output at least.
+				OutputDebugStringUTF8("Warning: Unknown parameter: ");
+				OutputDebugStringUTF8(argv[i]);
+				OutputDebugStringUTF8("\n");
+
+				std::string msg = StringFromFormat("Unknown command line parameter: %s\n\nProceeding anyway.", argv[i]);
+				ShowMessageDialog("Unknown Parameter", msg.c_str(), true);
+
+				return CommandLineParseResult::Continue;
+			}
 			return CommandLineParseResult::Error;
 		}
 		// To the next argument.
@@ -608,6 +623,10 @@ void CommandLineOptions::ApplyToConfig() const {
 		g_Config.bForceLagSync = lagSync.value();
 		g_Config.DoNotSaveSetting(&g_Config.bForceLagSync);
 	}
+	if (audioGranular.has_value()) {
+		g_Config.iAudioPlaybackMode = (int)(audioGranular.value() ? AudioSyncMode::GRANULAR : AudioSyncMode::CLASSIC_PITCH);
+		g_Config.DoNotSaveSetting(&g_Config.iAudioPlaybackMode);
+	}
 	if (fuseId.has_value()) {
 		g_Config.sFuseID = fuseId.value();
 		g_Config.DoNotSaveSetting(&g_Config.sFuseID);
@@ -622,6 +641,7 @@ void CommandLineOptions::ApplyToConfig() const {
 	}
 	if (cpuCore.has_value()) {
 		g_Config.iCpuCore = (int)cpuCore.value();
+		g_Config.DoNotSaveSetting(&g_Config.iCpuCore);
 	}
 	if (hardwareTransform.has_value()) {
 		g_Config.bHardwareTransform = hardwareTransform.value();
@@ -712,6 +732,9 @@ void CommandLineOptions::ApplyToConfig() const {
 	}
 	if (jitProfile.has_value()) {
 		g_Config.sJitProfileFile = jitProfile.value();
+	}
+	if (jitBench.has_value()) {
+		g_Config.iJitBenchFlip = jitBench.value();
 	}
 
 	if (root.has_value()) {

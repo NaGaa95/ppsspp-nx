@@ -42,6 +42,9 @@ typedef Memory::Opcode MIPSOpcode;
 // 26, which the Allegrex doesn't have, decodes it as CallRepl.
 #define MIPS_CALL_REPLACEMENT_OP 0x6A000000
 #define MIPS_REPLACEMENT_INDEX_MASK 0x00FFFFFF
+// Another (BranchPair): the IR frontend's way to run a branch with a branch or jump in its delay
+// slot, which it leaves to the interpreter. Also never in memory.
+#define MIPS_BRANCH_PAIR_OP 0x69000000
 
 enum MIPSGPReg {
 	MIPS_REG_ZERO=0,
@@ -314,6 +317,8 @@ public:
 	// Actual clearing is deferred until execution begins again.
 	void InvalidateICacheRangeDeferred(u32 address, u32	length);
 	void ClearJitCacheDeferred();
+	// Times recompiling the whole JIT cache, when execution begins again (--jit-bench).
+	void BenchmarkJitDeferred();
 
 	void ProcessPendingInvalidates();
 
@@ -321,6 +326,7 @@ public:
 	// Doesn't need save stating.
 	std::vector<PendingCacheOperation> pendingInvalidates_;
 	bool invalidateAll_ = false;
+	bool benchmarkJit_ = false;
 	std::vector<std::pair<u32, u32>> keepJitBlocks_;
 
 	// Owned. Null on the interpreter.

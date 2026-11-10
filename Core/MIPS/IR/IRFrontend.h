@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Common/CommonTypes.h"
+#include "Common/TimeUtil.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/MIPS/JitCommon/JitState.h"
 #include "Core/MIPS/MIPSVFPUUtils.h"
@@ -94,6 +95,8 @@ public:
 	void Comp_Vocp(MIPSOpcode op) override;
 	void Comp_ColorConv(MIPSOpcode op) override;
 	void Comp_Vbfy(MIPSOpcode op) override;
+	void Comp_Vsrt(MIPSOpcode op) override;
+	void Comp_Vf2h(MIPSOpcode op) override;
 
 	int Replace_fabsf() override;
 	// Returns true if a loaded state means blocks compiled before it can't run any more.
@@ -102,6 +105,11 @@ public:
 	bool CheckRounding(u32 blockAddress);  // returns true if we need a do-over
 
 	void DoJit(u32 em_address, std::vector<IRInst> &instructions, u32 &mipsBytes);
+	// How long the last DoJit spent making the IR, and running the passes over it, and when it ended.
+	int64_t LastFrontendNanos() const { return lastFrontendNanos_; }
+	int64_t LastPassNanos() const { return lastPassNanos_; }
+	// In time_now_fast_ticks() units.
+	uint64_t LastEnd() const { return lastEnd_; }
 
 	void EatPrefix() override {
 		js.EatPrefix();
@@ -140,6 +148,7 @@ private:
 	void BranchRSZeroComp(MIPSOpcode op, IRComparison cc, bool andLink, bool likely);
 	void BranchRSRTComp(MIPSOpcode op, IRComparison cc, bool likely);
 	bool CanContinuePastBranch(const BranchInfo &branchInfo, bool constantOperands);
+	bool CompileBranchPair(MIPSOpcode op);
 
 	// Utilities to reduce duplicated code
 	void CompShiftImm(MIPSOpcode op, IROp shiftType, int sa);
@@ -175,10 +184,16 @@ private:
 	// State
 	JitState js;
 	IRWriter ir;
+	// The IR after the passes. A member to keep its capacity.
+	IRWriter simplified_;
 	IROptions opts{};
 
 	int dontLogBlocks = 0;
 	int logBlocks = 0;
+
+	int64_t lastFrontendNanos_ = 0;
+	int64_t lastPassNanos_ = 0;
+	uint64_t lastEnd_ = 0;
 
 private:
 	bool IsMediaEngine() const;

@@ -552,7 +552,7 @@ void MIPSState::InvalidateICacheRangeImmediate(u32 address, u32 length) {
 		me->InvalidateICacheRangeDeferred(address, length);
 	}
 	if (!IsMediaEngine()) {
-		Replacement_CheckRange(address, length);
+		RemoveModifiedReplacementsInRange(address, length);
 	}
 	if (!jit) {
 		// Nothing to do.
@@ -573,7 +573,7 @@ void MIPSState::ProcessPendingInvalidates() {
 		pending.swap(pendingInvalidates_);
 		for (const auto &p : pending) {
 			if (!IsMediaEngine())
-				Replacement_CheckRange(p.addr, p.size);
+				RemoveModifiedReplacementsInRange(p.addr, p.size);
 			if (jit && !all) {
 				jit->InvalidateCacheAt(p.addr, p.size);
 			}
@@ -581,6 +581,18 @@ void MIPSState::ProcessPendingInvalidates() {
 		if (jit && all) {
 			jit->ClearCache();
 		}
+	}
+	if (benchmarkJit_) {
+		benchmarkJit_ = false;
+		if (jit)
+			jit->BenchmarkCompile();
+	}
+}
+
+void MIPSState::BenchmarkJitDeferred() {
+	benchmarkJit_ = true;
+	if (jit && !IsMediaEngine()) {
+		Core_ReenterDispatcher();
 	}
 }
 

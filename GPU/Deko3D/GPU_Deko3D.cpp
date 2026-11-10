@@ -76,7 +76,7 @@ namespace {
 
 // Increase when the stored keys change meaning (Deko3DPipelineKey, the shader IDs, the formats).
 constexpr uint32_t DEKO3D_CACHE_MAGIC = 0x4F4B4544; // "DEKO"
-constexpr uint32_t DEKO3D_CACHE_VERSION = 4;
+constexpr uint32_t DEKO3D_CACHE_VERSION = 5;
 
 struct Deko3DCacheHeader {
 	uint32_t magic;

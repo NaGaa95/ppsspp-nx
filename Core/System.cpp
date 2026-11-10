@@ -391,6 +391,7 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 
 	g_RemasterMode = false;
 	g_DoubleTextureCoordinates = false;
+	g_RemasterHLEFonts = false;
 	Memory::g_PSPModel = g_Config.iPSPModel;
 
 	g_CoreParameter.fileType = type;
@@ -880,6 +881,18 @@ bool PSP_InitStart(const CoreParameter &coreParam) {
 				}
 				filename = vshmain;
 				loadedFile = ResolveFileLoaderTarget(ConstructFileLoader(filename), &fileType, errorString);
+			}
+		}
+
+		if (filename.GetFilename() == "vshmain.prx") {
+			// A firmware installed for the other model makes the XMB look for files it doesn't have.
+			InstalledFirmwareInfo firmware;
+			ReadInstalledFirmwareInfo(g_Config.nandRootDirectory, &firmware, false);
+			if (!InstalledFirmwareFitsModel(firmware, g_Config.iPSPModel)) {
+				auto sy = GetI18NCategory(I18NCat::SYSTEM);
+				g_OSD.Show(OSDType::MESSAGE_WARNING, ApplySafeSubstitutions(
+					sy->T("FirmwareOtherModel", "Firmware %1 was installed for a different PSP model than the selected one, so the XMB may not work until you install it again."),
+					firmware.version), 10.0f, "firmware_model");
 			}
 		}
 

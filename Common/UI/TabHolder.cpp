@@ -44,7 +44,7 @@ TabHolder::TabHolder(Orientation orientation, float stripSize, TabHolderFlags fl
 			Add(tabScroll_);
 		}
 	} else {
-		SetPadding(Margins(10, 0, 0, 0));
+		SetPadding(Margins(12, 0, 0, 0));
 		tabContainer_ = new LinearLayout(ORIENT_VERTICAL, new LayoutParams(stripSize, FILL_PARENT));
 		tabContainer_->Add(new Spacer(8.0f));
 		tabContainer_->SetSpacing(0.0f);
@@ -83,6 +83,10 @@ void TabHolder::EnablePaneNavigation(ViewGroup *root) {
 		page->CollectTabOrder(&order);
 		order.erase(std::remove_if(order.begin(), order.end(),
 								   [](View *view) {
+									   // The tab order includes disabled views, which can take focus. Pane navigation skips them.
+									   if (!view->IsEnabled()) {
+										   return true;
+									   }
 									   for (ViewGroup *parent = view->Parent(); parent; parent = parent->Parent()) {
 										   if (!parent->IsEnabled() || parent->GetVisibility() != V_VISIBLE) {
 											   return true;
@@ -137,7 +141,7 @@ void TabHolder::AddTabContents(std::string_view title, ImageID imageId, ViewGrou
 	} else {
 		tabStrip_->AddChoice(title);
 	}
-	tabStrip_->ApplyRoundCorners(orientation_ == Orientation::ORIENT_HORIZONTAL ? RoundCorners::Left : RoundCorners::Top);
+	tabStrip_->SetRoundCorners(orientation_ == Orientation::ORIENT_HORIZONTAL ? RoundCorners::Left : RoundCorners::Top);
 
 	contents_->Add(tabContents);
 	if (tabs_.size() > 1)
@@ -159,7 +163,7 @@ void TabHolder::AddTabDeferred(std::string_view title, ImageID imageId, std::fun
 	} else {
 		tabStrip_->AddChoice(title);
 	}
-	tabStrip_->ApplyRoundCorners(orientation_ == Orientation::ORIENT_HORIZONTAL ? RoundCorners::Left : RoundCorners::Top);
+	tabStrip_->SetRoundCorners(orientation_ == Orientation::ORIENT_HORIZONTAL ? RoundCorners::Left : RoundCorners::Top);
 	
 	tabTweens_.push_back(nullptr);
 	createFuncs_.push_back(createCb);
@@ -295,6 +299,13 @@ void TabHolder::OnTabClick(EventParams &e) {
 	// We have e.b set when it was an explicit click action.
 	// In that case, we make the view gone and then visible - this scrolls scrollviews to the top.
 	if (e.b != 0) {
+		if ((int)e.a == currentTab_) {
+			UI::EventParams e2{};
+			e2.v = this;
+			e2.a = currentTab_;
+			OnReselectTab.Trigger(e2);
+			return;
+		}
 		// SetCurrentTab calls EnsureTab if needed.
 		SetCurrentTab((int)e.a);
 	}

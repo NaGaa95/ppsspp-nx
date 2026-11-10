@@ -65,6 +65,7 @@
 #include "Common/GPU/OpenGL/GLFeatures.h"
 #include "Common/GPU/thin3d.h"
 #include "Common/GPU/Vulkan/FixedSPIRVCache.h"
+#include "Common/GPU/Vulkan/VulkanDriverVars.h"
 #include "Common/UI/UI.h"
 #include "Common/UI/Screen.h"
 #include "Common/UI/ScreenManager.h"
@@ -142,6 +143,7 @@
 #include "UI/DiscordIntegration.h"
 #include "UI/EmuScreen.h"
 #include "UI/FirmwareScreen.h"
+#include "UI/DriverManagerScreen.h"
 #include "UI/GameInfoCache.h"
 #if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
 #include "SDL/SwitchLauncher.h"
@@ -153,7 +155,9 @@
 #include "UI/GPUDriverTestScreen.h"
 #include "UI/MiscScreens.h"
 #include "UI/MemStickScreen.h"
+#include "UI/StorageTestScreen.h"
 #include "UI/OnScreenDisplay.h"
+#include "UI/SettingsPage.h"
 #include "UI/RemoteISOScreen.h"
 #include "UI/Theme.h"
 #include "UI/PauseScreen.h"
@@ -381,7 +385,7 @@ void runImDebugger(Draw::DrawContext *draw) {
 
 			// Read the TTF font
 			size_t propSize = 0;
-			const uint8_t *propFontData = g_VFS.ReadFile("Roboto-Regular.ttf", &propSize);
+			const uint8_t *propFontData = g_VFS.ReadFile("Roboto_Condensed-Regular.ttf", &propSize);
 			size_t fixedSize = 0;
 			const uint8_t *fixedFontData = g_VFS.ReadFile("Inconsolata-Regular.ttf", &fixedSize);
 			// This call works even if fontData is nullptr, in which case the font just won't get loaded.
@@ -451,6 +455,8 @@ void runImDebugger(Draw::DrawContext *draw) {
 		SetOverrideScreenFrame(nullptr);
 		if (imDebugger_) {
 			imDebugger_->OnHidden();
+			// Key events don't reach imgui while it's hidden, so it would miss the release of a key held when it closed.
+			ImGui::GetIO().ClearInputKeys();
 		}
 	}
 
@@ -510,12 +516,17 @@ static void CheckFailedGPUBackends() {
 	return;
 #endif
 
+	// Only a custom driver is given up on, never the backend.
+	bool customDriverOnly = false;
 #if PPSSPP_PLATFORM(ANDROID)
 	if (System_GetPropertyInt(SYSPROP_SYSTEMVERSION) >= 30) {
-		// In Android 11 or later, Vulkan is as stable as OpenGL, so let's not even bother.
-		// Have also seen unexplained issues with random fallbacks to OpenGL for no good reason,
-		// especially when debugging.
-		return;
+		// In Android 11 or later, Vulkan is as stable as OpenGL, so the only thing to check for is a custom
+		// driver that crashes. Have also seen unexplained issues with random fallbacks to OpenGL for no good
+		// reason, especially when debugging.
+		if (g_Config.iGPUBackend != (int)GPUBackend::VULKAN || g_Config.sCustomDriver.empty()) {
+			return;
+		}
+		customDriverOnly = true;
 	}
 #endif
 
@@ -542,8 +553,26 @@ static void CheckFailedGPUBackends() {
 		ERROR_LOG(Log::Loader, "Failed graphics backends: %s", g_Config.sFailedGPUBackends.c_str());
 	}
 
+#if PPSSPP_PLATFORM(ANDROID)
+	// A crash in Vulkan with a custom driver gets another try with the system's driver before leaving Vulkan.
+	std::vector<std::string> failed;
+	SplitString(g_Config.sFailedGPUBackends, ',', failed);
+	if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN && ContainsNoCase(failed, "VULKAN") && VulkanDisableCustomDriver()) {
+		RemoveNoCase(failed, "VULKAN");
+		g_Config.sFailedGPUBackends.clear();
+		for (const std::string &backend : failed) {
+			if (!g_Config.sFailedGPUBackends.empty()) {
+				g_Config.sFailedGPUBackends += ",";
+			}
+			g_Config.sFailedGPUBackends += backend;
+		}
+	}
+#endif
+
 	// Okay, let's not try a backend in the failed list.
-	g_Config.iGPUBackend = g_Config.NextValidBackend();
+	if (!customDriverOnly) {
+		g_Config.iGPUBackend = g_Config.NextValidBackend();
+	}
 	if (lastBackend != g_Config.iGPUBackend) {
 		// This is the expected path.
 		std::string param = GPUBackendToString((GPUBackend)lastBackend) + " -> " + GPUBackendToString((GPUBackend)g_Config.iGPUBackend);
@@ -873,6 +902,8 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 
 	g_BackgroundAudio.SFX().Init();
 
+	UI::SetDisabledActivationCallback(&ShowWhyViewDisabled);
+
 	if (!boot_filename.empty() && cmdLineOptions.stateToLoad.has_value()) {
 		SaveState::Load(Path(cmdLineOptions.stateToLoad.value()), -1, &ShowMessageAfterSaveStateAction);
 	}
@@ -939,6 +970,9 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 		if (equals(cmdLineOptions.startScreen.value(), "touchscreentest")) {
 			g_screenManager->switchScreen(new MainScreen());
 			g_screenManager->push(new TouchTestScreen(Path()));
+		} else if (equals(cmdLineOptions.startScreen.value(), "colortest")) {
+			g_screenManager->switchScreen(new MainScreen());
+			g_screenManager->push(new ColorTestScreen());
 		} else if (equals(cmdLineOptions.startScreen.value(), "gamesettings")) {
 			g_screenManager->switchScreen(new LogoScreen(AfterLogoScreen::TO_GAME_SETTINGS));
 		} else if (equals(cmdLineOptions.startScreen.value(), "developertools")) {
@@ -949,6 +983,22 @@ void NativeInit(int argc, const char *argv[], const CommandLineOptions &cmdLineO
 		} else if (equals(cmdLineOptions.startScreen.value(), "firmware")) {
 			g_screenManager->switchScreen(new MainScreen());
 			g_screenManager->push(new FirmwareScreen(Path()));
+		} else if (equals(cmdLineOptions.startScreen.value(), "memsticksetup")) {
+			g_screenManager->switchScreen(new MainScreen());
+			g_screenManager->push(new MemStickScreen(true));
+		} else if (equals(cmdLineOptions.startScreen.value(), "memstick")) {
+			// As opened from the settings, to move an existing memory stick.
+			g_screenManager->switchScreen(new MainScreen());
+			g_screenManager->push(new MemStickScreen(false));
+		} else if (equals(cmdLineOptions.startScreen.value(), "storagetest")) {
+			g_screenManager->switchScreen(new MainScreen());
+			g_screenManager->push(new StorageTestScreen());
+		} else if (equals(cmdLineOptions.startScreen.value(), "credits")) {
+			g_screenManager->switchScreen(new MainScreen());
+			g_screenManager->push(new CreditsScreen());
+		} else if (equals(cmdLineOptions.startScreen.value(), "driver")) {
+			g_screenManager->switchScreen(new MainScreen());
+			g_screenManager->push(new DriverManagerScreen(Path()));
 		} else {
 			WARN_LOG(Log::System, "Unknown start screen '%s'", cmdLineOptions.startScreen.value().c_str());
 			g_screenManager->switchScreen(new LogoScreen(AfterLogoScreen::DEFAULT));
@@ -1466,6 +1516,13 @@ void NativeFrame(GraphicsContext *graphicsContext) {
 			runImDebugger(g_draw);
 		});
 		renderImDebugger(g_draw);
+		int cursorX, cursorY, cursorW, cursorH;
+		if (IsVREnabled() && GetVRMouseCursorRect(&cursorX, &cursorY, &cursorW, &cursorH)) {
+			UIContext *uiContext = g_screenManager->getUIContext();
+			uiContext->Begin();
+			uiContext->FillRect(UI::Drawable(0xFFFFFFFF), Bounds(cursorX * g_display.dpi_scale_x, cursorY * g_display.dpi_scale_y, cursorW * g_display.dpi_scale_x, cursorH * g_display.dpi_scale_y));
+			uiContext->Flush();
+		}
 		// Last, since the readback ends the backbuffer pass. Nothing can draw after it.
 		ScreenshotNotifyEndOfFrame(g_draw);
 		if (g_screenManager->getUIContext()->Text()) {
@@ -1567,6 +1624,12 @@ bool HandleGlobalMessage(UIMessage message, const std::string &value) {
 		return true;
 	}
 	else if (message == UIMessage::PERMISSION_GRANTED && value == "storage") {
+		// Android reports the permission at every startup too (sendInitialGrants). If the config loaded, we had
+		// access all along, and there's nothing to redo: reloading it and creating the directories again cost
+		// half a second of every startup with a memory stick on a content URI.
+		if (g_Config.LoadedFromFile()) {
+			return true;
+		}
 		CreateSysDirectories();
 		// We must have failed to load the config before, so load it now to avoid overwriting the old config
 		// with a freshly generated one.

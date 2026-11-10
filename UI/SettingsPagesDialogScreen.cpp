@@ -147,17 +147,18 @@ void SettingsPagesDialogScreen::CreateSettingsTabContents(int settingsTab, UI::L
 	}
 }
 
-// Where you are, with the earlier pages clickable to go back to them. Also has the search button.
+// Creates the navigation bar, which shows where you are in the settings tree, with the previous pages
+// clickable if there's room (horizontal layout). Also has the search and help buttons.
 void SettingsPagesDialogScreen::CreateNavBar(UI::ViewGroup *parent, int settingsTab, const std::vector<std::string> &titles, const std::string &helpTag) {
 	using namespace UI;
 	const SettingsTab &tab = settingsTabs_[settingsTab];
-	const Margins barPadding(12, 0, 8, 0);
-	LinearLayout *bar = parent->Add(new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, ITEM_HEIGHT, Margins(0, 8))));
+	const Margins barPadding(12, 0, 12, 0);
+	LinearLayout *bar = parent->Add(new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, ITEM_HEIGHT, Margins(0, 12))));
 	bar->SetPadding(barPadding);
 	bar->SetSpacing(8.0f);
 
 	// When stacked in portrait, there's no other back button, so it's always there, and leaves the screen from the root page.
-	if (stacked_ || !searchText_.empty() || !pagePaths_[tab.tag].empty()) {
+	if (stacked_ || !searchText_.empty()) {
 		Choice *backButton = bar->Add(new Choice(ImageID("I_CHEVRON_LEFT"), new LinearLayoutParams(ITEM_HEIGHT, ITEM_HEIGHT)));
 		backButton->SetRoundCorners(RoundCorners::All);
 		backButton->OnClick.Add([this, settingsTab](UI::EventParams &) {
@@ -411,10 +412,9 @@ bool SettingsPagesDialogScreen::SearchPage(UI::ViewGroup *parent, int settingsTa
 	const I18NCat cat = page.DefaultCat();
 	const std::deque<SettingItem> &items = page.Items();
 
-	// A matching header shows its whole section, and a matching hint the setting it belongs to.
+	// A matching header shows its whole section.
 	std::vector<bool> show(items.size());
 	bool sectionMatches = false;
-	int lastSetting = -1;
 	for (int i = 0; i < (int)items.size(); i++) {
 		const SettingItem &item = items[i];
 		bool matches = SettingTextMatches(item.text, cat, searchText_);
@@ -422,16 +422,13 @@ bool SettingsPagesDialogScreen::SearchPage(UI::ViewGroup *parent, int settingsTa
 		case SettingType::Header:
 			sectionMatches = matches;
 			break;
-		case SettingType::Hint:
-			if (matches && lastSetting >= 0) {
-				show[lastSetting] = true;
-			}
-			break;
 		case SettingType::Description:
 			break;
 		default:
-			lastSetting = i;
-			show[i] = matches || sectionMatches;
+			if (!item.hint.empty() && SettingTextMatches(item.hint, cat, searchText_)) {
+				matches = true;
+			}
+			show[i] = item.visible && (matches || sectionMatches);
 			break;
 		}
 	}
@@ -505,7 +502,10 @@ void SettingsPagesDialogScreen::GoToPage(int settingsTab, const std::vector<int>
 	if (!stacked_) {
 		// The tab strip keeps showing its tab when the views are recreated. This creates the tab if it wasn't
 		// already, so it has to come before ShowPage, or that would take the item to focus.
-		SetCurrentTab(settingsTabs_[settingsTab].tabIndex);
+		int tabIndex = settingsTabs_[settingsTab].tabIndex;
+		// TabChanged comes later, and mustn't go back to the root page.
+		keepPageOnTabChange_ = GetCurrentTab() != tabIndex;
+		SetCurrentTab(tabIndex);
 	}
 	ShowPage(settingsTab, path, itemIndex);
 	pendingHighlight_ = true;
@@ -540,6 +540,8 @@ void SettingsPagesDialogScreen::update() {
 
 void SettingsPagesDialogScreen::CreateViews() {
 	settingsTabs_.clear();
+	// The old tab strip's TabChanged won't come.
+	keepPageOnTabChange_ = false;
 	pendingFocusView_ = nullptr;
 	highlightedView_ = nullptr;
 
@@ -595,7 +597,51 @@ int SettingsPagesDialogScreen::InitialTab() {
 	return pendingTab_ >= 0 ? settingsTabs_[pendingTab_].tabIndex : -1;
 }
 
-// Picking a tab means leaving the search for it.
+// Picking a tab means leaving the search for it. The tab opens on its root page, unless a search result
+// on it is being shown.
 void SettingsPagesDialogScreen::TabChanged(int tab) {
+	int settingsTab = CurrentSettingsTab();
+	if (keepPageOnTabChange_) {
+		keepPageOnTabChange_ = false;
+	} else if (settingsTab >= 0 && !pagePaths_[settingsTabs_[settingsTab].tag].empty()) {
+		pagePaths_[settingsTabs_[settingsTab].tag].clear();
+		// Leaving the search recreates all the views anyway.
+		if (searchText_.empty()) {
+			RecreateTabContents(settingsTab);
+		}
+	}
 	SetSearchText("");
+}
+
+// Without recreating the other views, so the tab can be switched to while sliding in.
+void SettingsPagesDialogScreen::RecreateTabContents(int settingsTab) {
+	UI::ViewGroup *contents = tabHolder_->GetTabContentViews()[settingsTabs_[settingsTab].tabIndex];
+	if (!contents) {
+		// Not created yet. It will be with the page.
+		return;
+	}
+	ClearHighlight();
+	pendingFocusView_ = nullptr;
+	contents->Clear();
+	bool wasCreatingViews = IsCreatingViews();
+	SetCreatingViews(true);
+	CreateSettingsTabContents(settingsTab, static_cast<UI::LinearLayout *>(contents));
+	SetCreatingViews(wasCreatingViews);
+}
+
+// Picking the tab that's shown goes back up to its root page. Not while showing search results, which aren't
+// on a page.
+void SettingsPagesDialogScreen::TabReselected(int tab) {
+	if (!searchText_.empty()) {
+		return;
+	}
+	int settingsTab = CurrentSettingsTab();
+	if (settingsTab < 0) {
+		return;
+	}
+	const std::vector<int> &path = pagePaths_[settingsTabs_[settingsTab].tag];
+	if (path.empty()) {
+		return;
+	}
+	ShowPage(settingsTab, {}, path[0]);  // Focuses the link to the page we're leaving.
 }

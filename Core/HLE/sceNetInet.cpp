@@ -144,6 +144,21 @@ static bool InetValidRange(u32 ptr, u32 size, const char *func, SceUID threadID 
 	return false;
 }
 
+// A receive buffer's length is only how much the game can take. Treated like PdpRecv and PtpRecv's,
+// which may run past the end of memory on a PSP (pspautotests net/adhoc/pdp and ptp): only the start
+// has to be valid, and InetRecvSize gives the host no more than fits.
+static bool InetValidRecvBuffer(u32 ptr, u32 size, const char *func, SceUID threadID = __KernelGetCurThread()) {
+	if (size == 0 || Memory::IsValidAddress(ptr)) {
+		return true;
+	}
+	SetInetErrno(ERROR_INET_EFAULT, func, threadID);
+	return false;
+}
+
+static u32 InetRecvSize(u32 ptr, u32 size) {
+	return Memory::ClampValidSizeAt(ptr, size);
+}
+
 bool netInetInited = false;
 
 // A blocking call waiting for its sockets. Host sockets are always non-blocking: rather than block
@@ -832,7 +847,7 @@ static InetTry TryRecv(SceUID threadID, const u32 *args) {
 	}
 	int flgs = args[3] & ~PSP_NET_INET_MSG_DONTWAIT; // removing non-POSIX flag, which is an alternative way to use non-blocking mode
 	flgs = convertMSGFlagsPSP2Host(flgs);
-	int retval = recv(inetSock->sock, (char*)Memory::GetPointerOrException(args[1]), args[2], flgs | MSG_NOSIGNAL);
+	int retval = recv(inetSock->sock, (char*)Memory::GetPointerOrException(args[1]), InetRecvSize(args[1], args[2]), flgs | MSG_NOSIGNAL);
 	if (retval < 0) {
 		const int hostErrno = socket_errno;
 		if (IsWouldBlock(hostErrno)) {
@@ -922,6 +937,47 @@ static bool StartInetWait(InetWaitOp op, const u32 *args, int numArgs, s64 timeo
 	return true;
 }
 
+// The entry points check the arguments before a wait starts, but a wait can also come from a
+// savestate. Same checks, failing with EFAULT (errno set) like the entry points would.
+static bool InetWaitArgsValid(const InetWait &wait, SceUID threadID) {
+	const u32 *args = wait.args;
+	const char *func = "inet wait";
+	auto optional = [&](u32 ptr, u32 size) {
+		return ptr == 0 || InetValidRange(ptr, size, func, threadID);
+	};
+	switch (wait.op) {
+	case InetWaitOp::Select:
+		if ((int)args[0] < 0 || (int)args[0] > PSP_NET_INET_FD_SETSIZE) {
+			SetInetErrno(ERROR_INET_EINVAL, func, threadID);
+			return false;
+		}
+		return optional(args[1], sizeof(SceNetInetFdSet)) && optional(args[2], sizeof(SceNetInetFdSet)) && optional(args[3], sizeof(SceNetInetFdSet));
+	case InetWaitOp::Poll:
+		if (args[1] > PSP_NET_INET_FD_SETSIZE) {
+			SetInetErrno(ERROR_INET_EINVAL, func, threadID);
+			return false;
+		}
+		return InetValidRange(args[0], args[1] * (u32)sizeof(SceNetInetPollfd), func, threadID);
+	case InetWaitOp::Recv:
+		return InetValidRecvBuffer(args[1], args[2], func, threadID);
+	case InetWaitOp::Send:
+		return InetValidRange(args[1], args[2], func, threadID);
+	case InetWaitOp::RecvFrom:
+		return InetValidRecvBuffer(args[1], args[2], func, threadID) && optional(args[4], sizeof(SceNetInetSockaddr)) && optional(args[5], 4);
+	case InetWaitOp::SendTo:
+		return InetValidRange(args[1], args[2], func, threadID) && optional(args[4], sizeof(SceNetInetSockaddr));
+	case InetWaitOp::Accept:
+		return optional(args[1], sizeof(SceNetInetSockaddr)) && optional(args[2], 4);
+	case InetWaitOp::Connect:
+	case InetWaitOp::RecvMsg:
+		// Connect has no pointers, and TryRecvMsg checks its msghdr on every attempt.
+		return true;
+	default:
+		SetInetErrno(ERROR_INET_EINVAL, func, threadID);
+		return false;
+	}
+}
+
 static void __NetInetWaitPoll(u64 userdata, int cyclesLate) {
 	const SceUID threadID = (SceUID)userdata;
 	auto it = g_inetWaits.find(threadID);
@@ -936,6 +992,12 @@ static void __NetInetWaitPoll(u64 userdata, int cyclesLate) {
 	}
 
 	const InetWait wait = it->second;
+	if (!InetWaitArgsValid(wait, threadID)) {
+		g_inetWaits.erase(it);
+		__KernelResumeThreadFromWait(threadID, -1);
+		__KernelReSchedule("inet wait failed");
+		return;
+	}
 	const InetTry attempt = TryInetOp(wait.op, threadID, wait.args, false);
 	const s64 now = CoreTiming::GetTicks(currentMIPS);
 	if (attempt.wouldBlock && (wait.deadline < 0 || now < wait.deadline)) {
@@ -1063,7 +1125,7 @@ static int sceNetInetRecv(int socket, u32 bufPtr, u32 bufLen, u32 flags) {
 		return InetBadSocket(socket, __FUNCTION__);
 	}
 
-	if (!InetValidRange(bufPtr, bufLen, __FUNCTION__)) {
+	if (!InetValidRecvBuffer(bufPtr, bufLen, __FUNCTION__)) {
 		return hleLogError(Log::sceNet, -1, "bad buffer %08x, %d bytes", bufPtr, bufLen);
 	}
 
@@ -1794,7 +1856,7 @@ static InetTry TryRecvFrom(SceUID threadID, const u32 *args) {
 	socklen_t hostLen = sizeof(saddr);
 	int flgs = args[3] & ~PSP_NET_INET_MSG_DONTWAIT; // removing non-POSIX flag, which is an alternative way to use non-blocking mode
 	flgs = convertMSGFlagsPSP2Host(flgs);
-	int retval = recvfrom(inetSock->sock, (char*)Memory::GetPointerOrException(args[1]), (int)args[2], flgs | MSG_NOSIGNAL, (struct sockaddr*)&saddr.addr, &hostLen);
+	int retval = recvfrom(inetSock->sock, (char*)Memory::GetPointerOrException(args[1]), (int)InetRecvSize(args[1], args[2]), flgs | MSG_NOSIGNAL, (struct sockaddr*)&saddr.addr, &hostLen);
 	if (retval < 0) {
 		const int hostErrno = socket_errno;
 		if (IsWouldBlock(hostErrno)) {
@@ -1823,7 +1885,7 @@ static int sceNetInetRecvfrom(int socket, u32 bufferPtr, int len, int flags, u32
 		return InetBadSocket(socket, __FUNCTION__);
 	}
 
-	if (!InetValidRange(bufferPtr, (u32)len, __FUNCTION__)) {
+	if (!InetValidRecvBuffer(bufferPtr, (u32)len, __FUNCTION__)) {
 		return hleLogError(Log::sceNet, -1, "bad buffer %08x, %d bytes", bufferPtr, len);
 	}
 	if ((fromPtr && !InetValidRange(fromPtr, sizeof(SceNetInetSockaddr), __FUNCTION__)) || (fromlenPtr && !InetValidRange(fromlenPtr, 4, __FUNCTION__))) {
@@ -1955,13 +2017,19 @@ typedef iovec HostIovec;
 
 // Reads a game's msghdr, checking that everything the host will read or write through it is in game
 // memory, and builds the host's buffer list from msg_iov. Fails with errno set.
-static bool ReadInetMsghdr(u32 msghdrPtr, InetMsghdr *msg, std::vector<HostIovec> *iov, const char *func, SceUID threadID) {
+static bool ReadInetMsghdr(u32 msghdrPtr, InetMsghdr *msg, std::vector<HostIovec> *iov, bool receiving, const char *func, SceUID threadID) {
 	if (!InetValidRange(msghdrPtr, sizeof(InetMsghdr), func, threadID)) {
 		return false;
 	}
 	*msg = *(const InetMsghdr *)Memory::GetPointerUnchecked(msghdrPtr);
 	if (msg->msg_iovlen < 0) {
 		SetInetErrno(ERROR_INET_EINVAL, func, threadID);
+		return false;
+	}
+	// The BSD stack's limit (UIO_MAXIOV). Otherwise only guest memory bounds it, and a blocking
+	// recvmsg rebuilds the list on every retry.
+	if (msg->msg_iovlen > 1024) {
+		SetInetErrno(ERROR_INET_EMSGSIZE, func, threadID);
 		return false;
 	}
 	// In 64 bits, so a huge count can't wrap around to a small size.
@@ -1977,16 +2045,18 @@ static bool ReadInetMsghdr(u32 msghdrPtr, InetMsghdr *msg, std::vector<HostIovec
 		if (!pspIov.iov_base) {
 			continue;
 		}
-		if (!InetValidRange(pspIov.iov_base, pspIov.iov_len, func, threadID)) {
+		const bool valid = receiving ? InetValidRecvBuffer(pspIov.iov_base, pspIov.iov_len, func, threadID) : InetValidRange(pspIov.iov_base, pspIov.iov_len, func, threadID);
+		if (!valid) {
 			return false;
 		}
 		char *base = (char *)Memory::GetPointerUnchecked(pspIov.iov_base);
+		const u32 len = receiving ? InetRecvSize(pspIov.iov_base, pspIov.iov_len) : pspIov.iov_len;
 #if defined(_WIN32)
 		(*iov)[i].buf = base;
-		(*iov)[i].len = pspIov.iov_len;
+		(*iov)[i].len = len;
 #else
 		(*iov)[i].iov_base = base;
-		(*iov)[i].iov_len = pspIov.iov_len;
+		(*iov)[i].iov_len = len;
 #endif
 	}
 	return true;
@@ -2003,7 +2073,7 @@ static int sceNetInetSendmsg(int socket, u32 msghdrPtr, int flags) {
 	}
 	InetMsghdr msg;
 	std::vector<HostIovec> iov;
-	if (!ReadInetMsghdr(msghdrPtr, &msg, &iov, __FUNCTION__, __KernelGetCurThread())) {
+	if (!ReadInetMsghdr(msghdrPtr, &msg, &iov, false, __FUNCTION__, __KernelGetCurThread())) {
 		return hleLogError(Log::sceNet, -1, "bad msghdr");
 	}
 	if (msg.msg_control && msg.msg_controllen) {
@@ -2096,7 +2166,7 @@ static InetTry TryRecvMsg(SceUID threadID, const u32 *args) {
 	}
 	InetMsghdr msg;
 	std::vector<HostIovec> iov;
-	if (!ReadInetMsghdr(args[1], &msg, &iov, "sceNetInetRecvmsg", threadID)) {
+	if (!ReadInetMsghdr(args[1], &msg, &iov, true, "sceNetInetRecvmsg", threadID)) {
 		return { -1, false, 0 };
 	}
 	const int hostFlags = convertMSGFlagsPSP2Host(args[2] & ~PSP_NET_INET_MSG_DONTWAIT) | MSG_NOSIGNAL;

@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "Common/CommonTypes.h"
+#include "Common/Data/Collections/FastVec.h"
 #include "Core/MIPS/MIPS.h"
 
 // Basic IR
@@ -231,6 +232,7 @@ enum class IROp : uint8_t {
 	FLog2,  // vlog2, bit-exact with the PSP
 	FHalfToFloat,  // vh2f of the lower (src2 = 0) or upper (src2 = 1) half of src1
 	FSinCos,  // dest = sin(src1), dest + 1 = cos(src1), from one argument reduction
+	FFloatToHalf2,  // vf2h of a pair: dest = half(src1) | half(src2) << 16, bit-exact with the PSP
 
 	// Fake/System instructions
 	Interpret,
@@ -425,16 +427,25 @@ u32 IRInterpret(MIPSState *ms, const IRInst *inst, const IRInst *chainArena = nu
 // Each IR block gets a constant pool.
 class IRWriter {
 public:
-	IRWriter &operator =(const IRWriter &w) {
-		insts_ = w.insts_;
-		return *this;
-	}
+	IRWriter() {}
+	IRWriter(const IRWriter &w) = delete;
+	IRWriter(IRWriter &&w) noexcept : insts_(std::move(w.insts_)) {}
+	IRWriter &operator =(const IRWriter &w) = delete;
 	IRWriter &operator =(IRWriter &&w) noexcept {
 		insts_ = std::move(w.insts_);
 		return *this;
 	}
 
-	void Write(IROp op, u8 dst = 0, u8 src1 = 0, u8 src2 = 0, u32 constant = 0);
+	// Inline (with FastVec rather than std::vector, which the compiler didn't inline), since the
+	// frontend and every pass write each instruction through these.
+	void Write(IROp op, u8 dst = 0, u8 src1 = 0, u8 src2 = 0, u32 constant = 0) {
+		IRInst &inst = insts_.push_uninitialized();
+		inst.op = op;
+		inst.dest = dst;
+		inst.src1 = src1;
+		inst.src2 = src2;
+		inst.constant = constant;
+	}
 	void WriteFC(IROp op, u8 dst, u8 src1, u8 src2, float fconstant);
 
 	void WriteSetConstant(u8 dst, u32 value);
@@ -451,10 +462,10 @@ public:
 	}
 	void ReplaceConstant(size_t instNumber, u32 newConstant);
 
-	const std::vector<IRInst> &GetInstructions() const { return insts_; }
+	const FastVec<IRInst> &GetInstructions() const { return insts_; }
 
 private:
-	std::vector<IRInst> insts_;
+	FastVec<IRInst> insts_;
 };
 
 // How far IRFrontend compiles on past conditional branches. The interpreter ends its blocks in the
@@ -478,6 +489,10 @@ struct IROptions {
 	bool moreVec4Ops;
 };
 
-const IRMeta *GetIRMeta(IROp op);
+// Filled in by InitIR(). Inline, since the passes and backends look it up for every instruction.
+extern const IRMeta *metaIndex[256];
+inline const IRMeta *GetIRMeta(IROp op) {
+	return metaIndex[(int)op];
+}
 void DisassembleIR(char *buf, size_t bufsize, IRInst inst);
 void InitIR();

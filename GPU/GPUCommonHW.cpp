@@ -576,6 +576,8 @@ u32 GPUCommonHW::CheckGPUFeatures() const {
 		features |= GPU_USE_CLIP_DISTANCE;
 	}
 
+	// With clip distances too, the GPU clips and culls draws crossing the Z planes, as long as the near plane is on
+	// the min Z (see TestBoundingBoxFast). Otherwise the CPU does (DrawEngineCommon::ClipCullPrims).
 	if (draw_->GetDeviceCaps().maxCullDistances >= 1) {
 		features |= GPU_USE_CULL_DISTANCE;
 	}
@@ -956,6 +958,7 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 	}
 
 	CheckDepthUsage(vfb);
+	framebufferManager_->RebuildStencilIfPending(vfb);
 	framebufferManager_->CheckMaskCopy(vfb);
 
 	const void *verts = Memory::GetPointerUnchecked(gstate_c.vertexAddr);
@@ -983,14 +986,18 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 	VertexDecoder *decoder = drawEngineCommon_->GetVertexDecoder(vertTypeID);
 
 	// Nothing is mapped past the end of RAM or VRAM, so a draw running off the end would fault on the first read.
-	if (!inds && !Memory::IsValidRange(gstate_c.vertexAddr, count * decoder->VertexSize())) {
+	if (!IsValidDrawRange(gstate_c.vertexAddr, gstate_c.indexAddr, count, vertexType, decoder->VertexSize())) {
 		ERROR_LOG(Log::G3D, "Bad vertex range %08x (%d verts of %d bytes)!", gstate_c.vertexAddr, count, decoder->VertexSize());
 		return;
 	}
 
-	// This is the check from #21678 for Evangelion JO.
+	// This is the check from #21678 for Evangelion JO, whose menu text is rendered into small framebuffers
+	// that are then used as textures, so they need to reach memory on the first frame.
+	// Only for buffers smaller than the screen. A partial readback of a screen-sized one leaves a strip of
+	// stale pixels in VRAM, which GTA's Japanese versions then display for a few frames when pausing (#21802).
 	// TODO: Make this less specific.
-	if (gstate.isModeThrough() && gstate.isTextureMapEnabled() && gstate.getColorMask() != 0xFFFFFFFF &&
+	if (vfb && (vfb->width < 480 || vfb->height < 272) &&
+		gstate.isModeThrough() && gstate.isTextureMapEnabled() && gstate.getColorMask() != 0xFFFFFFFF &&
 		gstate.getScissorX1() == 0 && gstate.getScissorY1() == 0 && Memory::IsVRAMAddress(gstate.getFrameBufAddress())) {
 		int safeWidth;
 		int safeHeight;
@@ -1018,6 +1025,8 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 	}
 
 	// For now, turn off culling on platforms where we don't have SIMD bounding box tests, like RISC-V.
+	// True means the bounding box test is skipped (through mode, morphing, skinning), not that the draw passed it.
+	// Those get UncheckedClipInfoFlags(), so they're never clipped or culled on the CPU either.
 #if PPSSPP_ARCH(ARM_NEON) || PPSSPP_ARCH(SSE2)
 
 #define PASSES_CULLING ((vertexType & (GE_VTYPE_THROUGH_MASK | GE_VTYPE_MORPHCOUNT_MASK | GE_VTYPE_WEIGHT_MASK)) != 0)
@@ -1035,7 +1044,7 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 	}
 	if (!passCulling && !discardLines) {
 		// Do software culling.
-		if (drawEngineCommon_->TestBoundingBoxFast(gstate_c.cullMatrix, verts, inds, count, decoder, vertexType, &flags)) {
+		if (drawEngineCommon_->TestBoundingBoxFast(gstate_c.cullMatrix, verts, inds, count, decoder, vertexType, &flags, drawEngineCommon_->CpuCullSupported())) {
 			passCulling = true;
 		} else {
 			gpuStats.perFrame.numCulledDraws++;
@@ -1083,6 +1092,11 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 	const u32_le *start = (const u32_le *)Memory::GetPointerUnchecked(currentList->pc + 4);
 	const u32_le *src = start;
 	const u32_le *stall = currentList->stall ? (const u32_le *)Memory::GetPointerUnchecked(currentList->stall) : 0;
+	// Without a stall ahead, stop at the end of memory.
+	const u32_le *end = start + Memory::MaxSizeAtAddress(currentList->pc + 4) / 4;
+	if (!stall || stall < start || stall > end) {
+		stall = end;
+	}
 
 	// Optimized submission of sequences of PRIM. Allows us to avoid going through all the mess
 	// above for each one. This can be expanded to support additional games that intersperse
@@ -1096,7 +1110,7 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 	if (!useFastRunLoop_ || readsFramebufferPerDraw)
 		goto bail;  // we're either recording or stepping, or each draw has to go alone.
 
-	while (src != stall) {
+	while (src < stall) {
 		uint32_t data = *src;
 		switch (data >> 24) {
 		case GE_CMD_PRIM:
@@ -1110,7 +1124,8 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 			bool clockwise = !gstate.isCullEnabled() || gstate.getCullMode() == cullMode;
 			if (canExtend) {
 				// Non-indexed draws can be cheaply merged if vertexAddr hasn't changed, that means the vertices
-				// are consecutive in memory. We also ignore culling here which is not ideal.
+				// are consecutive in memory. We also ignore culling here which is not ideal: the merged draws take
+				// the first one's flags, so one crossing a Z plane after one that doesn't isn't clipped on the CPU.
 				_dbg_assert_((vertexType & GE_VTYPE_IDX_MASK) == GE_VTYPE_IDX_NONE);
 				const int maxVerts = Memory::MaxSizeAtAddress(gstate_c.vertexAddr) / decoder->VertexSize();
 				int commandsExecuted = drawEngineCommon_->ExtendNonIndexedPrim(src, stall, decoder, vertTypeID, clockwise, &bytesRead, isTriangle, flags, maxVerts);
@@ -1125,19 +1140,13 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 
 			verts = Memory::GetPointerUnchecked(gstate_c.vertexAddr);
 			inds = nullptr;
+			if (!IsValidDrawRange(gstate_c.vertexAddr, gstate_c.indexAddr, count, vertexType, decoder->VertexSize())) {
+				// Bad index or vertex range, leave it to Execute_Prim.
+				goto bail;
+			}
 			if ((vertexType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
-				const u32 indexAddr = gstate_c.indexAddr;
-				const int indexShift = ((vertexType & GE_VTYPE_IDX_MASK) >> GE_VTYPE_IDX_SHIFT) - 1;
-				if (!Memory::IsValidRange(gstate_c.indexAddr, count << indexShift)) {
-					// Bad index range. Let's give up the fast loop.
-					goto bail;
-				}
-				inds = Memory::GetPointerUnchecked(indexAddr);
+				inds = Memory::GetPointerUnchecked(gstate_c.indexAddr);
 			} else {
-				if (!Memory::IsValidRange(gstate_c.vertexAddr, count * decoder->VertexSize())) {
-					// Bad vertex range, leave it to Execute_Prim.
-					goto bail;
-				}
 				// We can extend again after submitting a normal draw.
 				canExtend = isTriangle;
 			}
@@ -1149,7 +1158,7 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 			}
 			if (!passCulling) {
 				// Do software culling.
-				if (drawEngineCommon_->TestBoundingBoxFast(gstate_c.cullMatrix, verts, inds, count, decoder, vertexType, &flags)) {
+				if (drawEngineCommon_->TestBoundingBoxFast(gstate_c.cullMatrix, verts, inds, count, decoder, vertexType, &flags, drawEngineCommon_->CpuCullSupported())) {
 					passCulling = true;
 				} else {
 					gpuStats.perFrame.numCulledDraws++;
@@ -1261,7 +1270,7 @@ void GPUCommonHW::Execute_Prim(u32 op, u32 diff) {
 		{
 			// A bone matrix probably. If not we bail.
 			const u32 target = gstate_c.getRelativeAddress(data & 0x00FFFFFC);
-			if (currentList->HardwareCallDepth() < 2 &&
+			if (currentList->HardwareCallDepth() < 2 && Memory::IsValidRange(target, 13 * 4) &&
 				(Memory::ReadUnchecked_U32(target) >> 24) == GE_CMD_BONEMATRIXDATA &&
 				(Memory::ReadUnchecked_U32(target + 11 * 4) >> 24) == GE_CMD_BONEMATRIXDATA &&
 				(Memory::ReadUnchecked_U32(target + 12 * 4) >> 24) == GE_CMD_RET &&
@@ -1335,6 +1344,7 @@ void GPUCommonHW::Execute_Bezier(u32 op, u32 diff) {
 	}
 
 	CheckDepthUsage(vfb);
+	framebufferManager_->RebuildStencilIfPending(vfb);
 	framebufferManager_->CheckMaskCopy(vfb);
 
 	if (!Memory::IsValidAddress(gstate_c.vertexAddr)) {
@@ -1345,20 +1355,17 @@ void GPUCommonHW::Execute_Bezier(u32 op, u32 diff) {
 	const void *control_points = Memory::GetPointerUnchecked(gstate_c.vertexAddr);
 	const void *indices = NULL;
 	const u32 vertType = gstate.vertType;
-	if ((vertType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
-		if (!Memory::IsValidAddress(gstate_c.indexAddr)) {
-			ERROR_LOG(Log::G3D, "Bad index address %08x!", gstate_c.indexAddr);
-			return;
-		}
-		indices = Memory::GetPointerUnchecked(gstate_c.indexAddr);
-	} else if (!Memory::IsValidRange(gstate_c.vertexAddr, (op & 0xFF) * ((op >> 8) & 0xFF) * drawEngineCommon_->GetVertexDecoder(GetVertTypeID(vertType, gstate.getUVGenMode()))->VertexSize())) {
-		// Nothing is mapped past the end of RAM or VRAM, so this would fault on the first read.
-		ERROR_LOG(Log::G3D, "Bad control point range %08x!", gstate_c.vertexAddr);
+	// Nothing is mapped past the end of RAM or VRAM, so this would fault on the first read.
+	if (!IsValidDrawRange(gstate_c.vertexAddr, gstate_c.indexAddr, (op & 0xFF) * ((op >> 8) & 0xFF), vertType, drawEngineCommon_->GetVertexDecoder(GetVertTypeID(vertType, gstate.getUVGenMode()))->VertexSize())) {
+		ERROR_LOG(Log::G3D, "Bad control point range %08x (indices %08x)!", gstate_c.vertexAddr, gstate_c.indexAddr);
 		return;
+	}
+	if ((vertType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
+		indices = Memory::GetPointerUnchecked(gstate_c.indexAddr);
 	}
 
 	if (vertTypeIsSkinningEnabled(vertType)) {
-		DEBUG_LOG_REPORT(Log::G3D, "Unusual bezier/spline vtype: %08x, morph: %d, bones: %d", vertType, (vertType & GE_VTYPE_MORPHCOUNT_MASK) >> GE_VTYPE_MORPHCOUNT_SHIFT, vertTypeGetNumBoneWeights(vertType));
+		DEBUG_LOG(Log::G3D, "Unusual bezier/spline vtype: %08x, morph: %d, bones: %d", vertType, (vertType & GE_VTYPE_MORPHCOUNT_MASK) >> GE_VTYPE_MORPHCOUNT_SHIFT, vertTypeGetNumBoneWeights(vertType));
 	}
 
 	// Can't flush after setting gstate_c.submitType below since it'll be a mess - it must be done already.
@@ -1411,6 +1418,7 @@ void GPUCommonHW::Execute_Spline(u32 op, u32 diff) {
 	}
 
 	CheckDepthUsage(vfb);
+	framebufferManager_->RebuildStencilIfPending(vfb);
 	framebufferManager_->CheckMaskCopy(vfb);
 
 	if (!Memory::IsValidAddress(gstate_c.vertexAddr)) {
@@ -1421,16 +1429,13 @@ void GPUCommonHW::Execute_Spline(u32 op, u32 diff) {
 	const void *control_points = Memory::GetPointerUnchecked(gstate_c.vertexAddr);
 	const void *indices = NULL;
 	const u32 vertType = gstate.vertType;
-	if ((vertType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
-		if (!Memory::IsValidAddress(gstate_c.indexAddr)) {
-			ERROR_LOG(Log::G3D, "Bad index address %08x!", gstate_c.indexAddr);
-			return;
-		}
-		indices = Memory::GetPointerUnchecked(gstate_c.indexAddr);
-	} else if (!Memory::IsValidRange(gstate_c.vertexAddr, (op & 0xFF) * ((op >> 8) & 0xFF) * drawEngineCommon_->GetVertexDecoder(GetVertTypeID(vertType, gstate.getUVGenMode()))->VertexSize())) {
-		// Nothing is mapped past the end of RAM or VRAM, so this would fault on the first read.
-		ERROR_LOG(Log::G3D, "Bad control point range %08x!", gstate_c.vertexAddr);
+	// Nothing is mapped past the end of RAM or VRAM, so this would fault on the first read.
+	if (!IsValidDrawRange(gstate_c.vertexAddr, gstate_c.indexAddr, (op & 0xFF) * ((op >> 8) & 0xFF), vertType, drawEngineCommon_->GetVertexDecoder(GetVertTypeID(vertType, gstate.getUVGenMode()))->VertexSize())) {
+		ERROR_LOG(Log::G3D, "Bad control point range %08x (indices %08x)!", gstate_c.vertexAddr, gstate_c.indexAddr);
 		return;
+	}
+	if ((vertType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
+		indices = Memory::GetPointerUnchecked(gstate_c.indexAddr);
 	}
 
 	if (vertTypeIsSkinningEnabled(vertType)) {

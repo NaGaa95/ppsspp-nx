@@ -86,8 +86,7 @@ void BuildControlsSettings(SettingsPage *page) {
 			joystick->releaseRightStickFaceButtons();
 		}
 		g_controlMapper.ReleaseAll();
-	});
-	page->Hint("Up: Triangle, Down: Cross, Left: Square, Right: Circle");
+	}).Hint("Up: Triangle, Down: Cross, Left: Square, Right: Circle");
 #endif
 	page->Setting(&g_Config.fAnalogTriggerThreshold);
 	page->Setting(&g_Config.fAnalogStickThreshold);
@@ -116,8 +115,7 @@ void BuildControlsSettings(SettingsPage *page) {
 		page->Setting(&touch.bHideStickBackground).Enabled(&g_Config.bShowTouchControls);
 
 		// Sticky D-pad.
-		page->Setting(&g_Config.bStickyTouchDPad).Enabled(&g_Config.bShowTouchControls);
-		page->Hint("Easier sweeping movements");
+		page->Setting(&g_Config.bStickyTouchDPad).Enabled(&g_Config.bShowTouchControls).Hint("Easier sweeping movements");
 
 		// Re-centers itself to the touch location on touch-down.
 		page->Setting(&g_Config.bAutoCenterTouchAnalog).Enabled(&g_Config.bShowTouchControls);
@@ -143,8 +141,7 @@ void BuildControlsSettings(SettingsPage *page) {
 #if PPSSPP_PLATFORM(WINDOWS) && !PPSSPP_PLATFORM(UWP)
 		page->Setting(&g_Config.bIgnoreWindowsKey);
 #endif
-		page->Setting(&g_Config.fAnalogLimiterDeadzone);
-		page->Hint({ I18NCat::CONTROLS, "AnalogLimiter Tip", "When the analog limiter button is pressed" });
+		page->Setting(&g_Config.fAnalogLimiterDeadzone).Hint({ I18NCat::CONTROLS, "AnalogLimiter Tip", "When the analog limiter button is pressed" });
 		page->Setting(&g_Config.iRapidFireInterval);
 #if PPSSPP_PLATFORM(WINDOWS) || defined(SDL) || PPSSPP_PLATFORM(ANDROID)
 		bool enableMouseSettings = true;
@@ -161,8 +158,7 @@ void BuildControlsSettings(SettingsPage *page) {
 			page->Header({ I18NCat::CONTROLS, "Mouse", "Mouse settings" });
 			page->Setting(&g_Config.iMouseWheelUpDelayMs);
 
-			page->Setting(&g_Config.bMouseControl);
-			page->Hint({ I18NCat::CONTROLS, "MouseControl Tip", "You can now map mouse in control mapping screen by pressing the 'M' icon." });
+			page->Setting(&g_Config.bMouseControl).Hint({ I18NCat::CONTROLS, "MouseControl Tip", "You can now map mouse in control mapping screen by pressing the 'M' icon." });
 
 #if !PPSSPP_PLATFORM(ANDROID)
 			page->Setting(&g_Config.bMouseConfine).Enabled(&g_Config.bMouseControl);

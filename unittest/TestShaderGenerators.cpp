@@ -212,29 +212,22 @@ bool TestReinterpretShaders() {
 
 		std::string errorMessage;
 
-		// Stencil export only on Vulkan, as GLSL_3xx is ES, which doesn't support it.
-		const int numOutputs = languages[k] == ShaderLanguage::GLSL_VULKAN ? 3 : 2;
-		for (int o = 0; o < numOutputs; o++) {
-			const ReinterpretOutput output = (ReinterpretOutput)o;
-			const char *extensions[1] = { g_stencilExportExtension };
-			const Slice<const char *> writerExtensions = output == ReinterpretOutput::STENCIL_EXPORT ? Slice<const char *>(extensions) : Slice<const char *>::empty();
-			for (int i = 0; i < 3; i++) {
-				for (int j = 0; j < 3; j++) {
-					if (i == j)
-						continue;  // useless shader!
-					ShaderWriter writer(buffer, desc, ShaderStage::Fragment, writerExtensions);
-					GenerateReinterpretFragmentShader(writer, fmts[i], fmts[j], output);
-					if (strlen(buffer) >= 8192) {
-						printf("Reinterpret fragment shader %d (output %d) exceeded buffer:\n\n%s\n", (int)j, o, LineNumberString(buffer).c_str());
-						failed = true;
-					}
-					if (!TestCompileShader(buffer, languages[k], ShaderStage::Fragment, &errorMessage)) {
-						printf("Error compiling reinterpret fragment shader %d (output %d):\n\n%s\n\n%s\n", (int)j, o, LineNumberString(buffer).c_str(), errorMessage.c_str());
-						failed = true;
-					} else {
-						if (g_testLog) {
-							printf("===\n%s\n===\n", buffer);
-						}
+		for (int i = 0; i < 3; i++) {
+			for (int j = 0; j < 3; j++) {
+				if (i == j)
+					continue;  // useless shader!
+				ShaderWriter writer(buffer, desc, ShaderStage::Fragment);
+				GenerateReinterpretFragmentShader(writer, fmts[i], fmts[j]);
+				if (strlen(buffer) >= 8192) {
+					printf("Reinterpret fragment shader %d exceeded buffer:\n\n%s\n", (int)j, LineNumberString(buffer).c_str());
+					failed = true;
+				}
+				if (!TestCompileShader(buffer, languages[k], ShaderStage::Fragment, &errorMessage)) {
+					printf("Error compiling reinterpret fragment shader %d:\n\n%s\n\n%s\n", (int)j, LineNumberString(buffer).c_str(), errorMessage.c_str());
+					failed = true;
+				} else {
+					if (g_testLog) {
+						printf("===\n%s\n===\n", buffer);
 					}
 				}
 			}
@@ -380,7 +373,8 @@ const ShaderLanguage languages[] = {
 };
 const int numLanguages = ARRAY_SIZE(languages);
 
-bool TestVertexShaders() {
+// vr: GPU_USE_VIRTUAL_REALITY is set, which only the GLSL backends (OpenGL, Vulkan) use.
+bool TestVertexShaders(bool vr) {
 	char *buffer[numLanguages];
 
 	for (int i = 0; i < numLanguages; i++) {
@@ -416,6 +410,10 @@ bool TestVertexShaders() {
 		std::string genErrorString[numLanguages];
 
 		for (int j = 0; j < numLanguages; j++) {
+			if (vr && languages[j] == ShaderLanguage::HLSL_D3D11) {
+				buffer[j][0] = '\0';
+				continue;
+			}
 			generateSuccess[j] = GenerateVShader(id, buffer[j], languages[j], bugs, &genErrorString[j]);
 			if (!genErrorString[j].empty()) {
 				if (g_testLog) {
@@ -728,7 +726,16 @@ bool TestShaderGenerators() {
 		return false;
 	}
 
-	if (!TestVertexShaders()) {
+	if (!TestVertexShaders(false)) {
+		return false;
+	}
+
+	// Again with the VR uniforms and the per-eye view (with VS_BIT_SIMPLE_STEREO on Vulkan).
+	const u32 oldFlags = gstate_c.GetUseFlags();
+	gstate_c.SetUseFlags(oldFlags | GPU_USE_VIRTUAL_REALITY);
+	const bool vrResult = TestVertexShaders(true);
+	gstate_c.SetUseFlags(oldFlags);
+	if (!vrResult) {
 		return false;
 	}
 

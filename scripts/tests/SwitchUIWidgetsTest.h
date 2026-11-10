@@ -111,9 +111,8 @@ struct UIContext {
 	std::vector<std::string> labels;
 	Theme &GetTheme() { return theme; }
 	DrawBuffer *Draw() { return &draw; }
-	void SetFontStyle(int) {}
 	void MeasureText(int, float, float, std::string_view s, float *w, float *h) { *w = s.size() * 9; *h = 18; }
-	void DrawText(std::string_view s, float x, float, uint32_t, int) { assert(x >= 0 && x <= 1000); labels.emplace_back(s); }
+	void DrawText(int, std::string_view s, float x, float, uint32_t, int) { assert(x >= 0 && x <= 1000); labels.emplace_back(s); }
 	void FillRect(UI::Drawable, Bounds) {}
 };
 struct Category { std::string_view T(std::string_view s) { return s; } } category;

@@ -521,6 +521,8 @@ static void check_dynamic_variables(CoreParameter &coreParam) {
    }
 }
 
+extern int DefaultDepthRaster();
+
 static void check_variables(CoreParameter &coreParam)
 {
    check_dynamic_variables(coreParam);
@@ -814,6 +816,23 @@ static void check_variables(CoreParameter &coreParam)
          g_Config.iInflightFrames = 1;
       else if (!strcmp(var.value, "Up to 1"))
          g_Config.iInflightFrames = 2;
+      else if (!strcmp(var.value, "Up to 2"))
+         g_Config.iInflightFrames = 3;
+   }
+
+   var.key = "ppsspp_depth_raster";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (!strcmp(var.value, "auto"))
+         g_Config.iDepthRasterMode = (int)DepthRasterMode::DEFAULT;
+      else if (!strcmp(var.value, "low"))
+         g_Config.iDepthRasterMode = (int)DepthRasterMode::LOW_QUALITY;
+      else if (!strcmp(var.value, "off"))
+         g_Config.iDepthRasterMode = (int)DepthRasterMode::OFF;
+      else if (!strcmp(var.value, "always_on"))
+         g_Config.iDepthRasterMode = (int)DepthRasterMode::FORCE_ON;
+      else
+         g_Config.iDepthRasterMode = DefaultDepthRaster();
    }
 
    var.key = "ppsspp_skip_buffer_effects";
@@ -1641,10 +1660,13 @@ void retro_unload_game(void) {
       Libretro::EmuThreadStop();
    }
 
-	Libretro::FinishPendingBoot();
-	// A failed boot has already shut down.
-	if (PollBootState() != BootState::Off)
-		PSP_Shutdown(true);
+	{
+		ScopedContextLock contextLock;
+		Libretro::FinishPendingBoot();
+		// A failed boot has already shut down.
+		if (PollBootState() != BootState::Off)
+			PSP_Shutdown(true);
+	}
 	g_VFS.Clear();
 
 	if (ctx && ctx->GetGPUCore() == GPUCORE_GLES && ctx->GetDrawContext()) {
@@ -1663,6 +1685,7 @@ void retro_reset(void) {
    if (Libretro::useEmuThread)
       Libretro::EmuThreadStop();
 
+   ScopedContextLock contextLock;
    Libretro::FinishPendingBoot();
    if (PollBootState() != BootState::Off)
       PSP_Shutdown(true);
@@ -1767,6 +1790,16 @@ static void retro_input(void) {
 
 // Called every frame by retroarch.
 void retro_run(void) {
+   // Hold the graphics context for the frame. SwapBuffers lets go of it before handing the frame over.
+   ctx->BeginFrameAccess();
+   struct FrameAccessEnd {
+      ~FrameAccessEnd() {
+         if (ctx) {
+            ctx->EndFrameAccess();
+         }
+      }
+   } frameAccessEnd;
+
    if (g_pendingBoot) {
       BootState state = PSP_InitUpdate(&g_bootErrorString);
       switch (state) {
@@ -1860,6 +1893,7 @@ size_t retro_serialize_size(void)
    if (!gpu) // The HW renderer isn't ready on first pass.
       return 134217728; // 128MB ought to be enough for anybody.
 
+   ScopedContextLock contextLock;
    SaveState::SaveStart state;
    // TODO: Libretro API extension to use the savestate queue
    if (useEmuThread)
@@ -1878,6 +1912,7 @@ bool retro_serialize(void *data, size_t size) {
       EmuThreadPause(); // Does nothing if already paused
    }
 
+   ScopedContextLock contextLock;
    SaveState::SaveStart state;
    // The buffer was sized by an earlier retro_serialize_size(); the state
    // may have grown since, so never write past 'size'.
@@ -1912,6 +1947,7 @@ bool retro_unserialize(const void *data, size_t size) {
    if (useEmuThread)
       EmuThreadPause(); // Does nothing if already paused
 
+   ScopedContextLock contextLock;
    std::string errorString;
    SaveState::SaveStart state;
    bool retVal = CChunkFileReader::LoadPtr((u8 *)data, size, state, &errorString)
@@ -2080,6 +2116,12 @@ bool System_GetPropertyBool(SystemProperty prop) {
       return (environ_cb(RETRO_ENVIRONMENT_GET_JIT_CAPABLE, &can_jit) && can_jit);
 #else
       return true;
+#endif
+   case SYSPROP_ENOUGH_RAM_FOR_FULL_ISO:
+#ifdef LIBRETRO_CAN_CACHE_ISO_IN_RAM
+      return true;
+#else
+      return false;
 #endif
    default:
       return false;

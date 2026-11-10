@@ -116,7 +116,7 @@ bool BackgroundScreen::renderOutput(const OutputDisplay &output) {
 	}
 	const Bounds &bounds = dc.GetBounds();
 	dc.Begin();
-	dc.DrawText(text, bounds.centerX(), bounds.centerY(), 0xFF505050, ALIGN_CENTER);
+	dc.DrawText(dc.GetTheme().uiFont, text, bounds.centerX(), bounds.centerY(), 0xFF505050, ALIGN_CENTER);
 	dc.Flush();
 	return true;
 }
@@ -304,9 +304,8 @@ NewLanguageScreen::NewLanguageScreen(std::string_view title) : ListPopupScreen(t
 			continue;
 		}
 
-		// We only support Arabic on platforms where we have support for the native text rendering
-		// APIs, as proper Arabic support is way too difficult to implement ourselves.
-#if !(PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(ANDROID))
+		// Arabic script needs a text drawer that does shaping (see TextDrawer::Create), the atlas font can't.
+#if defined(__LIBRETRO__) || !(PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(ANDROID) || PPSSPP_PLATFORM(MAC) || PPSSPP_PLATFORM(IOS) || defined(USE_SDL3_TTF))
 		if (tempLangs[i].name.find("ar_AE") != std::string::npos) {
 			continue;
 		}
@@ -510,11 +509,10 @@ void LogoScreen::DrawForeground(UIContext &dc) {
 	dc.Draw()->DrawImage(ImageID("I_LOGO"), bounds.centerX() + 45, startY, 1.5f, 0xFFFFFFFF, ALIGN_CENTER);
 	//dc.Draw()->DrawTextShadow(UBUNTU48, "PPSSPP", bounds.w / 2, bounds.h / 2 - 30, textColor, ALIGN_CENTER);
 	dc.SetFontScale(1.0f, 1.0f);
-	dc.SetFontStyle(dc.GetTheme().uiFont);
-	dc.DrawText(temp, bounds.centerX(), startY + 70, textColor, ALIGN_CENTER);
-	dc.DrawText(cr->T_cstr("license", "Free Software under GPL 2.0+"), bounds.centerX(), startY + 110, textColor, ALIGN_CENTER);
+	dc.DrawText(dc.GetTheme().uiFont, temp, bounds.centerX(), startY + 70, textColor, ALIGN_CENTER);
+	dc.DrawText(dc.GetTheme().uiFont, cr->T_cstr("license", "Free Software under GPL 2.0+"), bounds.centerX(), startY + 110, textColor, ALIGN_CENTER);
 
-	dc.DrawText("www.ppsspp.org", bounds.centerX(), startY + 160, textColor, ALIGN_CENTER);
+	dc.DrawText(dc.GetTheme().uiFont, "www.ppsspp.org", bounds.centerX(), startY + 160, textColor, ALIGN_CENTER);
 
 #if !PPSSPP_PLATFORM(UWP) || defined(_DEBUG)
 	// Draw the graphics API, except on UWP where it's always D3D11
@@ -524,7 +522,7 @@ void LogoScreen::DrawForeground(UIContext &dc) {
 	// Add some emoji for testing.
 	apiName += CodepointToUTF8(0x1F41B) + CodepointToUTF8(0x1F41C) + CodepointToUTF8(0x1F914);
 #endif
-	dc.DrawText(apiName, bounds.centerX(), startY + 200, textColor, ALIGN_CENTER);
+	dc.DrawText(dc.GetTheme().uiFont, apiName, bounds.centerX(), startY + 200, textColor, ALIGN_CENTER);
 #endif
 
 	dc.Flush();
@@ -603,8 +601,8 @@ void CreditsScreen::CreateDialogViews(UI::ViewGroup *parent) {
 		right->Add(new Spacer(0.0f, new LinearLayoutParams(1.0f)));
 	}
 
-	left->ApplyRoundCorners();
-	right->ApplyRoundCorners();
+	left->SetRoundCorners();
+	right->SetRoundCorners();
 
 	int rightYOffset = 0;
 	if (!System_GetPropertyBool(SYSPROP_APP_GOLD)) {
@@ -641,6 +639,9 @@ void CreditsScreen::CreateDialogViews(UI::ViewGroup *parent) {
 			System_ShareText(cr->T("CheckOutPPSSPP", "Check out PPSSPP, the awesome PSP emulator: https://www.ppsspp.org/"));
 		});
 	}
+
+	left->SetRoundCorners();
+	right->SetRoundCorners();
 }
 
 void CreditsScreen::update() {
@@ -833,7 +834,7 @@ void CreditsScroller::Draw(UIContext &dc) {
 
 		if (alpha > 0.0f) {
 			dc.SetFontScale(ease(alpha), ease(alpha));
-			dc.DrawText(credits[i], bounds.centerX(), y + bounds.y, textColor, ALIGN_HCENTER);
+			dc.DrawText(dc.GetTheme().uiFont, credits[i], bounds.centerX(), y + bounds.y, textColor, ALIGN_HCENTER);
 			dc.SetFontScale(1.0f, 1.0f);
 		}
 	}
