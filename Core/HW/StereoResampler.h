@@ -23,6 +23,22 @@
 #include <atomic>
 
 #include "Common/CommonTypes.h"
+#include "ppsspp_config.h"
+
+#if PPSSPP_PLATFORM(SWITCH)
+// Smooth only the boundaries of a host audio starvation gap.
+class SwitchAudioGapFade {
+public:
+	void Reset() { *this = {}; }
+	void Process(int16_t *samples, unsigned validFrames, unsigned frames, int sampleRate);
+
+private:
+	int16_t last_[2]{};
+	int16_t start_[2]{};
+	unsigned fadeOut_ = 0, fadeIn_ = 0;
+	bool gap_ = false;
+};
+#endif
 
 struct AudioDebugStats;
 
@@ -54,6 +70,10 @@ private:
 	int inputSampleRateHz_ = 44100;
 
 	int16_t *buffer_ = nullptr;
+#if PPSSPP_PLATFORM(SWITCH)
+	SwitchAudioGapFade gapFade_;
+	std::atomic<bool> gapResetPending_{false};
+#endif
 	std::atomic<u32> indexW_;
 	std::atomic<u32> indexR_;
 	float numLeftI_ = 0.0f;

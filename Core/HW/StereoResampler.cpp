@@ -35,6 +35,7 @@
 #include "ppsspp_config.h"
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <atomic>
 
 #include "Common/Common.h"
@@ -48,6 +49,46 @@
 #include "Core/HW/StereoResampler.h"
 #include "Core/Util/AudioFormat.h"  // for clamp_u16
 #include "Core/System.h"
+
+#if PPSSPP_PLATFORM(SWITCH)
+void SwitchAudioGapFade::Process(int16_t *samples, unsigned validFrames, unsigned frames, int sampleRate) {
+	if (!frames) {
+		return;
+	}
+	const unsigned fadeFrames = std::clamp(sampleRate / 200, 1, 512);  // Five milliseconds.
+	if (validFrames && gap_) {
+		gap_ = false;
+		fadeIn_ = fadeFrames;
+		std::copy(std::begin(last_), std::end(last_), start_);
+	}
+	for (unsigned i = 0; i < validFrames && fadeIn_; ++i) {
+		const unsigned remaining = std::min(fadeIn_, fadeFrames) - 1;
+		for (unsigned channel = 0; channel < 2; ++channel) {
+			samples[i * 2 + channel] = (start_[channel] * (int)remaining +
+				samples[i * 2 + channel] * (int)(fadeFrames - remaining)) / (int)fadeFrames;
+		}
+		fadeIn_ = remaining;
+	}
+	if (validFrames) {
+		last_[0] = samples[(validFrames - 1) * 2];
+		last_[1] = samples[(validFrames - 1) * 2 + 1];
+	}
+	if (validFrames < frames && !gap_) {
+		gap_ = true;
+		fadeOut_ = fadeFrames;
+		fadeIn_ = 0;
+		std::copy(std::begin(last_), std::end(last_), start_);
+	}
+	for (unsigned i = validFrames; i < frames; ++i) {
+		const unsigned remaining = fadeOut_ ? std::min(fadeOut_, fadeFrames) - 1 : 0;
+		for (unsigned channel = 0; channel < 2; ++channel) {
+			last_[channel] = start_[channel] * (int)remaining / (int)fadeFrames;
+			samples[i * 2 + channel] = last_[channel];
+		}
+		fadeOut_ = remaining;
+	}
+}
+#endif
 
 StereoResampler::StereoResampler() noexcept
 		: maxBufsize_(MAX_BUFSIZE_DEFAULT)
@@ -147,6 +188,9 @@ inline void ClampBufferToS16WithVolume(s16 *out, const s32 *in, size_t size, int
 
 void StereoResampler::Clear() {
 	memset(buffer_, 0, maxBufsize_ * 2 * sizeof(int16_t));
+#if PPSSPP_PLATFORM(SWITCH)
+	gapResetPending_.store(true, std::memory_order_release);
+#endif
 }
 
 inline int16_t MixSingleSample(int16_t s1, int16_t s2, uint16_t frac) {
@@ -168,6 +212,11 @@ void StereoResampler::Mix(s16 *samples, unsigned int numSamples, bool consider_f
 		return;
 	}
 
+#if PPSSPP_PLATFORM(SWITCH)
+	if (gapResetPending_.exchange(false, std::memory_order_acquire)) {
+		gapFade_.Reset();
+	}
+#endif
 	unsigned int currentSample;
 
 	// Cache access in non-volatile variable
@@ -235,15 +284,18 @@ void StereoResampler::Mix(s16 *samples, unsigned int numSamples, bool consider_f
 	// Let's not count the underrun padding here.
 	outputSampleCount_ += currentSample / 2;
 
+#if PPSSPP_PLATFORM(SWITCH)
+	gapFade_.Process(samples, currentSample / 2, numSamples, sample_rate);
+#else
 	// Padding with the last value to reduce clicking
 	short s[2];
-	s[0] = clamp_s16(buffer_[(indexR - 1) & INDEX_MASK]);
-	s[1] = clamp_s16(buffer_[(indexR - 2) & INDEX_MASK]);
+	s[0] = clamp_s16(buffer_[(indexR - 2) & INDEX_MASK]);
+	s[1] = clamp_s16(buffer_[(indexR - 1) & INDEX_MASK]);
 	for (; currentSample < numSamples * 2; currentSample += 2) {
 		samples[currentSample] = s[0];
 		samples[currentSample + 1] = s[1];
 	}
-
+#endif
 	// Flush cached variable
 	indexR_.store(indexR);
 }
