@@ -23,4 +23,8 @@ enum UamStage {
 };
 
 void *UamCompileGlsl(const char *glsl, int stage, size_t *out_size, char **out_log);
+// Also returns how many clip and cull distances the shader writes. The hardware puts the cull distances
+// after the clip distances.
+void *UamCompileGlslDistances(const char *glsl, int stage, size_t *out_size, char **out_log, unsigned *out_clip_distances,
+							  unsigned *out_cull_distances);
 }

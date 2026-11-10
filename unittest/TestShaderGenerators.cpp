@@ -575,6 +575,72 @@ static bool TestDeko3DClipDistanceHeaders() {
 	return true;
 }
 
+// The Deko3D backend counts a cached vertex shader's clip and cull distances from its source, and sets the
+// hardware's cull mode for the slots after the clip distances. The counts have to match UAM's.
+static bool TestDeko3DCullDistances() {
+	uint32_t clip = 0, cull = 0;
+	Deko3DCountDistances("out gl_PerVertex { vec4 gl_Position; float gl_ClipDistance[3]; };\ngl_ClipDistance[1] = 1.0;", &clip, &cull);
+	EXPECT_EQ_INT(clip, 3);
+	EXPECT_EQ_INT(cull, 0);
+	Deko3DCountDistances("gl_ClipDistance[0] = a;\ngl_ClipDistance[1] = b;\ngl_CullDistance[1] = c;\n", &clip, &cull);
+	EXPECT_EQ_INT(clip, 2);
+	EXPECT_EQ_INT(cull, 2);
+	EXPECT_EQ_INT(Deko3DClipDistanceMode(0, 0), 0);
+	EXPECT_EQ_INT(Deko3DClipDistanceMode(2, 2), 0x1100);
+	EXPECT_EQ_INT(Deko3DClipDistanceMode(3, 2), 0x11000);
+	EXPECT_EQ_INT(Deko3DClipDistanceMode(7, 2), 0x10000000);
+
+	const u32 oldFlags = gstate_c.UseFlags();
+	gstate_c.SetUseFlags(oldFlags | GPU_USE_CLIP_DISTANCE | GPU_USE_CULL_DISTANCE);
+	Draw::Bugs bugs;
+	GMRng rng;
+	std::vector<char> buffer(128 * 1024);
+	int compiled = 0, withCull = 0;
+	bool ok = true;
+	for (int i = 0; i < 300 && ok; i++) {
+		const uint64_t id64 = rng.R64();
+		VShaderID id;
+		id.FromUint64(id64);
+		id.SetBit(VS_BIT_SIMPLE_STEREO, false);
+		id.SetBit(VS_BIT_IS_THROUGH, false);
+		id.SetBit(VS_BIT_USE_HW_TRANSFORM, true);
+		id.SetBit(VS_BIT_VERTEX_RANGE_CULLING, i % 2 == 0);
+		std::string error;
+		if (!GenerateVShader(id, buffer.data(), GLSL_VULKAN, bugs, &error)) {
+			continue;  // Not every random ID is a valid combination.
+		}
+		std::string binary;
+		uint32_t arrays = 0, textures = 0, compiledClip = 0, compiledCull = 0;
+		if (!CompileDeko3DShader(ShaderStage::Vertex, buffer.data(), &binary, &arrays, &textures, &error, 0, &compiledClip, &compiledCull)) {
+			printf("Deko3D vertex shader %016llx: %s\n", (unsigned long long)id64, error.c_str());
+			ok = false;
+			break;
+		}
+		Deko3DCountDistances(buffer.data(), &clip, &cull);
+		if (clip != compiledClip || cull != compiledCull) {
+			printf("Deko3D distances of %016llx: source clip=%u cull=%u, compiled clip=%u cull=%u\n", (unsigned long long)id64, clip, cull, compiledClip, compiledCull);
+			ok = false;
+		}
+		// The header exports the clip distances and then the cull distances (see TestDeko3DClipDistanceHeaders).
+		uint32_t controlSize, programsOffset, entrypoint;
+		memcpy(&controlSize, binary.data() + 8, sizeof(controlSize));
+		memcpy(&programsOffset, binary.data() + 16, sizeof(programsOffset));
+		memcpy(&entrypoint, binary.data() + programsOffset + 4, sizeof(entrypoint));
+		const uint8_t distanceMask = (uint8_t)binary[(size_t)controlSize + entrypoint + 72];
+		if (distanceMask != (1u << (clip + cull)) - 1) {
+			printf("Deko3D distance mask of %016llx: %02x for clip=%u cull=%u\n", (unsigned long long)id64, distanceMask, clip, cull);
+			ok = false;
+		}
+		compiled++;
+		withCull += cull > 0;
+	}
+	gstate_c.SetUseFlags(oldFlags);
+	printf("Deko3D cull distances: %d vertex shaders compiled, %d with cull distances\n", compiled, withCull);
+	EXPECT_TRUE(ok);
+	EXPECT_TRUE(withCull >= 50);
+	return true;
+}
+
 static bool TestDeko3DThin3DShaders() {
 	const ShaderLanguageDesc language(GLSL_VULKAN);
 	for (int i = 0; i < Draw::VS_MAX_PRESET; ++i) {
@@ -635,6 +701,9 @@ bool TestShaderGenerators() {
 
 #ifdef PPSSPP_DEKO3D_SHADER_TESTS
 	if (!TestDeko3DClipDistanceHeaders()) {
+		return false;
+	}
+	if (!TestDeko3DCullDistances()) {
 		return false;
 	}
 	if (!TestDeko3DThin3DShaders()) {

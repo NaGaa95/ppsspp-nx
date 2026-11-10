@@ -104,6 +104,11 @@ void UamFrontendInitOnce() {
 void UamFrontendExitOnce() {}
 
 void *UamCompileGlsl(const char *glsl, int stage, size_t *out_size, char **out_log) {
+	return UamCompileGlslDistances(glsl, stage, out_size, out_log, nullptr, nullptr);
+}
+
+void *UamCompileGlslDistances(const char *glsl, int stage, size_t *out_size, char **out_log, unsigned *out_clip_distances,
+							  unsigned *out_cull_distances) {
 	static std::mutex compilerMutex;
 	std::lock_guard<std::mutex> guard(compilerMutex);
 	*out_size = 0;
@@ -122,6 +127,12 @@ void *UamCompileGlsl(const char *glsl, int stage, size_t *out_size, char **out_l
 		DekoCompiler compiler{static_cast<pipeline_stage>(stage)};
 		if (compiler.CompileGlsl(glsl)) {
 			dksh = BuildDksh(compiler, out_size);
+			if (out_clip_distances) {
+				*out_clip_distances = compiler.m_info.io.clipDistances;
+			}
+			if (out_cull_distances) {
+				*out_cull_distances = compiler.m_info.io.cullDistances;
+			}
 		}
 		ReleaseCompilerOutput(compiler);
 	}

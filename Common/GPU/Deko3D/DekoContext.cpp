@@ -147,6 +147,7 @@ struct Shader : ShaderModule {
 	ShaderStage stage;
 	uint32_t arrays = 0;
 	uint32_t textures = 0;
+	uint32_t clipDistanceMode = 0;  // Deko3DClipDistanceMode() of a vertex shader.
 	~Shader() override { owner->Retire(std::move(code)); }
 	ShaderStage GetStage() const override { return stage; }
 };
@@ -509,7 +510,9 @@ bool Context::Init(void *window, std::string *error) {
 	caps_.vendor = GPUVendor::VENDOR_NVIDIA;
 	caps_.deviceName = "Nintendo Switch Tegra X1 (deko3d)";
 	caps_.maxTextureSize = 16384;
+	// Clip and cull distances share eight slots. Apply() sets the hardware's cull mode, which deko3d doesn't.
 	caps_.maxClipDistances = 8;
+	caps_.maxCullDistances = 8;
 	caps_.coordConvention = CoordConvention::Vulkan;
 	caps_.preferredDepthBufferFormat = DataFormat::D24_S8;
 	caps_.preferredShadowMapFormatLow = DataFormat::D16;
@@ -1243,9 +1246,21 @@ ShaderModule *Context::CreateNativeShader(ShaderStage stage, ShaderLanguage lang
 		}
 	}
 	size_t binarySize = 0;
-	if (!fromCache && !CompileDeko3DShader(stage, source.c_str(), &compiledBytes, &arrays, &textures, &error, textureBindingBase)) {
+	// The cache doesn't keep the distance counts, so they come from the source, checked against the compiler
+	// whenever it runs.
+	uint32_t clipDistances = 0, cullDistances = 0, compiledClip = 0, compiledCull = 0;
+	Deko3DCountDistances(source.c_str(), &clipDistances, &cullDistances);
+	if (!fromCache && !CompileDeko3DShader(stage, source.c_str(), &compiledBytes, &arrays, &textures, &error, textureBindingBase,
+										   &compiledClip, &compiledCull)) {
 		ERROR_LOG(Log::G3D, "deko3d compiler %s: %s", tag, error.c_str());
 		return nullptr;
+	}
+	if (!fromCache && stage == ShaderStage::Vertex && (compiledClip != clipDistances || compiledCull != cullDistances)) {
+		const std::string detail = StringFromFormat("source clip=%u cull=%u compiled clip=%u cull=%u", clipDistances, cullDistances,
+													compiledClip, compiledCull);
+		ERROR_LOG(Log::G3D, "deko3d shader %s distance counts differ: %s", tag, detail.c_str());
+		clipDistances = compiledClip;
+		cullDistances = compiledCull;
 	}
 	binarySize = compiledBytes.size();
 	const void *binary = compiledBytes.data();
@@ -1272,6 +1287,9 @@ ShaderModule *Context::CreateNativeShader(ShaderStage stage, ShaderLanguage lang
 	shader->stage = stage;
 	shader->arrays = arrays;
 	shader->textures = textures;
+	if (stage == ShaderStage::Vertex) {
+		shader->clipDistanceMode = Deko3DClipDistanceMode(clipDistances, cullDistances);
+	}
 	shader->code = device_->Allocate(header.codeSize + DK_SHADER_CODE_UNUSABLE_SIZE,
 									 DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code, "shader code");
 	if (!shader->code) {
@@ -1372,10 +1390,18 @@ bool Context::Apply() {
 	auto cmd = Commands();
 	if (stateDirty_) {
 		DkShader const *shaders[2]{};
+		uint32_t clipDistanceMode = 0;
 		for (auto &shader : pipeline_->shaders) {
 			shaders[shader->stage == ShaderStage::Vertex ? 0 : 1] = &shader->shader;
+			if (shader->stage == ShaderStage::Vertex) {
+				clipDistanceMode = shader->clipDistanceMode;
+			}
 		}
 		cmd.bindShaders(DkStageFlag_GraphicsMask, {shaders[0], shaders[1]});
+		// CLIP_DISTANCE_MODE (3D method 0x650, nouveau's NVC0_3D_CLIP_DISTANCE_MODE), which deko3d has no state for:
+		// an increasing-method header with one data word, on the 3D subchannel (0).
+		const uint32_t clipMode[2] = {(1u << 29) | (1u << 16) | 0x650, clipDistanceMode};
+		dkCmdBufReplayCmds(cmd, clipMode, 2);
 		// All native framebuffers are single-sample. Bind the full draw state,
 		// including stages and sample settings unused by PPSSPP.
 		cmd.bindMultisampleState(dk::MultisampleState{});

@@ -312,8 +312,8 @@ add_custom_command(
   COMMAND "${CMAKE_LINKER}" -r --force-group-allocation
           --whole-archive "$<TARGET_FILE:uam_objects>" --no-whole-archive
           -o "${_uam_isolated}.tmp"
-  COMMAND "${CMAKE_OBJCOPY}" --keep-global-symbol=UamCompileGlsl "${_uam_isolated}.tmp"
-          "${_uam_isolated}"
+  COMMAND "${CMAKE_OBJCOPY}" --keep-global-symbol=UamCompileGlsl --keep-global-symbol=UamCompileGlslDistances
+          "${_uam_isolated}.tmp" "${_uam_isolated}"
   COMMAND "${CMAKE_COMMAND}" -E rm -f "${_uam_isolated}.tmp"
   DEPENDS uam_objects
   COMMENT "Localising uam's mesa symbols so they cannot bind against NXVK's")

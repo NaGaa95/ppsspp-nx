@@ -6,16 +6,58 @@
 
 #include "Common/GPU/Deko3D/ShaderCompiler.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 #include "Common/GPU/Deko3D/UamBridge.h"
 #include "Common/GPU/Vulkan/VulkanContext.h"
 #include "ext/SPIRV-Cross/spirv_glsl.hpp"
 
+void Deko3DCountDistances(const char *source, uint32_t *clipDistances, uint32_t *cullDistances) {
+	const std::string_view text(source);
+	auto count = [&](std::string_view name) {
+		uint32_t result = 0;
+		for (size_t pos = text.find(name); pos != std::string_view::npos; pos = text.find(name, pos + 1)) {
+			size_t at = pos + name.size();
+			if (at >= text.size() || text[at] != '[') {
+				continue;
+			}
+			uint32_t value = 0;
+			bool digits = false;
+			while (++at < text.size() && text[at] >= '0' && text[at] <= '9') {
+				value = value * 10 + (text[at] - '0');
+				digits = true;
+			}
+			if (!digits || at >= text.size() || text[at] != ']') {
+				continue;
+			}
+			// "float gl_ClipDistance[3]" declares a size; anything else is an index.
+			size_t before = pos;
+			while (before > 0 && (text[before - 1] == ' ' || text[before - 1] == '\t')) {
+				before--;
+			}
+			const bool declaration = before >= 5 && text.substr(before - 5, 5) == "float";
+			result = std::max(result, declaration ? value : value + 1);
+		}
+		return result;
+	};
+	*clipDistances = count("gl_ClipDistance");
+	*cullDistances = count("gl_CullDistance");
+}
+
+uint32_t Deko3DClipDistanceMode(uint32_t clipDistances, uint32_t cullDistances) {
+	uint32_t mode = 0;
+	for (uint32_t i = 0; i < cullDistances && clipDistances + i < 8; ++i) {
+		mode |= 1u << ((clipDistances + i) * 4);
+	}
+	return mode;
+}
+
 bool CompileDeko3DShader(ShaderStage stage, const char *source, std::string *binary, uint32_t *arrayTextures, uint32_t *textures,
-						 std::string *error, uint32_t textureBindingBase) {
+						 std::string *error, uint32_t textureBindingBase, uint32_t *clipDistances, uint32_t *cullDistances) {
 	// glslang and UAM share process-wide compiler state.
 	static std::mutex compilerMutex;
 	std::lock_guard<std::mutex> lock(compilerMutex);
@@ -90,7 +132,14 @@ bool CompileDeko3DShader(ShaderStage stage, const char *source, std::string *bin
 	}
 	size_t size = 0;
 	char *log = nullptr;
-	void *compiled = UamCompileGlsl(glsl.c_str(), uamStage, &size, &log);
+	unsigned clip = 0, cull = 0;
+	void *compiled = UamCompileGlslDistances(glsl.c_str(), uamStage, &size, &log, &clip, &cull);
+	if (clipDistances) {
+		*clipDistances = clip;
+	}
+	if (cullDistances) {
+		*cullDistances = cull;
+	}
 	if (log) {
 		*error = log;
 		free(log);
