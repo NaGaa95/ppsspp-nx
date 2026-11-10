@@ -17,10 +17,12 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Common/TimeUtil.h"
 #include "GPU/Common/DepthRaster.h"
 #include "unittest/UnitTest.h"
 
@@ -73,6 +75,8 @@ bool TestDepthRaster() {
 	std::vector<u8> covered(BUF_W * BUF_H);
 	int mismatches = 0;
 	int pixels = 0;
+	int interpolatedCases = 0;
+	std::vector<u16> reference(depth.size()), skipped(depth.size());
 
 	for (int trial = 0; trial < 4000; trial++) {
 		DepthScissor scissor;
@@ -118,8 +122,58 @@ bool TestDepthRaster() {
 					printf("Trial %d: pixel %d,%d is %d, expected %s\n", trial, i % BUF_W, i / BUF_W, depth[i], covered[i] ? "covered" : "empty");
 			}
 		}
+		if (trial < 200) {
+			if (trial % 10 == 0) {
+				tx[4] = 10000;
+			}
+			if (trial % 17 == 0) {
+				ty[8] = -10000;
+			}
+			for (int i = 0; i < groups * 12; ++i) {
+				tz[i] = (rng.Next() & 0xFFFF) + (rng.Next() & 255) * (1.0f / 256.0f);
+			}
+			for (bool lowQ : {false, true}) {
+				for (ZCompareMode compare : {ZCompareMode::Greater, ZCompareMode::Less, ZCompareMode::Always}) {
+					for (auto &value : reference) {
+						value = (u16)rng.Next();
+					}
+					skipped = reference;
+					draw.compareMode = compare;
+					DepthRasterScreenVerts(reference.data(), BUF_W, tx, ty, tz, groups * 12, draw, scissor, lowQ, false, false);
+					DepthRasterScreenVerts(skipped.data(), BUF_W, tx, ty, tz, groups * 12, draw, scissor, lowQ, false, true);
+					if (reference != skipped) {
+						printf("Empty-block skip changed depth: trial=%d lowQ=%d compare=%d\n", trial, lowQ, (int)compare);
+						mismatches++;
+					}
+					++interpolatedCases;
+				}
+			}
+		}
 	}
-	printf("%d pixels covered\n", pixels);
+	printf("%d pixels covered; %d interpolated depth buffers match the original traversal\n", pixels, interpolatedCases);
+	EXPECT_EQ_INT(interpolatedCases, 1200);
+	if (getenv("PPSSPP_BENCH_DEPTH")) {
+		DepthDraw draw{};
+		draw.prim = GE_PRIM_TRIANGLES;
+		draw.compareMode = ZCompareMode::Greater;
+		const DepthScissor scissor{0, 0, 479, 271};
+		for (int shape = 0; shape < 3; ++shape) {
+			alignas(16) int tx[12], ty[12];
+			alignas(16) float tz[12];
+			for (int t = 0; t < 4; ++t) {
+				tx[t] = 8; ty[t] = 8;
+				tx[t + 4] = shape == 2 ? 16 : 475; ty[t + 4] = shape == 0 ? 264 : 8;
+				tx[t + 8] = shape == 0 ? 472 : 8; ty[t + 8] = shape == 2 ? 16 : 264;
+				tz[t] = 1000.25f; tz[t + 4] = 40000.5f; tz[t + 8] = 20000.75f;
+			}
+			for (bool skip : {false, true}) {
+				const double rate = CallsPerSecond([&] {
+					DepthRasterScreenVerts(depth.data(), BUF_W, tx, ty, tz, 12, draw, scissor, false, false, skip);
+				}, 0.3, 100);
+				printf("Depth benchmark shape=%d skip=%d: %.0f triangles/s\n", shape, skip, rate * 4);
+			}
+		}
+	}
 	EXPECT_EQ_INT(mismatches, 0);
 	EXPECT_TRUE(pixels > 1000000);
 	return true;

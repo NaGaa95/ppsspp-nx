@@ -105,7 +105,7 @@ constexpr int MIN_TWICE_TRI_AREA = 10;
 
 // A mix of ideas from Intel's sample and ryg's rasterizer blog series.
 template<ZCompareMode compareMode, bool lowQ>
-void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthScissor scissor, const int *tx, const int *ty, const float *tz) {
+void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthScissor scissor, const int *tx, const int *ty, const float *tz, bool skipEmptyBlocks) {
 	// Triangle setup. This is done using SIMD, four triangles at a time.
 	// 16x16->32 multiplications are doable on SSE2, which should be all we need.
 
@@ -190,6 +190,14 @@ void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthSc
 
 		const int minYT = minY[t];
 		const int maxYT = maxY[t];
+		// The coarse edge bounds must not cross a signed edge-function overflow.
+		auto inGuard = [](int value) { return (u32)value + 4096U <= 8192U; };
+		const bool canSkip = skipEmptyBlocks && (u32)maxXT - (u32)minXT >= 28 &&
+			inGuard(x0[t]) && inGuard(x1[t]) && inGuard(x2[t]) &&
+			inGuard(y0[t]) && inGuard(y1[t]) && inGuard(y2[t]);
+		const int maxAhead12 = canSkip ? std::max(stepX12[t] * 7, 0) : 0;
+		const int maxAhead20 = canSkip ? std::max(stepX20[t] * 7, 0) : 0;
+		const int maxAhead01 = canSkip ? std::max(stepX01[t] * 7, 0) : 0;
 
 		// Convert to wide registers.
 		Vec4S32 initialX = Vec4S32::Splat(minXT) + Vec4S32::LoadAligned(zero123);
@@ -233,8 +241,25 @@ void DepthRaster4Triangles(int stats[3], uint16_t *depthBuf, int stride, DepthSc
 				Vec4S32 signCalc = w0 | w1 | w2;
 
 				if (!AnyZeroSignBit(signCalc)) {
-					if (rowEntered)
+					if (rowEntered) {
 						break;
+					}
+					if (canSkip && x + 28 <= maxXT) {
+						// Bound each lane over eight tiles. Different edges may reach their maxima at
+						// different X positions; this overestimates coverage and can only miss a skip.
+						const Vec4S32 coarse = (w0 + Vec4S32::Splat(maxAhead12)) |
+							(w1 + Vec4S32::Splat(maxAhead20)) | (w2 + Vec4S32::Splat(maxAhead01));
+						if (!AnyZeroSignBit(coarse)) {
+							w0 += oneStepX12.Shl<3>() - oneStepX12;
+							w1 += oneStepX20.Shl<3>() - oneStepX20;
+							w2 += oneStepX01.Shl<3>() - oneStepX01;
+							// Keep the original sequence of float additions, including rounding.
+							for (int step = 0; step < 7; ++step) {
+								zs += zdeltaX;
+							}
+							x += 28;  // The loop increment advances the eighth tile.
+						}
+					}
 					continue;
 				}
 				rowEntered = true;
@@ -566,7 +591,7 @@ int DepthRasterClipIndexedTriangles(int *tx, int *ty, float *tz, const float *tr
 }
 
 // Rasterizes screen-space vertices.
-void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, const int *ty, const float *tz, int count, const DepthDraw &draw, const DepthScissor scissor, bool lowQ, bool updateStats) {
+void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, const int *ty, const float *tz, int count, const DepthDraw &draw, const DepthScissor scissor, bool lowQ, bool updateStats, bool skipEmptyBlocks) {
 	// Prim should now be either TRIANGLES or RECTs.
 	_dbg_assert_(draw.prim == GE_PRIM_RECTANGLES || draw.prim == GE_PRIM_TRIANGLES);
 
@@ -591,21 +616,21 @@ void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, con
 			case ZCompareMode::Greater:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Greater, true>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i]);
+					DepthRaster4Triangles<ZCompareMode::Greater, true>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
 			case ZCompareMode::Less:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Less, true>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i]);
+					DepthRaster4Triangles<ZCompareMode::Less, true>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
 			case ZCompareMode::Always:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Always, true>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i]);
+					DepthRaster4Triangles<ZCompareMode::Always, true>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
@@ -615,21 +640,21 @@ void DepthRasterScreenVerts(uint16_t *depth, int depthStride, const int *tx, con
 			case ZCompareMode::Greater:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Greater, false>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i]);
+					DepthRaster4Triangles<ZCompareMode::Greater, false>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
 			case ZCompareMode::Less:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Less, false>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i]);
+					DepthRaster4Triangles<ZCompareMode::Less, false>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
 			case ZCompareMode::Always:
 			{
 				for (int i = 0; i < count; i += 12) {
-					DepthRaster4Triangles<ZCompareMode::Always, false>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i]);
+					DepthRaster4Triangles<ZCompareMode::Always, false>(stats, depth, depthStride, scissor, &tx[i], &ty[i], &tz[i], skipEmptyBlocks);
 				}
 				break;
 			}
