@@ -28,14 +28,17 @@ enum class ZCompareMode : u8 {
 	Always,  // Mostly used for clears
 };
 
+constexpr int DEPTH_SPLIT_ONE = 1024;
+
 struct DepthScissor {
 	u16 x1;
 	u16 y1;
 	u16 x2;
 	u16 y2;
 
-	// The part of the scissor in one of numTiles column ranges of a buffer.
-	DepthScissor Tile(int tile, int numTiles, int bufferWidth) const;
+	// The part of the scissor in one of numTiles column ranges of a buffer. With two tiles, split is where
+	// the first ends, in DEPTH_SPLIT_ONE units of the width.
+	DepthScissor Tile(int tile, int numTiles, int bufferWidth, int split = DEPTH_SPLIT_ONE / 2) const;
 };
 
 struct DepthDraw {
@@ -84,6 +87,7 @@ struct DepthBatch {
 	int pendingTiles = 0;  // Tiles that haven't finished this batch yet.
 	u64 firstDraw = 0;  // Sequence number of the first draw.
 	u64 previousBuffer = 0;  // DepthBufferKey of the draw before it.
+	int split = DEPTH_SPLIT_ONE / 2;  // Between two tiles, see DepthScissor::Tile.
 };
 
 // Rasterizes batches of depth draws on threads of its own, in the order they're submitted, so
@@ -121,12 +125,14 @@ private:
 
 	void WaitForTiles(u64 draw);
 	void FinishDraw(int tile, u64 draws);
+	void Rebalance();
 
 	struct TileThread {
 		std::thread thread;
 		int *screenVerts = nullptr;
 		u64 next = 0;  // Sequence number of the next batch to rasterize.
 		u64 drawsDone = 0;
+		double busy = 0.0;  // Seconds spent rasterizing since the last Rebalance().
 	};
 
 	const int maxVerts_;
@@ -139,6 +145,7 @@ private:
 	u64 queueStart_ = 0;  // Sequence number of queue_.front().
 	u64 submittedDraws_ = 0;
 	u64 lastBuffer_ = 0;
+	int split_ = DEPTH_SPLIT_ONE / 2;
 	DepthBatch *current_ = nullptr;
 
 	// The depth buffer bytes the submitted, unfinished batches can write.

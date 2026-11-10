@@ -12,7 +12,7 @@
 #include "Common/TimeUtil.h"
 #include "Core/MemMap.h"
 
-DepthScissor DepthScissor::Tile(int tile, int numTiles, int bufferWidth) const {
+DepthScissor DepthScissor::Tile(int tile, int numTiles, int bufferWidth, int split) const {
 	if (numTiles <= 1) {
 		return *this;
 	}
@@ -20,8 +20,12 @@ DepthScissor DepthScissor::Tile(int tile, int numTiles, int bufferWidth) const {
 
 	// The buffer is split at fixed columns (whole groups of four), so a pixel belongs to the same tile in
 	// every draw to it, whatever the scissor.
-	const int start = tile == 0 ? 0 : (bufferWidth * tile / numTiles + 3) & ~3;
-	const int endExclusive = tile == numTiles - 1 ? 0x10000 : (bufferWidth * (tile + 1) / numTiles + 3) & ~3;
+	auto boundary = [&](int t) {
+		const int x = numTiles == 2 ? bufferWidth * split / DEPTH_SPLIT_ONE : bufferWidth * t / numTiles;
+		return (x + 3) & ~3;
+	};
+	const int start = tile == 0 ? 0 : boundary(tile);
+	const int endExclusive = tile == numTiles - 1 ? 0x10000 : boundary(tile + 1);
 
 	DepthScissor scissor = *this;
 	scissor.x1 = (u16)std::max((int)x1, start);
@@ -846,6 +850,10 @@ void DepthRasterWorker::Submit() {
 			busyRanges_.emplace_back(low, high);
 		}
 	}
+	if (queue_.empty() && tiles_.size() == 2) {
+		Rebalance();
+	}
+	current_->split = split_;
 	current_->pendingTiles = (int)tiles_.size();
 	current_->firstDraw = submittedDraws_;
 	current_->previousBuffer = lastBuffer_;
@@ -907,8 +915,26 @@ void DepthRasterWorker::TakeTimes(double *cull, double *raster) {
 	rasterTime_ = 0.0;
 }
 
+// Moves the boundary between two tiles so they take about as long. Only called with the queue empty, so no
+// tile is using the columns it changes. A busy render core slows the second tile, which then gets less.
+void DepthRasterWorker::Rebalance() {
+	const double first = tiles_[0].busy;
+	const double second = tiles_[1].busy;
+	if (first + second < 0.004) {
+		return;  // Too little to go on.
+	}
+	// Time per column on each side, as if spread evenly over it. Equal times leave the split where it is.
+	const double split = (double)split_ / DEPTH_SPLIT_ONE;
+	const double firstDensity = first / split;
+	const double secondDensity = second / (1.0 - split);
+	const double balanced = secondDensity / (firstDensity + secondDensity);
+	split_ = std::clamp((int)(DEPTH_SPLIT_ONE * (split + balanced) * 0.5), DEPTH_SPLIT_ONE / 8, DEPTH_SPLIT_ONE * 7 / 8);
+	tiles_[0].busy = 0.0;
+	tiles_[1].busy = 0.0;
+}
+
 void DepthRasterWorker::Run(int tile) {
-	// Further tiles go to the render core, which Deko3D leaves almost idle.
+	// Further tiles go to the render core, at a priority that leaves it to a render thread first.
 	SetCurrentThreadAffinity(tile == 0 ? ThreadAffinityRole::COMPUTE : ThreadAffinityRole::RENDER_CORE_COMPUTE);
 	SetCurrentThreadName(tile == 0 ? "DepthRaster" : "DepthRasterTile");
 	TileThread &self = tiles_[tile];
@@ -926,6 +952,7 @@ void DepthRasterWorker::Run(int tile) {
 
 		lock.lock();
 		self.next++;
+		self.busy += cull + raster;
 		cullTime_ += cull;
 		rasterTime_ += raster;
 		if (--batch->pendingTiles == 0) {
@@ -965,7 +992,7 @@ void DepthRasterWorker::Rasterize(const DepthBatch &batch, int tile, double *cul
 		const float *vertices = batch.transformed + 4 * draw.vertexOffset;
 		const uint16_t *indices = batch.indices + draw.indexOffset;
 		const bool whole = numTiles == 1 || DepthDrawWraps(draw);
-		const DepthScissor columns = whole ? draw.scissor : draw.scissor.Tile(tile, numTiles, DepthTileWidth(draw));
+		const DepthScissor columns = whole ? draw.scissor : draw.scissor.Tile(tile, numTiles, DepthTileWidth(draw), batch.split);
 		if (tile != 0 && (whole || columns.x1 > columns.x2)) {
 			continue;  // The scissor misses this tile's columns.
 		}

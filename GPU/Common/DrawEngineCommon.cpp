@@ -1160,13 +1160,12 @@ void DrawEngineCommon::InitDepthRaster() {
 	}
 
 	if (useDepthRaster_) {
-		int numTiles = 1;
 #if PPSSPP_PLATFORM(SWITCH)
-		// Split each batch between the worker core and the render core, which Deko3D leaves almost idle
-		// (unlike Vulkan, whose render thread is there).
-		if (g_Config.iGPUBackend == (int)GPUBackend::DEKO3D) {
-			numTiles = 2;
-		}
+		// Split each batch between the worker core and the render core. The render thread (if any) has priority
+		// there, and the split follows how fast each side goes.
+		const int numTiles = 2;
+#else
+		const int numTiles = 1;
 #endif
 		depthWorker_ = new DepthRasterWorker(DEPTH_TRANSFORMED_MAX_VERTS, DEPTH_INDEXBUFFER_MAX_INDICES, numTiles);
 	}

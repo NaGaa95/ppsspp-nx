@@ -95,6 +95,7 @@ int CheckTiledDepth(RasterRng &rng, int *changedPixels) {
 		draw.scissor = scissor;
 		const bool lowQ = trial % 4 == 1;
 		const int bufferWidth = trial % 2 ? 480 : 256;
+		const int split = rng.Range(DEPTH_SPLIT_ONE / 8, DEPTH_SPLIT_ONE * 7 / 8);
 
 		const int vertsPerPrim = draw.prim == GE_PRIM_RECTANGLES ? 2 : 3;
 		const int prims = rng.Range(1, MAX_PRIMS);
@@ -127,7 +128,7 @@ int CheckTiledDepth(RasterRng &rng, int *changedPixels) {
 		for (int numTiles : {2, 3}) {
 			tiled = initial;
 			for (int tile = 0; tile < numTiles; tile++) {
-				const DepthScissor columns = scissor.Tile(tile, numTiles, bufferWidth);
+				const DepthScissor columns = scissor.Tile(tile, numTiles, bufferWidth, split);
 				if (tile != 0 && columns.x1 > columns.x2) {
 					continue;
 				}

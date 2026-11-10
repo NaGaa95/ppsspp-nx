@@ -183,4 +183,4 @@ with tempfile.TemporaryDirectory(prefix='ppsspp-depth-tiles-') as directory:
                     '-fno-omit-frame-pointer', '-I' + str(root),
                     str(cpp), '-o', str(executable)], check=True)
     subprocess.run([str(executable), str(folder)], timeout=300, check=True)
-    print('Depth tile checks passed: the worker with two and three tile threads writes the same depth buffer as one thread.')
+    print('Depth tile checks passed: the worker with two and three tile threads, and a moving split between two, writes the same depth buffer as one thread.')
