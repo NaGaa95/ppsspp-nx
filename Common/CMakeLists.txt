@@ -453,7 +453,7 @@ target_link_libraries(Common ${GlslangLibs})
 
 if(USE_LIBNX)
 	target_sources(Common PRIVATE SwitchSaltyNX.cpp SwitchSaltyNX.h)
-	target_sources(Common PRIVATE GPU/Deko3D/DekoContext.cpp GPU/Deko3D/DekoContext.h)
+	target_sources(Common PRIVATE GPU/Deko3D/DekoContext.cpp GPU/Deko3D/DekoContext.h GPU/Deko3D/DekoMemoryPool.h)
 	find_library(PPSSPP_DEKO3D_LIBRARY NAMES deko3d REQUIRED)
 	target_link_libraries(Common ${PPSSPP_DEKO3D_LIBRARY})
 endif()

@@ -17,6 +17,7 @@
 #include <set>
 #include <mutex>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 #include <atomic>
 #include <chrono>
@@ -25,6 +26,7 @@
 
 #include "Common/File/FileUtil.h"
 #include "Common/Crypto/sha1.h"
+#include "Common/GPU/Deko3D/DekoMemoryPool.h"
 #include "Common/GPU/Deko3D/ShaderCompiler.h"
 #include "Common/GPU/Deko3D/LSFGFrameGenerator.h"
 #include "Common/GPU/Deko3D/LSFGFramePacer.h"
@@ -49,6 +51,8 @@ constexpr unsigned SAMPLER_DESCRIPTORS = 1024;
 constexpr uint32_t UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
 constexpr uint32_t COMMAND_CHUNK_SIZE = 1024 * 1024;
 constexpr uint32_t SCRATCH_PER_WARP = 32 * 1024;
+constexpr uint32_t TEXTURE_SLAB_SIZE = 2 * 1024 * 1024;
+constexpr uint32_t SHADER_SLAB_SIZE = 1024 * 1024;
 
 // deko3d's default callback exits the app on any error. Log it instead, and let the caller handle the failure.
 void DekoDebug(void *, const char *context, DkResult result, const char *message) {
@@ -59,11 +63,16 @@ void DekoDebug(void *, const char *context, DkResult result, const char *message
 
 uint32_t Align(uint32_t value, uint32_t alignment) { return (value + alignment - 1) & ~(alignment - 1); }
 
+using MemoryPool = DekoMemoryPool<dk::UniqueMemBlock>;
+using RetiredMemory = std::variant<dk::UniqueMemBlock, MemoryPool::Slice>;
+
 struct Device {
 	dk::UniqueDevice device;
 	dk::UniqueQueue queue;
+	MemoryPool texturePool, shaderPool;
+	std::atomic<bool> shaderCodeDirty{false};
 	std::mutex mutex;
-	std::vector<dk::UniqueMemBlock> pending;
+	std::vector<RetiredMemory> pending;
 	uint64_t nextImage = 1, nextSampler = 1;
 	~Device() {
 		if (queue && !queue.isInErrorState()) {
@@ -71,15 +80,17 @@ struct Device {
 		}
 		pending.clear();
 	}
-	void Retire(dk::UniqueMemBlock block) {
-		if (block) {
+	template <typename Memory>
+	void Retire(Memory memory) {
+		if (memory) {
 			std::lock_guard<std::mutex> guard(mutex);
-			pending.push_back(std::move(block));
+			pending.emplace_back(std::move(memory));
 		}
 	}
 	dk::UniqueMemBlock Allocate(uint32_t size, uint32_t flags = DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached,
 								const char *tag = "GPU buffer") {
-		dk::MemBlock block = dk::MemBlockMaker{device, Align(size, DK_MEMBLOCK_ALIGNMENT)}.setFlags(flags).create();
+		const uint32_t bytes = Align(size, DK_MEMBLOCK_ALIGNMENT);
+		dk::MemBlock block = dk::MemBlockMaker{device, bytes}.setFlags(flags).create();
 		return dk::UniqueMemBlock{std::move(block)};
 	}
 };
@@ -87,11 +98,15 @@ struct Device {
 struct Image : Texture {
 	std::shared_ptr<Device> owner;
 	dk::UniqueMemBlock memory;
+	MemoryPool::Slice pooledMemory;
 	dk::Image image;
 	DkImageView view{};
 	int levels = 1;
 	uint64_t identity = 0;
-	~Image() override { owner->Retire(std::move(memory)); }
+	~Image() override {
+		owner->Retire(std::move(memory));
+		owner->Retire(std::move(pooledMemory));
+	}
 	void Dimensions(const TextureDesc &desc) {
 		width_ = desc.width;
 		height_ = desc.height;
@@ -142,7 +157,7 @@ struct Sampler : SamplerState {
 };
 struct Shader : ShaderModule {
 	std::shared_ptr<Device> owner;
-	dk::UniqueMemBlock code;
+	MemoryPool::Slice code;
 	DkShader shader{};
 	ShaderStage stage;
 	uint32_t arrays = 0;
@@ -275,7 +290,7 @@ struct Frame {
 	uint32_t imageCount = 0, samplerCount = 0;
 	std::unordered_map<uint64_t, uint32_t> imageCache;
 	std::unordered_map<uint64_t, uint32_t> samplerCache;
-	std::vector<dk::UniqueMemBlock> retired;
+	std::vector<RetiredMemory> retired;
 };
 
 class Context : public DrawContext {
@@ -614,6 +629,9 @@ void Context::BeginFrame(DebugFlags flags) {
 		frame.submitted = false;
 	}
 	frame.retired.clear();
+	if ((frameCount_ & 63) == 0) {
+		device_->texturePool.TrimEmpty();
+	}
 	frame.commands.clear();
 	resourceBindings_.Invalidate();
 	frame.commandChunk = frame.uploadChunk = frame.uploadOffset = 0;
@@ -715,8 +733,11 @@ void Context::CollectRetired() {
 		frame.submitted = false;
 		frame.retired.clear();
 	}
-	std::lock_guard<std::mutex> guard(device_->mutex);
-	device_->pending.clear();
+	{
+		std::lock_guard<std::mutex> guard(device_->mutex);
+		device_->pending.clear();
+	}
+	device_->texturePool.TrimEmpty();
 }
 
 void Context::Wait() {
@@ -1025,15 +1046,26 @@ Texture *Context::CreateImage(const TextureDesc &desc, bool render, bool zeroFil
 	if (layout.getSize() > 512 * 1024 * 1024) {
 		return nullptr;
 	}
-	const std::string allocationTag = StringFromFormat("%s %dx%dx%d levels=%d format=%u", render ? "render target" : "texture", desc.width,
-													   desc.height, desc.depth, desc.mipLevels, (unsigned)desc.format);
-	texture->memory = device_->Allocate((uint32_t)layout.getSize(),
-										DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image | (zeroFill ? DkMemBlockFlags_ZeroFillInit : 0),
-										allocationTag.c_str());
-	if (!texture->memory) {
-		return nullptr;
+	constexpr uint32_t imageFlags = DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image;
+	const uint32_t size = (uint32_t)layout.getSize();
+	const uint32_t alignment = layout.getAlignment();
+	// A 512-byte layout uses a generic mapping. Other layouts can retype whole GPU pages.
+	if (!render && !zeroFill && alignment == 512 && size <= TEXTURE_SLAB_SIZE / 2) {
+		texture->pooledMemory = device_->texturePool.Allocate(size, alignment, TEXTURE_SLAB_SIZE, [&](uint32_t bytes) {
+			return device_->Allocate(bytes, imageFlags, "texture slab");
+		});
+		if (!texture->pooledMemory) {
+			return nullptr;
+		}
+		texture->image.initialize(layout, texture->pooledMemory.Storage(), texture->pooledMemory.Offset());
+	} else {
+		texture->memory = device_->Allocate(size, imageFlags | (zeroFill ? DkMemBlockFlags_ZeroFillInit : 0),
+										   render ? "render target" : "texture");
+		if (!texture->memory) {
+			return nullptr;
+		}
+		texture->image.initialize(layout, texture->memory, 0);
 	}
-	texture->image.initialize(layout, texture->memory, 0);
 	dkImageViewDefaults(&texture->view, &texture->image);
 	if (desc.swizzle != TextureSwizzle::DEFAULT) {
 		texture->view.swizzle[3] = desc.swizzle == TextureSwizzle::R8_AS_GRAYSCALE ? DkImageSwizzle_One : DkImageSwizzle_Red;
@@ -1290,15 +1322,21 @@ ShaderModule *Context::CreateNativeShader(ShaderStage stage, ShaderLanguage lang
 	if (stage == ShaderStage::Vertex) {
 		shader->clipDistanceMode = Deko3DClipDistanceMode(clipDistances, cullDistances);
 	}
-	shader->code = device_->Allocate(header.codeSize + DK_SHADER_CODE_UNUSABLE_SIZE,
-									 DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code, "shader code");
+	const uint32_t bytes = header.codeSize + DK_SHADER_CODE_UNUSABLE_SIZE;
+	const uint32_t slabSize = std::max(SHADER_SLAB_SIZE, Align(bytes, DK_MEMBLOCK_ALIGNMENT));
+	// Keep empty code slabs available for reuse. deko3d does not reclaim their code address ranges.
+	shader->code = device_->shaderPool.Allocate(bytes, DK_SHADER_CODE_ALIGNMENT, slabSize, [&](uint32_t slabBytes) {
+		return device_->Allocate(slabBytes, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code,
+								 "shader code slab");
+	});
 	if (!shader->code) {
 		ERROR_LOG(Log::G3D, "deko3d shader %s: code allocation failed", tag);
 		return nullptr;
 	}
-	memcpy(shader->code.getCpuAddr(), (const uint8_t *)binary + header.controlSize, header.codeSize);
+	const auto &code = shader->code;
+	memcpy((uint8_t *)dkMemBlockGetCpuAddr(code.Storage()) + code.Offset(), (const uint8_t *)binary + header.controlSize, header.codeSize);
 	DkShaderMaker maker{};
-	dkShaderMakerDefaults(&maker, shader->code, 0);
+	dkShaderMakerDefaults(&maker, code.Storage(), code.Offset());
 	maker.control = binary;
 	dkShaderInitialize(&shader->shader, &maker);
 	const DkStage expectedStage = stage == ShaderStage::Vertex	   ? DkStage_Vertex
@@ -1308,6 +1346,7 @@ ShaderModule *Context::CreateNativeShader(ShaderStage stage, ShaderLanguage lang
 		ERROR_LOG(Log::G3D, "deko3d rejected shader %s", tag);
 		return nullptr;
 	}
+	device_->shaderCodeDirty.store(true, std::memory_order_release);
 	if (!fromCache && g_Config.bShaderCache && File::CreateFullPath(directory)) {
 		cache.arrays = arrays;
 		cache.textures = textures;
@@ -1389,6 +1428,10 @@ bool Context::Apply() {
 	}
 	auto cmd = Commands();
 	if (stateDirty_) {
+		if (device_->shaderCodeDirty.load(std::memory_order_relaxed) &&
+			device_->shaderCodeDirty.exchange(false, std::memory_order_acq_rel)) {
+			cmd.barrier(DkBarrier_None, DkInvalidateFlags_Shader);
+		}
 		DkShader const *shaders[2]{};
 		uint32_t clipDistanceMode = 0;
 		for (auto &shader : pipeline_->shaders) {
