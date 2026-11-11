@@ -1938,12 +1938,21 @@ void Context::BindFramebufferAsTexture(Framebuffer *fbo, int binding, Aspect asp
 }
 
 void Context::Clear(Aspect aspects, uint32_t color, float depth, int stencil) {
+	// deko3d clears stay inside the scissor, but thin3d clears the whole target (as Vulkan and D3D11 do).
+	// The current scissor can still be a smaller target's, like the backbuffer's after the UI.
+	Image *target = Color(target_);
+	if (target) {
+		Commands().setScissors(0, DkScissor{0, 0, (uint32_t)target->Width(), (uint32_t)target->Height()});
+	}
 	if (aspects & Aspect::COLOR_BIT) {
 		const float rgba[] = {(color & 255) / 255.f, ((color >> 8) & 255) / 255.f, ((color >> 16) & 255) / 255.f, (color >> 24) / 255.f};
 		Commands().clearColor(0, DkColorMask_RGBA, rgba[0], rgba[1], rgba[2], rgba[3]);
 	}
 	if ((aspects & (Aspect::DEPTH_BIT | Aspect::STENCIL_BIT)) && DepthImage(target_)) {
 		Commands().clearDepthStencil((bool)(aspects & Aspect::DEPTH_BIT), depth, (aspects & Aspect::STENCIL_BIT) ? 255 : 0, stencil);
+	}
+	if (target) {
+		Commands().setScissors(0, scissor_);
 	}
 }
 
