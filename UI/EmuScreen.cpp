@@ -800,14 +800,9 @@ void EmuScreen::ProcessVKey(VirtKey virtKey, bool down) {
 			if (!gpu) {
 				return;
 			}
+			// Not opened right away, which would interrupt the game.
 			gpu->GetRecorder()->RecordNextFrame([](const Path &dumpPath) {
-				NOTICE_LOG(Log::System, "Frame dump created at '%s'", dumpPath.c_str());
-				g_OSD.Show(OSDType::MESSAGE_SUCCESS, GetFriendlyPath(dumpPath), 7.0f, "framedump");
-				if (System_GetPropertyBool(SYSPROP_CAN_SHOW_FILE)) {
-					g_OSD.SetClickCallback("framedump", [dumpPath]() {
-						System_ShowFileInFolder(dumpPath);
-					});
-				}
+				OnFrameDumpCreated(dumpPath, false);
 			});
 		}
 		break;
@@ -1325,6 +1320,18 @@ void EmuScreen::CreateViews() {
 	});
 	backButton_->SetVisibility(V_GONE);
 
+	auto rp = GetI18NCategory(I18NCat::REPORTING);
+	reportCrashButton_ = buttons->Add(new Button(rp->T("Report crash")));
+	reportCrashButton_->OnClick.Add([this](UI::EventParams &) {
+		if (crashSeen_ && !crashReported_) {
+			Reporting::ReportCrash(Core_GetExceptionInfo(), true);
+			crashReported_ = true;
+			auto rp = GetI18NCategory(I18NCat::REPORTING);
+			g_OSD.Show(OSDType::MESSAGE_SUCCESS, rp->T("Crash report sent"));
+		}
+	});
+	reportCrashButton_->SetVisibility(V_GONE);
+
 	cardboardDisableButton_ = root_->Add(new Button(sc->T("Cardboard VR OFF"), new AnchorLayoutParams(bounds.centerX(), NONE, NONE, 30, Centering::Both)));
 	DeviceOrientation orientation = GetDeviceOrientation();
 	cardboardDisableButton_->OnClick.Add([deviceOrientation](UI::EventParams &) {
@@ -1501,6 +1508,20 @@ void EmuScreen::update() {
 	resumeButton_->SetVisibility(coreState == CoreState::CORE_RUNTIME_ERROR && Memory::MemFault_MayBeResumable() ? V_VISIBLE : V_GONE);
 	resetButton_->SetVisibility(coreState == CoreState::CORE_RUNTIME_ERROR ? V_VISIBLE : V_GONE);
 	backButton_->SetVisibility(coreState == CoreState::CORE_RUNTIME_ERROR ? V_VISIBLE : V_GONE);
+
+	// The same condition as drawing the crash screen.
+	const bool crashed = (coreState == CoreState::CORE_RUNTIME_ERROR || coreState == CoreState::CORE_STEPPING_CPU) && Core_GetExceptionInfo().type != MIPSExceptionType::NONE;
+	if (crashed && !crashSeen_) {
+		crashSeen_ = true;
+		crashReported_ = false;
+		if (Reporting::IsEnabled()) {
+			Reporting::ReportCrash(Core_GetExceptionInfo(), false);
+			crashReported_ = true;
+		}
+	} else if (!crashed) {
+		crashSeen_ = false;
+	}
+	reportCrashButton_->SetVisibility(crashed && !crashReported_ && Reporting::CanReportCrashManually() ? V_VISIBLE : V_GONE);
 
 	if (chatButton_ && chatMenu_) {
 		if (chatMenu_->GetVisibility() != V_GONE) {
@@ -2078,11 +2099,9 @@ void EmuScreen::renderUI() {
 		}
 	}
 
-#ifdef USE_PROFILER
 	if ((DebugOverlay)g_Config.iDebugOverlay == DebugOverlay::FRAME_PROFILE && PSP_IsInited()) {
 		DrawProfile(*ctx);
 	}
-#endif
 
 	if (g_Config.bShowGPOLEDs) {
 		// Draw a vertical strip of LEDs at the right side of the screen.

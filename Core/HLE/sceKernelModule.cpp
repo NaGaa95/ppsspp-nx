@@ -22,6 +22,7 @@
 #include "zlib.h"
 
 #include "Common/Data/Convert/SmallDataConvert.h"
+#include "Common/Profiler/Profiler.h"
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
 #include "Common/Serialize/SerializeMap.h"
@@ -2084,9 +2085,7 @@ static PSPModule *__KernelLoadELFFromPtr(const u8 *ptr, size_t elfSize, u32 load
 		}
 
 		if (scan) {
-			// TODO: Limit this to the newly loaded range! This is expensive, well, at least in debug builds
-			// and the cause of stutter during Wipeout Pure initialization.
-			MIPSAnalyst::FinalizeScan(insertSymbols);
+			MIPSAnalyst::FinalizeScan(insertSymbols, module->textStart, module->textEnd);
 		}
 	}
 
@@ -2394,6 +2393,8 @@ SceUID KernelLoadModule(const std::string &filename, std::string *error_string, 
 
 // filename is only used for dumping etc.
 static PSPModule *__KernelLoadModule(u8 *fileptr, size_t fileSize, SceKernelLMOption *options, std::string_view filename, std::string *error_string) {
+	PROFILE_THIS_SCOPE("module_load");
+	PROFILE_LABEL_COPY(std::string(filename).c_str());
 	PSPModule *module = nullptr;
 	// Check for PBP
 	if (fileSize >= sizeof(PSP_Header) && memcmp(fileptr, "\0PBP", 4) == 0) {

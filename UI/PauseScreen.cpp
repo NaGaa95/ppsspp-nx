@@ -329,11 +329,18 @@ SaveSlotView::SaveSlotView(std::string_view saveStatePrefix, int slot, UI::Layou
 	});
 #endif
 
+	// A save to this slot is still being written (slow storage, a save asked for just before the menu
+	// opened). The screen is rebuilt when it finishes, on UIMessage::SAVESTATE_SLOT_SAVED.
+	const bool savePending = SaveState::IsSlotSavePending(saveStatePrefix_, slot_);
+	saveStateButton_->SetEnabled(!savePending);
+	fv->SetEnabled(!savePending);
+
 	if (SaveState::HasSaveInSlot(saveStatePrefix_, slot_)) {
 		if (!Achievements::HardcoreModeActive()) {
 			loadStateButton_ = buttons->Add(new Button(pa->T("Load State"), new LinearLayoutParams(0.0, Gravity::G_VCENTER)));
 			loadStateButton_->OnClick.Handle(this, &SaveSlotView::OnLoadState);
 			loadStateButton_->SetRoundCorners();
+			loadStateButton_->SetEnabled(!savePending);
 		}
 
 #if defined(PPSSPP_SWITCH_SDL_LAUNCHER)
@@ -366,6 +373,10 @@ SaveSlotView::SaveSlotView(std::string_view saveStatePrefix, int slot, UI::Layou
 		}
 	} else {
 		fv->SetFilename(Path());
+	}
+
+	if (savePending) {
+		buttons->Add(new Spinner(nullptr, 0, new LinearLayoutParams(32.0f, 32.0f, 0.0f, Gravity::G_VCENTER)));
 	}
 }
 
