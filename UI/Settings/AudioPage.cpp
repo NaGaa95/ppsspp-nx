@@ -86,8 +86,8 @@ void BuildAudioSettings(SettingsPage *page) {
 		PlayUISound(UI::UISound::CONFIRM);
 	});
 
-#endif
 	page->Setting(&g_Config.iGamePreviewVolume);
+#endif
 
 	bool sdlAudio = false;
 

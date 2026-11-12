@@ -79,6 +79,7 @@
 #include "Core/System.h"
 #include "Core/SaveState.h"
 #include "Core/Util/RecentFiles.h"
+#include "UI/BackgroundAudio.h"
 #include "UI/CwCheatScreen.h"
 #include "UI/FirmwareScreen.h"
 #include "UI/GameInfoCache.h"
@@ -347,7 +348,9 @@ private:
 	bool LoadFonts();
 	bool Frame();
 	void Background();
-	void Present();
+	void Present(const Path &previewGame = {});
+	void InitAudio();
+	void UpdateGamePreview(const Path &path);
 	void Fill(float x, float y, float w, float h, SDL_Color color);
 	void Round(float x, float y, float w, float h, float radius, SDL_Color color);
 	void InitRoundTexture();
@@ -450,7 +453,11 @@ private:
 	SDL_Window *window_ = nullptr;
 	SDL_Renderer *renderer_ = nullptr;
 	SDL_Texture *roundTexture_ = nullptr;
+	SDL_AudioDeviceID audioDevice_ = 0;
 	SDL_AudioStream *audio_ = nullptr;
+	SDL_AudioStream *previewStream_ = nullptr;
+	BackgroundAudio previewAudio_;
+	Path previewPath_;
 	std::map<SDL_JoystickID, SDL_Gamepad *> pads_;
 	std::vector<std::vector<uint8_t>> fontData_;
 	std::unique_ptr<TextEngine> textEngine_;
@@ -502,6 +509,7 @@ private:
 	AppletOperationMode operationMode_ = AppletOperationMode_Handheld;
 	bool classic_ = false;
 	bool animations_ = true;
+	bool playGamePreview_ = true;
 	bool titles_ = true;
 	bool badges_ = true;
 	bool running_ = true;
@@ -1427,7 +1435,11 @@ Launcher::~Launcher() {
 		SDL_DestroyTexture(texture);
 	}
 	textEngine_.reset();
+	SDL_DestroyAudioStream(previewStream_);
 	SDL_DestroyAudioStream(audio_);
+	if (audioDevice_) {
+		SDL_CloseAudioDevice(audioDevice_);
+	}
 	SDL_DestroyRenderer(renderer_);
 	SDL_DestroyWindow(window_);
 	if (plReady_) {
@@ -1450,6 +1462,7 @@ bool Launcher::Init() {
 	}
 	appearance_->Get("Classic", &classic_);
 	appearance_->Get("Animations", &animations_);
+	appearance_->Get("PlayGamePreview", &playGamePreview_);
 	appearance_->Get("ShowTitles", &titles_);
 	appearance_->Get("ShowRegionFlags", &showRegions_);
 	appearance_->Get("CheckUpdatesAtBoot", &updateAtBoot_);
@@ -1498,11 +1511,7 @@ bool Launcher::Init() {
 		pads_[ids[i]] = SDL_OpenGamepad(ids[i]);
 	}
 	SDL_free(ids);
-	SDL_AudioSpec spec{SDL_AUDIO_S16, 2, 48000};
-	audio_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
-	if (audio_) {
-		SDL_ResumeAudioStreamDevice(audio_);
-	}
+	InitAudio();
 	worker_ = std::thread(&Launcher::DecodeWorker, this);
 	startedAt_ = SDL_GetTicks();
 	LoadLibrary();
@@ -1581,6 +1590,7 @@ void Launcher::SaveAppearance() {
 	}
 	appearance_->Set("Classic", classic_);
 	appearance_->Set("Animations", animations_);
+	appearance_->Set("PlayGamePreview", playGamePreview_);
 	appearance_->Set("ShowTitles", titles_);
 	appearance_->Set("ShowRegionFlags", showRegions_);
 	appearance_->Set("CheckUpdatesAtBoot", updateAtBoot_);
@@ -2134,7 +2144,8 @@ void Launcher::Footer(UiText rawvalue) {
 	}
 }
 
-void Launcher::Present() {
+void Launcher::Present(const Path &previewGame) {
+	UpdateGamePreview(previewGame);
 	if (animations_) {
 		const float alpha = std::max(0.f, 1.f - (SDL_GetTicks() - startedAt_) / 180.f);
 		if (alpha > 0) {
@@ -2685,7 +2696,56 @@ void Launcher::RenderLibrary() {
 	} else {
 		Footer();
 	}
-	Present();
+	Present(running_ && result_.action == Action::Unavailable && !headerFocus_ && !visible_.empty()
+			? games_[visible_[selection_]].path : Path());
+}
+
+void Launcher::InitAudio() {
+	const SDL_AudioSpec deviceSpec{SDL_AUDIO_S16, 2, 48000};
+	audioDevice_ = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &deviceSpec);
+	if (!audioDevice_) {
+		return;
+	}
+	auto bindStream = [&](const SDL_AudioSpec &spec) -> SDL_AudioStream * {
+		SDL_AudioStream *stream = SDL_CreateAudioStream(&spec, nullptr);
+		if (stream && !SDL_BindAudioStream(audioDevice_, stream)) {
+			SDL_DestroyAudioStream(stream);
+			return nullptr;
+		}
+		return stream;
+	};
+	audio_ = bindStream(deviceSpec);
+	previewStream_ = bindStream({SDL_AUDIO_S16, 2, BackgroundAudio::PREVIEW_SAMPLE_RATE});
+}
+
+void Launcher::UpdateGamePreview(const Path &path) {
+	if (!previewStream_) {
+		return;
+	}
+	const Path noGame;
+	const Path &game = playGamePreview_ ? path : noGame;
+	if (game != previewPath_) {
+		SDL_ClearAudioStream(previewStream_);
+		previewAudio_.SetGame(game);
+		previewPath_ = game;
+	}
+	if (game.empty()) {
+		return;
+	}
+
+	previewAudio_.Update();
+	// Keep enough PCM queued for SDL's audio thread without leaving a long tail on selection changes.
+	constexpr int framesPerBuffer = 2048;
+	constexpr int frameBytes = sizeof(int16_t) * 2;
+	const int queued = SDL_GetAudioStreamQueued(previewStream_);
+	if (queued < 0 || queued >= framesPerBuffer * frameBytes) {
+		return;
+	}
+	const int frames = framesPerBuffer - queued / frameBytes;
+	int16_t samples[framesPerBuffer * 2];
+	if (previewAudio_.ReadPreview(samples, frames)) {
+		SDL_PutAudioStreamData(previewStream_, samples, frames * frameBytes);
+	}
 }
 
 void Launcher::Sound(int direction) {
@@ -3818,6 +3878,7 @@ void Launcher::Appearance() {
 				 {"Language", g_Config.sLanguageIni, [&](int) { ChangeLanguage(); }},
 				 {"Theme", classic_ ? "Classic" : "PPSSPP", [&](int) { classic_ = !classic_; }},
 				 {"Animations", animations_ ? "On" : "Off", [&](int) { animations_ = !animations_; }},
+				 {"Game preview music", playGamePreview_ ? "On" : "Off", [&](int) { playGamePreview_ = !playGamePreview_; }},
 				 {"Show region flags", showRegions_ ? "On" : "Off", [&](int) { showRegions_ = !showRegions_; }},
 				 {"Show game titles", titles_ ? "On" : "Off", [&](int) { titles_ = !titles_; }},
 				 {"Custom settings badges", badges_ ? "On" : "Off", [&](int) { badges_ = !badges_; }},

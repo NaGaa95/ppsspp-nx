@@ -254,11 +254,12 @@ public:
 		decoder_ = nullptr;
 	}
 
-	bool IsOK() const { return wave_.raw_data != nullptr; }
+	bool IsOK() const { return decoder_ && wave_.raw_data_size > 0; }
 
 	bool Read(int *buffer, int len) {
-		if (!wave_.raw_data)
+		if (!IsOK()) {
 			return false;
+		}
 
 		while (bgQueue.size() < (size_t)(len * 2)) {
 			int outSamples = 0;
@@ -346,12 +347,12 @@ void BackgroundAudio::Clear(bool hard) {
 }
 
 void BackgroundAudio::SetGame(const Path &path) {
+	std::lock_guard<std::mutex> lock(mutex_);
 	if (path == bgGamePath_) {
 		// Do nothing
 		return;
 	}
 
-	std::lock_guard<std::mutex> lock(mutex_);
 	if (path.empty()) {
 		Clear(false);
 		sndLoadPending_ = false;
@@ -366,6 +367,38 @@ void BackgroundAudio::SetGame(const Path &path) {
 	bgGamePath_ = path;
 }
 
+bool BackgroundAudio::ReadSamples(int frames) {
+	if (!at3Reader_) {
+		return false;
+	}
+	if (!at3Reader_->Read(buffer_, frames)) {
+		Clear(true);
+		return false;
+	}
+	if (fadingOut_) {
+		for (int i = 0; i < frames * 2; i += 2) {
+			const float volume = std::max(0.0f, volumeFader_);
+			buffer_[i] = (int)(buffer_[i] * volume);
+			buffer_[i + 1] = (int)(buffer_[i + 1] * volume);
+			volumeFader_ += delta_;
+		}
+		if (volumeFader_ <= 0.0f) {
+			Clear(true);
+			fadingOut_ = false;
+		}
+	}
+	return true;
+}
+
+bool BackgroundAudio::ReadPreview(int16_t *output, int frames) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (frames <= 0 || frames > BUFSIZE / 2 || !ReadSamples(frames)) {
+		return false;
+	}
+	std::copy_n(buffer_, frames * 2, output);
+	return true;
+}
+
 bool BackgroundAudio::Play() {
 	std::lock_guard<std::mutex> lock(mutex_);
 
@@ -377,41 +410,17 @@ bool BackgroundAudio::Play() {
 	}
 
 	double now = time_now_d();
-	int sz = 44100 / 60;
+	int sz = PREVIEW_SAMPLE_RATE / 60;
 	if (lastPlaybackTime_ > 0.0 && lastPlaybackTime_ <= now) {
-		sz = (int)((now - lastPlaybackTime_) * 44100);
+		sz = (int)((now - lastPlaybackTime_) * PREVIEW_SAMPLE_RATE);
 	}
 
 	sz = std::min(BUFSIZE / 2, sz);
-	if (at3Reader_) {
-		if (at3Reader_->Read(buffer_, sz)) {
-			if (fadingOut_) {
-				float vol = volumeFader_;
-				// TODO: This isn't optimized. But hardly matters...
-				for (int i = 0; i < sz * 2; i += 2) {
-					const float v = vol;
-					buffer_[i] = (int)((float)buffer_[i] * v);
-					buffer_[i + 1] = (int)((float)buffer_[i + 1] * v);
-					vol += delta_;
-				}
-				volumeFader_ = vol;
-			}
-		}
-	} else {
-		for (int i = 0; i < sz * 2; i += 2) {
-			buffer_[i] = 0;
-			buffer_[i + 1] = 0;
-		}
+	if (!ReadSamples(sz)) {
+		std::fill_n(buffer_, sz * 2, 0);
 	}
-
 	float multiplier = Volume100ToMultiplier(g_Config.iGamePreviewVolume);
 	System_AudioPushSamples(buffer_, sz, multiplier);
-
-	if (at3Reader_ && fadingOut_ && volumeFader_ <= 0.0f) {
-		Clear(true);
-		fadingOut_ = false;
-		gameLastChanged_ = 0;
-	}
 
 	lastPlaybackTime_ = now;
 
@@ -419,28 +428,32 @@ bool BackgroundAudio::Play() {
 }
 
 void BackgroundAudio::Update() {
-	// If there's a game, and some time has passed since the selected game
-	// last changed... (to prevent crazy amount of reads when skipping through a list)
-	if (sndLoadPending_ && (time_now_d() - gameLastChanged_ > 0.5)) {
-		std::lock_guard<std::mutex> lock(mutex_);
-		// Already loaded somehow?  Or no game info cache?
-		if (at3Reader_ || !g_gameInfoCache)
-			return;
+	if (!sndLoadPending_) {
+		return;
+	}
+	std::lock_guard<std::mutex> lock(mutex_);
+	// Wait for the selection to settle before reading from storage.
+	if (!sndLoadPending_ || time_now_d() - gameLastChanged_ <= 0.5 || at3Reader_ || !g_gameInfoCache) {
+		return;
+	}
 
-		// Grab some audio from the current game and play it.
-		std::shared_ptr<GameInfo> gameInfo = g_gameInfoCache->GetInfo(nullptr, bgGamePath_, GameInfoFlags::SND);
-		if (!gameInfo->Ready(GameInfoFlags::SND)) {
-			// Should try again shortly..
-			return;
-		}
+	std::shared_ptr<GameInfo> gameInfo = g_gameInfoCache->TryGetInfo(bgGamePath_, GameInfoFlags::SND);
+	if (!gameInfo) {
+		return;
+	}
+	std::unique_lock<std::mutex> infoLock(gameInfo->lock, std::try_to_lock);
+	if (!infoLock.owns_lock() || !(gameInfo->hasFlags & GameInfoFlags::SND)) {
+		return;
+	}
 
-		const std::string &data = gameInfo->sndFileData;
-		if (!data.empty()) {
-			at3Reader_ = new AT3PlusReader(data);
+	if (!gameInfo->sndFileData.empty()) {
+		auto reader = std::make_unique<AT3PlusReader>(gameInfo->sndFileData);
+		if (reader->IsOK()) {
+			at3Reader_ = reader.release();
 			lastPlaybackTime_ = 0.0;
 		}
-		sndLoadPending_ = false;
 	}
+	sndLoadPending_ = false;
 }
 
 inline int16_t ConvertU8ToI16(uint8_t value) {

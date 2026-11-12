@@ -59,6 +59,9 @@ public:
 	void SetGame(const Path &path);
 	void Update();
 	bool Play();
+	// Reads interleaved stereo PCM at the preview sample rate. The caller sets the gain.
+	static constexpr int PREVIEW_SAMPLE_RATE = 44100;
+	bool ReadPreview(int16_t *output, int frames);
 
 	SoundEffectMixer &SFX() {
 		return sfxMixer_;
@@ -66,6 +69,7 @@ public:
 
 private:
 	void Clear(bool hard);
+	bool ReadSamples(int frames);
 
 	enum {
 		// 0.5 ms buffer at 44.1 khz should be enough.
