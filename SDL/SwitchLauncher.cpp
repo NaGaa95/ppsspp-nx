@@ -3580,7 +3580,7 @@ void Launcher::Updates() {
 	while (Frame()) {
 		auto snapshot = updateTask_->Snapshot();
 		if (snapshot.state == SwitchUpdateState::ReadyToInstall) {
-			if (updateTask_->Install()) {
+			if (updateTask_->ScheduleInstall()) {
 				result_.action = Action::Restart;
 				return;
 			}

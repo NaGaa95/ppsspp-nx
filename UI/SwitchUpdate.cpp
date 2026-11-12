@@ -15,6 +15,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -44,6 +45,7 @@ constexpr uint64_t MINIMUM_NRO_SIZE = 1024 * 1024;
 constexpr uint64_t MAXIMUM_NRO_SIZE = 512ULL * 1024 * 1024;
 
 std::string executablePath_;
+bool installPending_ = false;
 
 using UpdateState = SwitchUpdateState;
 using ReleaseInfo = SwitchReleaseInfo;
@@ -324,7 +326,7 @@ bool ReplaceExecutable(const std::string &executablePath, std::string *error) {
 		return false;
 	}
 	if (std::rename(executablePath.c_str(), backup.c_str()) != 0) {
-		*error = "Could not preserve the installed PPSSPP NRO.";
+		*error = StringFromFormat("Could not preserve the installed PPSSPP NRO: %s.", std::strerror(errno));
 		return false;
 	}
 	if (std::rename(temporary.c_str(), executablePath.c_str()) != 0) {
@@ -490,7 +492,7 @@ struct SwitchUpdateTask::Impl {
 		});
 	}
 
-	bool Install() {
+	bool ScheduleInstall() {
 		{
 			std::scoped_lock lock(mutex);
 			if (state != UpdateState::ReadyToInstall)
@@ -499,18 +501,10 @@ struct SwitchUpdateTask::Impl {
 		}
 		if (worker.joinable())
 			worker.join();
-		std::string failure;
-		bool success = ReplaceExecutable(executablePath_, &failure);
-		{
-			std::scoped_lock lock(mutex);
-			if (success) {
-				state = UpdateState::Installed;
-			} else {
-				error = std::move(failure);
-				state = UpdateState::Error;
-			}
-		}
-		return success;
+		// The mounted RomFS holds the executable open. The restart path releases
+		// it after all asset readers have finished, then replaces the file.
+		installPending_ = true;
+		return true;
 	}
 };
 
@@ -520,7 +514,19 @@ SwitchUpdateSnapshot SwitchUpdateTask::Snapshot() { return impl_->Snapshot(); }
 void SwitchUpdateTask::StartCheck() { impl_->StartCheck(); }
 void SwitchUpdateTask::StartDownload() { impl_->StartDownload(); }
 void SwitchUpdateTask::Cancel() { impl_->cancel.store(true, std::memory_order_relaxed); }
-bool SwitchUpdateTask::Install() { return impl_->Install(); }
+bool SwitchUpdateTask::ScheduleInstall() { return impl_->ScheduleInstall(); }
+
+bool SwitchUpdate_InstallPending(bool romfsUnmounted, std::string *error) {
+	if (!installPending_) {
+		return true;
+	}
+	installPending_ = false;
+	if (!romfsUnmounted) {
+		*error = "Could not close PPSSPP's RomFS before installing the update.";
+		return false;
+	}
+	return ReplaceExecutable(executablePath_, error);
+}
 
 void SwitchUpdate_SetExecutablePath(std::string path) {
 	executablePath_ = std::move(path);

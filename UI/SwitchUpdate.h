@@ -13,6 +13,8 @@
 
 void SwitchUpdate_SetExecutablePath(std::string path);
 bool SwitchUpdate_RecoverInstallation(std::string *error);
+// Called by the SDL restart path after shutting down asset readers and unmounting RomFS.
+bool SwitchUpdate_InstallPending(bool romfsUnmounted, std::string *error);
 
 enum class SwitchUpdateState {
 	Checking,
@@ -21,7 +23,6 @@ enum class SwitchUpdateState {
 	Downloading,
 	ReadyToInstall,
 	Installing,
-	Installed,
 	Cancelled,
 	Error,
 };
@@ -42,7 +43,7 @@ public:
 	void StartCheck();
 	void StartDownload();
 	void Cancel();
-	bool Install();
+	bool ScheduleInstall();
 private:
 	struct Impl;
 	std::unique_ptr<Impl> impl_;

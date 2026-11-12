@@ -3020,11 +3020,18 @@ int main(int argc, char *argv[]) {
 		socketExit();
 		g_socketInitialized = false;
 	}
-	romfsExit();
+	const Result romfsExitResult = romfsExit();
 #endif
 
 #if PPSSPP_PLATFORM(SWITCH)
 	if (g_RestartRequested) {
+		std::string updateError;
+		if (!SwitchUpdate_InstallPending(R_SUCCEEDED(romfsExitResult), &updateError)) {
+			fprintf(stderr, "Update installation failed: %s\n", updateError.c_str());
+			ErrorApplicationConfig error{};
+			errorApplicationCreate(&error, updateError.c_str(), nullptr);
+			errorApplicationShow(&error);
+		}
 		bool handoffReady = g_restartParams.empty() || SwitchWriteRestartHandoff(g_restartParams);
 		if (handoffReady && (__nx_applet_type == AppletType_Application || __nx_applet_type == AppletType_SystemApplication)) {
 			appletRestartProgram(nullptr, 0);
