@@ -21,8 +21,8 @@ SDL_RECIPE_VERSION="3"
 FFMPEG_REPOSITORY="https://github.com/hrydgard/ppsspp-ffmpeg.git"
 FFMPEG_REVISION="1e3b4965632f60b1d85360261d1b9dd45444bc71"
 FFMPEG_RECIPE_VERSION="9"
-MESA_VERSION="26.2.4"
-MESA_SDK_SHA256="c2f78d4c627adcd6950ae1be305f845a059eec325a2d9905c9eb48e1b5ab573f"
+MESA_VERSION="26.2.7"
+MESA_SDK_SHA256="6c919eb1bbb7df5729940b5b4ecaa5e0daaa05bd06ebde9f5b676ce6c3eff04b"
 
 # Every recursive removal is restricted to generated directories under this checkout.
 remove_build_dirs() {
@@ -71,7 +71,7 @@ done
 [[ -n "$UAM_HOST_PYTHON" ]] || { echo "Deko3D requires host Python with Mako. Install python-mako or set UAM_PYTHON." >&2; exit 1; }
 
 JOBS="${JOBS:-16}"
-SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION:-1.1.0}"
+SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION:-1.1.1}"
 
 case "$JOBS" in
 	''|*[!0-9]*) echo "JOBS must be a positive integer" >&2; exit 2 ;;
@@ -87,7 +87,7 @@ for tool in cmake git make ninja sha256sum tar bison flex realpath aarch64-none-
 done
 
 [[ -f "$DEVKITPRO/cmake/Switch.cmake" ]] || { echo "Missing devkitPro Switch toolchain" >&2; exit 1; }
-[[ -f "$MESA_PREFIX/lib/cmake/Vulkan/VulkanConfig.cmake" ]] || { echo "Set SWITCH_MESA_SDK to mesa-26.2.4-switch-unified-horizon-sdk.zip, or SWITCH_MESA_PREFIX to its extracted portlibs/switch directory" >&2; exit 1; }
+[[ -f "$MESA_PREFIX/lib/cmake/Vulkan/VulkanConfig.cmake" ]] || { echo "Set SWITCH_MESA_SDK to mesa-26.2.7-switch-unified-horizon-sdk.zip, or SWITCH_MESA_PREFIX to its extracted portlibs/switch directory" >&2; exit 1; }
 grep -Fq "Vulkan_VERSION \"$MESA_VERSION\"" "$MESA_PREFIX/lib/cmake/Vulkan/VulkanConfig.cmake" || { echo "Mesa SDK $MESA_VERSION is required" >&2; exit 1; }
 
 mkdir -p "$DEPS_DIR" "$DIST_DIR"

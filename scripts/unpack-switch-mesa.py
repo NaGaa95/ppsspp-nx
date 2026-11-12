@@ -6,7 +6,7 @@ from pathlib import Path, PurePosixPath
 import sys
 import zipfile
 
-SDK_SHA256 = "c2f78d4c627adcd6950ae1be305f845a059eec325a2d9905c9eb48e1b5ab573f"
+SDK_SHA256 = "6c919eb1bbb7df5729940b5b4ecaa5e0daaa05bd06ebde9f5b676ce6c3eff04b"
 
 
 def main():
@@ -14,7 +14,7 @@ def main():
     with archive.open("rb") as source:
         digest = hashlib.file_digest(source, "sha256").hexdigest()
     if digest != SDK_SHA256:
-        raise SystemExit("The Mesa SDK archive does not match mesa-26.2.4-switch-unified-horizon-sdk.zip")
+        raise SystemExit("The Mesa SDK archive does not match mesa-26.2.7-switch-unified-horizon-sdk.zip")
     destination = destination.resolve()
     with zipfile.ZipFile(archive) as source:
         for item in source.infolist():

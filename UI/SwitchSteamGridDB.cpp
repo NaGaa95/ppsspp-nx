@@ -20,7 +20,7 @@
 #include "Common/Render/ManagedTexture.h"
 
 #ifndef PPSSPP_SWITCH_RELEASE_VERSION
-#define PPSSPP_SWITCH_RELEASE_VERSION "1.1.0"
+#define PPSSPP_SWITCH_RELEASE_VERSION "1.1.1"
 #endif
 
 namespace {

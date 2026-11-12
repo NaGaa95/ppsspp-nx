@@ -5,7 +5,7 @@ TOOLS  := $(DEVKITPRO)/tools/bin
 OUT    := ../../assets/fwd
 
 AUTHOR  := naga
-VERSION ?= 1.1.0
+VERSION ?= 1.1.1
 
 CFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs \
           -march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft \
