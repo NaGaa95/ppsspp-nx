@@ -1,7 +1,11 @@
 #include "SwitchStorage.h"
 
 #include <switch.h>
+#if defined(__SWITCH2__)
+#include "SwitchUsbHsFsStub.h"  // no USB drives on the Switch 2 (usb:hs is never opened)
+#else
 #include <usbhsfs.h>
+#endif
 #include <smb2/smb2.h>
 #include <smb2/libsmb2.h>
 

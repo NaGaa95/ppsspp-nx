@@ -298,6 +298,17 @@ void CPUInfo::Detect()
 	SYSTEM_INFO sysInfo;
 	GetSystemInfo(&sysInfo);
 	num_cores = sysInfo.dwNumberOfProcessors;
+#elif PPSSPP_PLATFORM(SWITCH) && defined(__SWITCH2__)
+	// Switch 2: NVIDIA T239, Cortex-A78C (ARMv8.2-A: LSE atomics, FP16, dot product), six cores for applications.
+	strcpy(brand_string, "NVIDIA Tegra T239 (Cortex-A78C)");
+	isVFP3 = true;
+	isVFP4 = true;
+	uint64_t coreMask = 0;
+	if (R_SUCCEEDED(svcGetInfo(&coreMask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && coreMask) {
+		num_cores = __builtin_popcountll(coreMask & 0xFF);
+	} else {
+		num_cores = 6;
+	}
 #elif PPSSPP_PLATFORM(SWITCH)
 	strcpy(brand_string, "NVIDIA Tegra X1");
 	isVFP3 = true;

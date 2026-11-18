@@ -273,7 +273,10 @@ void ThreadManager::Init(int numRealCores, int numLogicalCoresPerCpu) {
 		Teardown();
 	}
 	
-#if PPSSPP_PLATFORM(SWITCH)
+#if PPSSPP_PLATFORM(SWITCH) && defined(__SWITCH2__)
+	// The two cores ThreadUtil leaves to compute work on the Switch 2's six.
+	numComputeThreads_ = 2;
+#elif PPSSPP_PLATFORM(SWITCH)
 	numComputeThreads_ = 1;
 #else
 	numComputeThreads_ = std::min(32, numRealCores * numLogicalCoresPerCpu);

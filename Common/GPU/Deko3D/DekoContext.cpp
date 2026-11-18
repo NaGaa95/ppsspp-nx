@@ -7,7 +7,13 @@
 
 #include "Common/GPU/Deko3D/DekoContext.h"
 
+#if defined(__SWITCH2__)
+// drako3d: deko3d's API on the Switch 2's Ampere GPU.
+#include <drako3d.hpp>
+#include "Common/nx2_platform.h"
+#else
 #include <deko3d.hpp>
+#endif
 #include <switch.h>
 #include <algorithm>
 #include <array>
@@ -53,6 +59,14 @@ constexpr uint32_t COMMAND_CHUNK_SIZE = 1024 * 1024;
 constexpr uint32_t SCRATCH_PER_WARP = 32 * 1024;
 constexpr uint32_t TEXTURE_SLAB_SIZE = 2 * 1024 * 1024;
 constexpr uint32_t SHADER_SLAB_SIZE = 1024 * 1024;
+
+// The barrier after a copy, before the GPU reads its result. On the Switch 2's Ampere, copies run on the copy engine
+// alongside graphics, which only DkBarrier_Full waits for.
+#if defined(__SWITCH2__)
+constexpr DkBarrier AFTER_COPY_BARRIER = DkBarrier_Full;
+#else
+constexpr DkBarrier AFTER_COPY_BARRIER = DkBarrier_None;
+#endif
 
 // deko3d's default callback exits the app on any error. Log it instead, and let the caller handle the failure.
 void DekoDebug(void *, const char *context, DkResult result, const char *message) {
@@ -163,6 +177,7 @@ struct Shader : ShaderModule {
 	uint32_t arrays = 0;
 	uint32_t textures = 0;
 	uint32_t clipDistanceMode = 0;  // Deko3DClipDistanceMode() of a vertex shader.
+	uint32_t clipDistanceEnable = 0;  // The clip and cull distances a vertex shader writes, one bit each.
 	~Shader() override { owner->Retire(std::move(code)); }
 	ShaderStage GetStage() const override { return stage; }
 };
@@ -523,7 +538,11 @@ bool Context::Init(void *window, std::string *error) {
 	}
 	shaderLanguageDesc_ = ShaderLanguageDesc(GLSL_VULKAN);
 	caps_.vendor = GPUVendor::VENDOR_NVIDIA;
+#if defined(__SWITCH2__)
+	caps_.deviceName = "Nintendo Switch 2 Tegra T239 (drako3d)";
+#else
 	caps_.deviceName = "Nintendo Switch Tegra X1 (deko3d)";
+#endif
 	caps_.maxTextureSize = 16384;
 	// Clip and cull distances share eight slots. Apply() sets the hardware's cull mode, which deko3d doesn't.
 	caps_.maxClipDistances = 8;
@@ -933,6 +952,11 @@ void Context::Present(PresentMode mode) {
 		return;
 	}
 	presentMode_ = mode;
+#if defined(__SWITCH2__)
+	// Docked, frame generation switches the output to 120 Hz: generation then doubles sources up to 60 fps.
+	nx2DisplaySetFrameGeneration(frameGenerationState_.enabled);
+	framePacer_.SetRefreshRate(nx2DisplayRefreshRate());
+#endif
 	if (generatedDisplay_ && displayUsed_) {
 		const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 		const auto decision = framePacer_.Observe(now, frameGenerationState_.active, frameGenerator_ != nullptr);
@@ -956,7 +980,11 @@ void Context::Present(PresentMode mode) {
 			}
 		}
 		SwitchLSFG_SetDekoStatus(!frameGenerationFailed_, decision.highRate);
+#if defined(__SWITCH2__)
+		nx2DisplayApply(generated || mode == PresentMode::FIFO ? 1 : 0);
+#else
 		swapchain_.setSwapInterval(generated || mode == PresentMode::FIFO ? 1 : 0);
+#endif
 		if (generated && !PresentImage(*frameGenerator_->GeneratedImage(), generatedDisplay_->Width(), generatedDisplay_->Height())) {
 			return;
 		}
@@ -964,7 +992,11 @@ void Context::Present(PresentMode mode) {
 			return;
 		}
 	} else {
+#if defined(__SWITCH2__)
+		nx2DisplayApply(mode == PresentMode::FIFO ? 1 : 0);
+#else
 		swapchain_.setSwapInterval(mode == PresentMode::FIFO ? 1 : 0);
+#endif
 		Submit(false);
 		if (ReportQueueFault("present")) {
 			return;
@@ -981,6 +1013,12 @@ void Context::Present(PresentMode mode) {
 	active_ = false;
 	frameIndex_ = (frameIndex_ + 1) % FRAME_COUNT;
 	++frameCount_;
+#if defined(__SWITCH2__)
+	// Docking, the TV's resolution or frame generation (1440 lines at 120 Hz docked) resized the window.
+	if (nx2DisplayUpdate()) {
+		Resize();
+	}
+#endif
 }
 
 uint32_t Context::GetDataFormatSupport(DataFormat format) const {
@@ -1169,7 +1207,7 @@ void Context::UpdateTextureLevels(Texture *source, const uint8_t **data, Texture
 		DkImageRect region{0, 0, 0, w, h, d};
 		Commands().copyBufferToImage(buffer, view, region);
 	}
-	Commands().barrier(DkBarrier_None, DkInvalidateFlags_Image);
+	Commands().barrier(AFTER_COPY_BARRIER, DkInvalidateFlags_Image);
 }
 
 void Context::UpdateTextureRegions(Texture *source, int level, const TextureRegionUpdate *regions, int count) {
@@ -1192,7 +1230,7 @@ void Context::UpdateTextureRegions(Texture *source, int level, const TextureRegi
 		DkImageRect rect{(uint32_t)region.x, (uint32_t)region.y, 0, (uint32_t)region.w, (uint32_t)region.h, 1};
 		Commands().copyBufferToImage(buffer, view, rect);
 	}
-	Commands().barrier(DkBarrier_None, DkInvalidateFlags_Image);
+	Commands().barrier(AFTER_COPY_BARRIER, DkInvalidateFlags_Image);
 }
 
 SamplerState *Context::SamplerWithLod(const SamplerStateDesc &desc, float minLod, float maxLod, float bias) {
@@ -1241,13 +1279,22 @@ ShaderModule *Context::CreateNativeShader(ShaderStage stage, ShaderLanguage lang
 	cache.magic = 0x434B4544;
 	cache.version = 2;
 	cache.stage = (uint32_t)stage;
+#if defined(__SWITCH2__)
+	// (Ampere code from uam2rt: its own key and directory)
+	std::string identity = "uam2rt-1-ppsspp-5/" + StringFromInt((int)stage) + "/" + StringFromInt(textureBindingBase) + "/" + source;
+#else
 	std::string identity = "uam-c0d76aa9-ppsspp-5/" + StringFromInt((int)stage) + "/" + StringFromInt(textureBindingBase) + "/" + source;
+#endif
 	sha1((uint8_t *)identity.data(), (int)identity.size(), cache.sourceHash);
 	std::string key;
 	for (uint8_t byte : cache.sourceHash) {
 		key += StringFromFormat("%02x", byte);
 	}
+#if defined(__SWITCH2__)
+	const Path directory("/switch/ppsspp-nx/cache/drako3d");
+#else
 	const Path directory("/switch/ppsspp-nx/cache/deko3d");
+#endif
 	const Path cachePath = directory / (key + ".dksh");
 	std::string compiledBytes;
 	uint32_t arrays = 0, textures = 0;
@@ -1321,6 +1368,7 @@ ShaderModule *Context::CreateNativeShader(ShaderStage stage, ShaderLanguage lang
 	shader->textures = textures;
 	if (stage == ShaderStage::Vertex) {
 		shader->clipDistanceMode = Deko3DClipDistanceMode(clipDistances, cullDistances);
+		shader->clipDistanceEnable = (1u << std::min(clipDistances + cullDistances, 8u)) - 1;
 	}
 	const uint32_t bytes = header.codeSize + DK_SHADER_CODE_UNUSABLE_SIZE;
 	const uint32_t slabSize = std::max(SHADER_SLAB_SIZE, Align(bytes, DK_MEMBLOCK_ALIGNMENT));
@@ -1433,11 +1481,12 @@ bool Context::Apply() {
 			cmd.barrier(DkBarrier_None, DkInvalidateFlags_Shader);
 		}
 		DkShader const *shaders[2]{};
-		uint32_t clipDistanceMode = 0;
+		uint32_t clipDistanceMode = 0, clipDistanceEnable = 0;
 		for (auto &shader : pipeline_->shaders) {
 			shaders[shader->stage == ShaderStage::Vertex ? 0 : 1] = &shader->shader;
 			if (shader->stage == ShaderStage::Vertex) {
 				clipDistanceMode = shader->clipDistanceMode;
+				clipDistanceEnable = shader->clipDistanceEnable;
 			}
 		}
 		cmd.bindShaders(DkStageFlag_GraphicsMask, {shaders[0], shaders[1]});
@@ -1445,6 +1494,12 @@ bool Context::Apply() {
 		// an increasing-method header with one data word, on the 3D subchannel (0).
 		const uint32_t clipMode[2] = {(1u << 29) | (1u << 16) | 0x650, clipDistanceMode};
 		dkCmdBufReplayCmds(cmd, clipMode, 2);
+#if defined(__SWITCH2__)
+		// SET_USER_CLIP_ENABLE (3D method 0x544): only the distances the shader writes, as NVK does. drako3d enables all
+		// eight, and uam2rt's shaders export whole vec4s of distances, so the unwritten ones clipped with undefined values.
+		const uint32_t clipEnable[2] = {(1u << 29) | (1u << 16) | 0x544, clipDistanceEnable};
+		dkCmdBufReplayCmds(cmd, clipEnable, 2);
+#endif
 		// All native framebuffers are single-sample. Bind the full draw state,
 		// including stages and sample settings unused by PPSSPP.
 		cmd.bindMultisampleState(dk::MultisampleState{});
@@ -1835,10 +1890,17 @@ bool Context::Swapchain(std::string *error) {
 		return false;
 	}
 	dk::ImageLayout layout;
+#if defined(__SWITCH2__)
+	// VI2 presents uncompressed images.
+	const uint32_t swapchainFlags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_Usage2DEngine;
+#else
+	const uint32_t swapchainFlags =
+		DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_Usage2DEngine | DkImageFlags_HwCompression;
+#endif
 	dk::ImageLayoutMaker{device_->device}
 		.setFormat(DkImageFormat_RGBA8_Unorm)
 		.setDimensions(width, height)
-		.setFlags(DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_Usage2DEngine | DkImageFlags_HwCompression)
+		.setFlags(swapchainFlags)
 		.initialize(layout);
 	std::array<DkImage const *, 3> images{};
 	for (unsigned i = 0; i < images.size(); ++i) {
@@ -2051,7 +2113,7 @@ void Context::CopyFramebufferImage(Framebuffer *src, int level, int x, int y, in
 		} else {
 			Commands().copyImage(a, from, b, to);
 		}
-		Commands().barrier(DkBarrier_None, DkInvalidateFlags_Image);
+		Commands().barrier(AFTER_COPY_BARRIER, DkInvalidateFlags_Image);
 	}
 }
 
@@ -2153,9 +2215,14 @@ bool Context::CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, int x, in
 }
 
 std::string Context::GetInfoString(InfoField info) const {
+#if defined(__SWITCH2__)
+	constexpr const char *api = "drako3d";
+#else
+	constexpr const char *api = "deko3d";
+#endif
 	switch (info) {
 	case InfoField::APINAME:
-		return "deko3d";
+		return api;
 	case InfoField::APIVERSION:
 		return "Native Horizon";
 	case InfoField::VENDORSTRING:
@@ -2164,7 +2231,7 @@ std::string Context::GetInfoString(InfoField info) const {
 	case InfoField::SHADELANGVERSION:
 		return "GLSL 450 / UAM";
 	case InfoField::DRIVER:
-		return "deko3d";
+		return api;
 	default:
 		return "";
 	}
@@ -2250,7 +2317,11 @@ SamplerState *Deko3DCreateSampler(DrawContext *draw, const SamplerStateDesc &des
 
 Deko3DGraphicsContext::~Deko3DGraphicsContext() { ShutdownSurface(); }
 bool Deko3DGraphicsContext::InitAPI(void *, std::string *name, std::string *) {
+#if defined(__SWITCH2__)
+	*name = "Nintendo Switch 2 Tegra T239 (drako3d)";
+#else
 	*name = "Nintendo Switch Tegra X1 (deko3d)";
+#endif
 	return true;
 }
 bool Deko3DGraphicsContext::InitSurface(WindowSystem, void *, void *, std::string *error) {
@@ -2263,7 +2334,11 @@ bool Deko3DGraphicsContext::InitSurface(WindowSystem, void *, void *, std::strin
 		ShutdownSurface();
 		return false;
 	}
+#if defined(__SWITCH2__)
+	SetGPUBackend(GPUBackend::DEKO3D, "NVIDIA Tegra T239");
+#else
 	SetGPUBackend(GPUBackend::DEKO3D, "NVIDIA Tegra X1");
+#endif
 	return true;
 }
 void Deko3DGraphicsContext::ShutdownSurface() {

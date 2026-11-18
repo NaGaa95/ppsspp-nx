@@ -19,6 +19,10 @@ RecentFilesManager g_recentFiles;
 RecentFilesManager::RecentFilesManager() {}
 
 RecentFilesManager::~RecentFilesManager() {
+	Shutdown();
+}
+
+void RecentFilesManager::Shutdown() {
 	if (thread_.joinable()) {
 		{
 			std::lock_guard<std::mutex> guard(cmdLock_);

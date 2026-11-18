@@ -25,6 +25,9 @@
 
 #if PPSSPP_PLATFORM(SWITCH)
 #include <switch.h>
+#if defined(__SWITCH2__)
+#include "Common/nx2_platform.h"
+#endif
 #endif
 
 namespace Arm64Gen
@@ -342,6 +345,17 @@ void ARM64XEmitter::FlushIcacheSections(const u8 *const *starts, const u8 *const
 #elif PPSSPP_PLATFORM(WINDOWS)
 	for (int i = 0; i < count; i++)
 		FlushInstructionCache(GetCurrentProcess(), starts[i], ends[i] - starts[i]);
+#elif PPSSPP_PLATFORM(SWITCH) && defined(__SWITCH2__)
+	// kaiHEN: the writable alias is a staging copy. Publishing copies it to the RX view through RO and invalidates
+	// this thread's instruction cache for the ranges (one request for all of them).
+	intptr_t aliasOffset = (intptr_t)m_writable - (intptr_t)m_code;
+	nx2JitBatchBegin();
+	for (int i = 0; i < count; i++) {
+		size_t size = ends[i] - starts[i];
+		if (size)
+			nx2JitPublish((const void *)((intptr_t)starts[i] + aliasOffset), size);
+	}
+	nx2JitBatchEnd();
 #elif PPSSPP_PLATFORM(SWITCH)
 	intptr_t aliasOffset = (intptr_t)m_writable - (intptr_t)m_code;
 	for (int i = 0; i < count; i++) {

@@ -1,0 +1,139 @@
+Switch 2 (libounce) for the devkitPro SDL3 Switch video driver, applied after switch-vulkan-window.patch by
+scripts/build-switch2.sh: no HID keyboard (libounce ends the program when HID refuses it), and the default
+window keeps libounce's per-mode size (1920x1080 handheld, the TV's resolution docked) instead of SDL's
+nwindowSetDimensions.
+
+--- a/src/video/switch/SDL_switchkeyboard.c
++++ b/src/video/switch/SDL_switchkeyboard.c
+@@ -31,7 +31,10 @@
+ 
+ void SWITCH_InitKeyboard(void)
+ {
++#ifndef __SWITCH2__
++    // (not on the Switch 2: libounce ends the program when HID refuses the keyboard)
+     hidInitializeKeyboard();
++#endif
+     SDL_AddKeyboard(keyboard_id, NULL);
+ }
+ 
+@@ -43,6 +46,12 @@
+     if (SDL_GetKeyboardFocus() == NULL) {
+         return;
+     }
++#ifdef __SWITCH2__
++    (void)state;
++    (void)scancode;
++    (void)timestamp;
++    return;
++#endif
+ 
+     if (hidGetKeyboardStates(&state, 1)) {
+         for (scancode = SDL_SCANCODE_UNKNOWN; scancode < (SDL_Scancode)HidKeyboardKey_RightGui; scancode++) {
+--- a/src/video/switch/SDL_switchvideo.c
++++ b/src/video/switch/SDL_switchvideo.c
+@@ -137,6 +137,16 @@
+ 
+     SDL_zero(current_mode);
+ 
++#ifdef __SWITCH2__
++    {
++        // libounce's default window: 1920x1080 handheld, the TV's resolution docked (the program sets that with
++        // nwindowSetModeDimensions). The window follows it; SDL never sets its size.
++        u32 w = 1920, h = 1080;
++        nwindowGetDimensions(nwindowGetDefault(), &w, &h);
++        current_mode.w = (int)w;
++        current_mode.h = (int)h;
++    }
++#else
+     if (appletGetOperationMode() == AppletOperationMode_Handheld) {
+         current_mode.w = 1280;
+         current_mode.h = 720;
+@@ -144,6 +154,7 @@
+         current_mode.w = 1920;
+         current_mode.h = 1080;
+     }
++#endif
+ 
+     current_mode.refresh_rate = 60.0f;
+     current_mode.format = SDL_PIXELFORMAT_RGBA8888;
+@@ -197,10 +208,22 @@
+     mode.refresh_rate = 60;
+     mode.format = SDL_PIXELFORMAT_RGBA8888;
+ 
++#ifdef __SWITCH2__
++    {
++        u32 w = 1920, h = 1080;
++        nwindowGetDimensions(nwindowGetDefault(), &w, &h);
++        if (w != 1920 || h != 1080) {
++            mode.w = (int)w;
++            mode.h = (int)h;
++            SDL_AddFullscreenDisplayMode(display, &mode);
++        }
++    }
++#else
+     // 1280x720 RGBA8888
+     mode.w = 1280;
+     mode.h = 720;
+     SDL_AddFullscreenDisplayMode(display, &mode);
++#endif
+ 
+     // 1920x1080 RGBA8888
+     mode.w = 1920;
+@@ -224,7 +247,9 @@
+     if (data != NULL && data->egl_surface != EGL_NO_SURFACE) {
+         SDL_EGL_MakeCurrent(_this, NULL, NULL);
+         SDL_EGL_DestroySurface(_this, data->egl_surface);
++#ifndef __SWITCH2__
+         nwindowSetDimensions(nWindow, mode->w, mode->h);
++#endif
+         data->egl_surface = SDL_EGL_CreateSurface(_this, switch_window, nWindow);
+         SDL_EGL_MakeCurrent(_this, data->egl_surface, ctx);
+     }
+@@ -249,10 +274,16 @@
+ 
+     nWindow = nwindowGetDefault();
+ 
++#ifdef __SWITCH2__
++    // (the default window keeps its per-mode size: nwindowSetDimensions would fix it to one)
++    rc = 0;
++    (void)rc;
++#else
+     rc = nwindowSetDimensions(nWindow, window->w, window->h);
+     if (R_FAILED(rc)) {
+         return SDL_SetError("Could not set NWindow dimensions: 0x%x", rc);
+     }
++#endif
+ 
+     window_data->egl_surface = EGL_NO_SURFACE;
+     if (!window->external_graphics_context) {
+@@ -325,7 +356,9 @@
+         if (data != NULL && data->egl_surface != EGL_NO_SURFACE) {
+             SDL_EGL_MakeCurrent(_this, NULL, NULL);
+             SDL_EGL_DestroySurface(_this, data->egl_surface);
++#ifndef __SWITCH2__
+             nwindowSetDimensions(nWindow, window->w, window->h);
++#endif
+             data->egl_surface = SDL_EGL_CreateSurface(_this, window, nWindow);
+             SDL_EGL_MakeCurrent(_this, data->egl_surface, ctx);
+         }
+@@ -383,11 +416,20 @@
+         om = appletGetOperationMode();
+         if (om != operationMode) {
+             operationMode = om;
++#ifdef __SWITCH2__
++            {
++                // libounce resized the default window when appletMainLoop handled the mode change
++                u32 w = 1920, h = 1080;
++                nwindowGetDimensions(nwindowGetDefault(), &w, &h);
++                SDL_SetWindowSize(switch_window, (int)w, (int)h);
++            }
++#else
+             if (operationMode == AppletOperationMode_Handheld) {
+                 SDL_SetWindowSize(switch_window, 1280, 720);
+             } else {
+                 SDL_SetWindowSize(switch_window, 1920, 1080);
+             }
++#endif
+         }
+     }
+ }

@@ -155,6 +155,8 @@ cmake-build-*/
 
 /dist/PPSSPP.nro
 /dist/PPSSPP-build.txt
+/dist/PPSSPP-NX2.nro
+/dist/PPSSPP-NX2-build.txt
 /assets/fwd/
 /Switch/forwarder/hbl.elf
 # Obsolete submodule checkout retained after upstream moved FFmpeg to FetchContent.

@@ -198,6 +198,26 @@ option(SIMULATOR "Set to ON when targeting an x86 simulator of an ARM platform" 
 option(LIBRETRO "Set to ON to generate the libretro target" OFF)
 # :: Options
 option(USE_LIBNX "Set to ON to build for Switch(libnx)" OFF)
+# Nintendo Switch 2 (scripts/build-switch2.sh): the USE_LIBNX build with libounce's toolchain, drako3d, uam2rt and
+# kaiHEN's JIT. kaiHEN cannot map memory twice, so the PSP address space is one flat allocation (NO_MMAP +
+# MASKED_PSP_MEMORY). No USB host, SaltyNX or forwarders.
+if(USE_LIBNX AND NINTENDO_SWITCH2)
+	set(PPSSPP_SWITCH2 ON)
+	message(STATUS "Building for Nintendo Switch 2 (libounce, drako3d, uam2rt, kaiHEN JIT)")
+	add_compile_definitions(PPSSPP_SWITCH2 NO_MMAP MASKED_PSP_MEMORY)
+	# The Switch 2 Mesa SDK prefix (with uam2rt): its libEGL.a and libvulkan.a are linker scripts that name the archives
+	# beside them. The Switch portlibs that only use the C library (zstd, expat, zlib...) come after.
+	set(SWITCH2_MESA_PREFIX "" CACHE PATH "portlibs/switch2 of mesa-26.2.7-switch2-horizon-sdk.zip, with uam2rt")
+	if(SWITCH2_MESA_PREFIX)
+		link_directories(BEFORE "${SWITCH2_MESA_PREFIX}/lib")
+	endif()
+	link_directories("${DEVKITPRO}/portlibs/switch/lib")
+	# nx2_platform.c and the link wraps it needs (see nx2_platform.h).
+	add_link_options("-Wl,--wrap=hidInitializeKeyboard" "-Wl,--wrap=hidInitializeMouse"
+		"-Wl,--wrap=hidInitializeTouchScreen" "-Wl,--wrap=__syscall_thread_create" "-Wl,--wrap=smGetServiceWrapper")
+else()
+	set(PPSSPP_SWITCH2 OFF)
+endif()
 option(SWITCH_ENABLE_LTO "Enable link-time optimization for Switch release builds" ON)
 set(SWITCH_LTO_JOBS "16" CACHE STRING "Parallel jobs used by the Switch LTO linker")
 set(DEFAULT_USE_MINIUPNPC ON)
@@ -263,7 +283,10 @@ if(USE_LIBNX)
 	FetchContent_MakeAvailable(libsmb2)
 	target_compile_definitions(smb2 PRIVATE AES128_ECB_encrypt=smb2_AES128_ECB_encrypt)
 	target_compile_options(smb2 PRIVATE -UNEED_WRITEV)
+endif()
 
+# USB drives (libusbhsfs): Switch only (kaiHEN never answers usb:hs).
+if(USE_LIBNX AND NOT PPSSPP_SWITCH2)
 	set(USBHSFS_GPL OFF CACHE BOOL "" FORCE)
 	set(USBHSFS_NTFS ON CACHE BOOL "" FORCE)
 	set(USBHSFS_EXT4 OFF CACHE BOOL "" FORCE)
@@ -1176,7 +1199,13 @@ else()
 		find_package(PkgConfig REQUIRED)
 		pkg_check_modules(SWITCH_TEXT REQUIRED IMPORTED_TARGET freetype2 harfbuzz fribidi)
 		list(APPEND targetExtraLibs PkgConfig::SWITCH_TEXT)
-		list(APPEND targetExtraLibs SwitchLsfgBackend SwitchCurl smb2 libusbhsfs)
+		list(APPEND targetExtraLibs SwitchLsfgBackend SwitchCurl smb2)
+		if(PPSSPP_SWITCH2)
+			# kaiHEN's JIT provider (libounce's jit* functions reference it weakly).
+			list(APPEND targetExtraLibs kaihen)
+		else()
+			list(APPEND targetExtraLibs libusbhsfs)
+		endif()
 	endif()
 	if(SDL_TTF_LIB_TARGET)
 		list(APPEND targetExtraLibs ${SDL_TTF_LIB_TARGET})
@@ -1753,17 +1782,23 @@ if(USE_LIBNX)
 	dkp_add_asset_target(PPSSPP_romfs "${SWITCH_ROMFS_DIR}")
 	dkp_track_assets(PPSSPP_romfs FILES ${SWITCH_ROMFS_FILES})
 
+	# The Switch 2 NRO is PPSSPP-NX2.nro, next to the Switch one in sdmc:/switch/ppsspp-nx.
+	if(PPSSPP_SWITCH2)
+		set(PPSSPP_NRO_NAME "PPSSPP-NX2")
+	else()
+		set(PPSSPP_NRO_NAME "PPSSPP")
+	endif()
 	nx_generate_nacp(
-		OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/PPSSPP.nacp"
+		OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${PPSSPP_NRO_NAME}.nacp"
 		NAME "PPSSPP"
 		AUTHOR "naga"
 		VERSION "${PPSSPP_SWITCH_RELEASE_VERSION}"
 	)
 	nx_create_nro(PPSSPP_NRO
 		TARGET ${TargetBin}
-		OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/PPSSPP.nro"
+		OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${PPSSPP_NRO_NAME}.nro"
 		ICON "${CMAKE_CURRENT_SOURCE_DIR}/icons/PPSSPP-icon.jpg"
-		NACP "${CMAKE_CURRENT_BINARY_DIR}/PPSSPP.nacp"
+		NACP "${CMAKE_CURRENT_BINARY_DIR}/${PPSSPP_NRO_NAME}.nacp"
 		ROMFS PPSSPP_romfs
 	)
 endif()

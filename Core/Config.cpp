@@ -948,7 +948,11 @@ static int DefaultAnalogAltSpeedPercent() {
 }
 
 static constexpr const char *externalDisplayNames[] = { "Show the game", "Mirror the screen" };
+#if defined(__SWITCH2__)
+static constexpr const char *gpuBackendNames[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan", "Metal", "Zink", "Drako3D" };
+#else
 static constexpr const char *gpuBackendNames[] = { "OpenGL", "Direct3D 9", "Direct3D 11", "Vulkan", "Metal", "Zink", "Deko3D" };
+#endif
 static constexpr const char *internalResolutionNames[] = { "Auto (1:1)", "1x PSP", "2x PSP", "3x PSP", "4x PSP", "5x PSP", "6x PSP", "7x PSP", "8x PSP", "9x PSP", "10x PSP" };
 static constexpr const char *msaaLevelNames[] = { "Off", "2x", "4x", "8x", "16x" };
 static constexpr const char *androidHwScaleNames[] = { "Native device resolution", "Same as Rendering resolution", "1x PSP", "2x PSP", "3x PSP", "4x PSP", "5x PSP" };

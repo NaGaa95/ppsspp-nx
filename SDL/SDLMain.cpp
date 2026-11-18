@@ -98,6 +98,10 @@ SDLJoystick *joystick = NULL;
 #include "UI/SwitchLibrary.h"
 #include "UI/SwitchUpdate.h"
 #include "Common/SwitchSaltyNX.h"
+#if defined(__SWITCH2__)
+#include "Common/nx2_platform.h"
+#include "Core/Util/RecentFiles.h"
+#endif
 
 #define LIBNX_SWKBD_LIMIT 500 // enforced by HOS
 extern "C" {
@@ -105,6 +109,10 @@ u32 __nx_applet_type = AppletType_Application;
 size_t __nx_heap_size = 0;
 }
 
+#if defined(__SWITCH2__)
+// Switch 2: every renderer presents to libounce's default window (sized by nx2DisplayInit).
+static AppletOperationMode g_switchOperationMode;
+#else
 static ViDisplay g_switchDisplay;
 static ViLayer g_switchLayer;
 static NWindow g_switchWindow;
@@ -169,6 +177,7 @@ extern "C" void __nx_win_exit() {
 	viCloseDisplay(&g_switchDisplay);
 	viExit();
 }
+#endif // __SWITCH2__
 #endif
 
 GlobalUIState lastUIState = UISTATE_MENU;
@@ -233,6 +242,12 @@ static std::string SwitchNormalizeNroPath(std::string path) {
 }
 
 static void CheckSwitchOperationMode() {
+#if defined(__SWITCH2__)
+	// Vulkan and GL pacing (drako3d paces in Present): a swap interval Mesa sets withdraws the 120 Hz request.
+	if (g_Config.iGPUBackend != (int)GPUBackend::DEKO3D) {
+		nx2DisplayApply(g_Config.bVSync ? 1 : 0);
+	}
+#endif
 	AppletOperationMode operationMode = appletGetOperationMode();
 	if (operationMode != g_switchOperationMode) {
 		g_switchOperationMode = operationMode;
@@ -1493,6 +1508,17 @@ float System_GetPropertyFloat(SystemProperty prop) {
 	case SYSPROP_DISPLAY_REFRESH_RATE:
 		return g_RefreshRate;
 	case SYSPROP_DISPLAY_DPI:
+#if defined(__SWITCH2__)
+		if (g_ForcedDPI == 0.0f) {
+			// The UI keeps the Switch's 720-line layout at every output size (1080p handheld, up to 4K docked), like
+			// the launcher's 1280x720 logical size.
+			u32 width = 1920, height = 1080;
+			nx2DisplaySize(&width, &height);
+			if (height > 720) {
+				return 96.0f * (float)height / 720.0f;
+			}
+		}
+#endif
 		return (g_ForcedDPI == 0.0f ? g_DesktopDPI : g_ForcedDPI) * 96.0;
 	case SYSPROP_DISPLAY_SAFE_INSET_LEFT:
 	case SYSPROP_DISPLAY_SAFE_INSET_RIGHT:
@@ -2287,11 +2313,19 @@ int main(int argc, char *argv[]) {
 		}
 	}
 	SetCurrentThreadToProcessAffinity();
+#if defined(__SWITCH2__)
+	g_switchOperationMode = appletGetOperationMode();
+	nx2DisplayInit();
+#endif
 	if (argc > 0 && argv[0]) {
 		g_switchExecutablePath = SwitchNormalizeNroPath(argv[0]);
 	}
 	if (g_switchExecutablePath.empty()) {
+#if defined(__SWITCH2__)
+		g_switchExecutablePath = "sdmc:/switch/ppsspp-nx/PPSSPP-NX2.nro";
+#else
 		g_switchExecutablePath = "sdmc:/switch/ppsspp-nx/PPSSPP.nro";
+#endif
 	}
 	SwitchUpdate_SetExecutablePath(g_switchExecutablePath);
 	SwitchForwarder_SetExecutablePath(g_switchExecutablePath);
@@ -2526,8 +2560,14 @@ int main(int argc, char *argv[]) {
 	SwitchLibrary::Initialize();
 	if (!forwarderLaunchError.empty())
 		g_OSD.Show(OSDType::MESSAGE_ERROR, "Could not launch game", forwarderLaunchError, 8.0f);
+#if defined(__SWITCH2__)
+	// (Ampere code, apart from the Switch's)
+	File::CreateFullPath(Path("/switch/ppsspp-nx/cache/mesa-nx2"));
+	setenv("MESA_SHADER_CACHE_DIR", "/switch/ppsspp-nx/cache/mesa-nx2", 1);
+#else
 	File::CreateFullPath(Path("/switch/ppsspp-nx/cache/mesa"));
 	setenv("MESA_SHADER_CACHE_DIR", "/switch/ppsspp-nx/cache/mesa", 1);
+#endif
 	setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 1);
 #endif
 
@@ -2596,9 +2636,19 @@ int main(int argc, char *argv[]) {
 			return false;
 		}
 #endif
+#if defined(__SWITCH2__)
+		if (backend != GPUBackend::DEKO3D) {
+			// (after the launcher's GL)
+			nx2MesaGpuRecover();
+		}
+#endif
 		if (backend == GPUBackend::OPENGL || backend == GPUBackend::ZINK) {
 #if PPSSPP_PLATFORM(SWITCH)
 			setenv("GALLIUM_DRIVER", backend == GPUBackend::ZINK ? "zink" : "nouveau", 1);
+#if defined(__SWITCH2__)
+			// (the Switch 2 Mesa's EGL picks its Gallium driver by this one)
+			setenv("MESA_SWITCH_GL_DRIVER", backend == GPUBackend::ZINK ? "zink" : "nvc0", 1);
+#endif
 #endif
 			SDL_GLContext glContext = nullptr;
 			window = CreateSDLGLWindowAndContext(x, y, w, h, mode, cmdLineOptions.force_gl_version, &glContext, errorMessage);
@@ -2621,6 +2671,10 @@ int main(int argc, char *argv[]) {
 			if (!window) { *errorMessage = SDL_GetError(); return false; }
 			windowDesc.winsys = WINDOWSYSTEM_SDL;
 			windowDesc.data1 = window;
+#if defined(__SWITCH2__)
+			// (after the launcher's GL)
+			nx2GpuReleaseForDrako3d();
+#endif
 			ctx = new Deko3DGraphicsContext();
 #endif
 #if PPSSPP_PLATFORM(MAC)
@@ -2988,7 +3042,15 @@ int main(int argc, char *argv[]) {
 	SDL_DestroyWindow(window);
 	window = nullptr;
 
+#if defined(__SWITCH2__)
+	// Read before NativeShutdown, which requests an exit itself on every way out.
+	const bool quitRequested = g_QuitRequested;
+#endif
 	NativeShutdown();
+#if defined(__SWITCH2__)
+	// (global destructors do not run here: the worker would still run when the homebrew loader takes the process back)
+	g_recentFiles.Shutdown();
+#endif
 
 #if PPSSPP_PLATFORM(SWITCH)
 	saltynx_stop();
@@ -3024,6 +3086,12 @@ int main(int argc, char *argv[]) {
 #endif
 
 #if PPSSPP_PLATFORM(SWITCH)
+#if defined(__SWITCH2__)
+	// Quitting the launcher still shows one frame whose MainScreen asks to restart into it: the quit wins.
+	if (quitRequested && g_RestartRequested) {
+		g_RestartRequested = false;
+	}
+#endif
 	if (g_RestartRequested) {
 		std::string updateError;
 		if (!SwitchUpdate_InstallPending(R_SUCCEEDED(romfsExitResult), &updateError)) {
@@ -3033,10 +3101,15 @@ int main(int argc, char *argv[]) {
 			errorApplicationShow(&error);
 		}
 		bool handoffReady = g_restartParams.empty() || SwitchWriteRestartHandoff(g_restartParams);
+#if defined(__SWITCH2__)
+		// No restart: it would start kaiHEN's host game. The loader runs PPSSPP again (envSetNextLoad below).
+		(void)handoffReady;
+#else
 		if (handoffReady && (__nx_applet_type == AppletType_Application || __nx_applet_type == AppletType_SystemApplication)) {
 			appletRestartProgram(nullptr, 0);
 			remove(SWITCH_RESTART_HANDOFF);
 		}
+#endif
 		std::string restartArgs = g_switchExecutablePath;
 		if (!g_restartParams.empty()) {
 			restartArgs += " ";

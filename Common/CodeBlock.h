@@ -13,6 +13,10 @@
 #if PPSSPP_PLATFORM(SWITCH)
 #include <cstdio>
 #include <switch.h>
+#if defined(__SWITCH2__)
+// kaiHEN: the writable region is a staging copy; ARM64XEmitter::FlushIcacheSections publishes it.
+#include "Common/nx2_platform.h"
+#endif
 #endif // PPSSPP_PLATFORM(SWITCH)
 
 // Everything that needs to generate code should inherit from this.
@@ -77,7 +81,7 @@ public:
 #if PPSSPP_PLATFORM(SWITCH)
 		Result rc = jitCreate(&jitController, size);
 		if (R_FAILED(rc)) {
-			printf("Failed to create Jitbuffer of size 0x%x err: 0x%x\n", size, rc);
+			ERROR_LOG(Log::JIT, "jitCreate(0x%x) failed: 0x%x", size, rc);
 			region_size = 0;
 			region = nullptr;
 			writableRegion = nullptr;
@@ -87,6 +91,9 @@ public:
 
 		region = (u8 *)jitController.rx_addr;
 		writableRegion = (u8 *)jitController.rw_addr;
+#if defined(__SWITCH2__)
+		nx2JitRegister(&jitController);
+#endif
 #else // PPSSPP_PLATFORM(SWITCH)
 		// The protection will be set to RW if PlatformIsWXExclusive.
 		region = (u8 *)AllocateExecutableMemory(region_size);
@@ -163,8 +170,10 @@ public:
 		ProtectMemoryPages(region, region_size, MEM_PROT_READ | MEM_PROT_WRITE);
 		FreeExecutableMemory(region, region_size);
 #else // !PPSSPP_PLATFORM(SWITCH)
+#if defined(__SWITCH2__)
+		nx2JitUnregister(&jitController);
+#endif
 		jitClose(&jitController);
-		printf("[NXJIT]: Jit closed\n");
 #endif // PPSSPP_PLATFORM(SWITCH)
 		region = nullptr;
 		writableRegion = nullptr;

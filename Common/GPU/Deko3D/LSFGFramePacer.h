@@ -15,6 +15,14 @@ public:
 	struct Decision {
 		bool generate = false, reset = false, highRate = false;
 	};
+	// The display's refresh rate: generation doubles sources up to half of it (30 fps at 60 Hz, 60 fps at 120 Hz).
+	void SetRefreshRate(int hz) {
+		const uint64_t period = hz > 0 ? 1'000'000'000ull / (uint64_t)hz : 16'666'667ull;
+		if (period != period_) {
+			Reset();
+			period_ = period;
+		}
+	}
 	Decision Observe(uint64_t now, bool requested, bool ready) {
 		Decision result;
 		const uint64_t interval = last_ && now > last_ ? now - last_ : 0;
@@ -27,7 +35,7 @@ public:
 		}
 		if (requested != requested_) {
 			requested_ = requested;
-			rate_ = requested && samples_ >= 8 ? (average_ < 30'000'000 ? 1 : 0) : -1;
+			rate_ = requested && samples_ >= 8 ? (average_ < FastLimit() ? 1 : 0) : -1;
 			slow_ = 0;
 			result.reset = true;
 		}
@@ -39,10 +47,10 @@ public:
 			return result;
 		}
 		if (rate_ < 0 && samples_ >= 8) {
-			rate_ = average_ < 30'000'000 ? 1 : 0;
+			rate_ = average_ < FastLimit() ? 1 : 0;
 		}
 		if (rate_ == 1) {
-			slow_ = interval >= 31'500'000 ? slow_ + 1 : interval ? 0 : slow_;
+			slow_ = interval >= SlowLimit() ? slow_ + 1 : interval ? 0 : slow_;
 			if (slow_ < 16) {
 				result.highRate = true;
 				return result;
@@ -54,10 +62,19 @@ public:
 		result.generate = rate_ == 0;
 		return result;
 	}
-	void Reset() { *this = {}; }
+	void Reset() {
+		const uint64_t period = period_;
+		*this = {};
+		period_ = period;
+	}
 	double SourceFPS() const { return average_ > 0 ? 1'000'000'000.0 / average_ : 0; }
 
 private:
+	// 30 ms and 31.5 ms at 60 Hz.
+	uint64_t FastLimit() const { return period_ * 9 / 5; }
+	uint64_t SlowLimit() const { return period_ * 189 / 100; }
+
+	uint64_t period_ = 16'666'667;
 	uint64_t last_ = 0;
 	double average_ = 0;
 	unsigned samples_ = 0, slow_ = 0;

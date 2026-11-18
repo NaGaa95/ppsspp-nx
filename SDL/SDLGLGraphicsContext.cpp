@@ -1,6 +1,9 @@
 #include <vector>
 
 #include "SDLGLGraphicsContext.h"
+#if defined(__SWITCH2__)
+#include "Common/nx2_platform.h"
+#endif
 #if PPSSPP_PLATFORM(SWITCH)
 #include "Common/SwitchSaltyNX.h"
 #endif
@@ -499,6 +502,10 @@ bool SDLGLGraphicsContext::InitSurface(WindowSystem winsys, void *data1, void *d
 	renderManager_->SetSwapIntervalFunction([&](int interval) {
 		INFO_LOG(Log::G3D, "SDL SwapInterval: %d", interval);
 		SDL_GL_SetSwapInterval(interval);
+#if defined(__SWITCH2__)
+		// (eglSwapInterval withdraws the 120 Hz request)
+		nx2DisplayApply(interval);
+#endif
 	});
 
 	window_ = window;

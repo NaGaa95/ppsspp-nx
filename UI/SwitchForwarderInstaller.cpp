@@ -644,7 +644,11 @@ void patch_nacp(NacpStruct &nacp, const std::string &name, const std::string &au
 			--length;
 		std::memcpy(destination, source.data(), length);
 	};
+#if defined(__SWITCH2__)
+	for (auto &lang : nacp.lang_data.lang) {  // (libounce's NACP layout)
+#else
 	for (auto &lang : nacp.lang) {
+#endif
 		if (!name.empty())
 			copyText(lang.name, sizeof(lang.name), name);
 		if (!author.empty())
@@ -1265,6 +1269,15 @@ bool SwitchForwarder_Create(const std::string &gamePath, const std::string &name
 							const std::vector<uint8_t> &iconData, std::string *error) {
 	if (error)
 		error->clear();
+#if defined(__SWITCH2__)
+	// No HOME menu shortcuts: kaiHEN starts homebrew only from its loader (and ns, ncm, spl stay closed).
+	(void)name;
+	(void)author;
+	(void)iconData;
+	if (error)
+		*error = "HOME menu shortcuts are not available on the Switch 2.";
+	return false;
+#else
 	if (gamePath.empty() || gamePath.size() >= FS_MAX_PATH || gamePath.find_first_of("\"\r\n") != std::string::npos) {
 		if (error)
 			*error = "The game path cannot be used by a forwarder.";
@@ -1332,6 +1345,7 @@ bool SwitchForwarder_Create(const std::string &gamePath, const std::string &name
 		*error = message;
 	}
 	return false;
+#endif
 }
 
 #endif

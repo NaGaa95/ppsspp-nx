@@ -4,7 +4,11 @@
 
 #pragma once
 
+#if defined(__SWITCH2__)
+#include <drako3d.hpp>
+#else
 #include <deko3d.hpp>
+#endif
 #include <functional>
 #include <memory>
 #include <string>

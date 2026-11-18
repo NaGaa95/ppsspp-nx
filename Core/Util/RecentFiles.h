@@ -30,6 +30,8 @@ public:
 	bool ContainsFile(std::string_view filename);
 
 	void EnsureThread();
+	// Stops the worker thread, as the destructor does, for where global destructors don't run at exit.
+	void Shutdown();
 
 	std::vector<std::string> GetRecentFiles() const;
 private:

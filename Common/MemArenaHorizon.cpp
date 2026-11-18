@@ -21,7 +21,63 @@
 #include <errno.h>
 #include <switch.h>
 
+#include "Common/Log.h"
 #include "Common/MemArena.h"
+
+#if defined(__SWITCH2__)
+#include <cstdlib>
+#include <cstring>
+
+// Switch 2: kaiHEN cannot map memory at a second address, so the build is NO_MMAP + MASKED_PSP_MEMORY. One flat,
+// zeroed allocation covers the masked 1 GB PSP address space; the mirrors fold onto it through the mask (only the
+// swizzled VRAM mirrors don't alias, as on PPSSPP's other no-mmap ports).
+static u8 *flatBase = nullptr;
+static constexpr size_t FLAT_SIZE = 0x40000000;  // MEMVIEW32_MASK + 1 (Core/MemMap.h)
+
+size_t MemArena::roundup(size_t x) {
+	return (x + 0xFFF) & ~(size_t)0xFFF;
+}
+
+bool MemArena::NeedsProbing() {
+	return false;
+}
+
+bool MemArena::GrabMemSpace(size_t size) {
+	return size <= FLAT_SIZE;
+}
+
+void MemArena::ReleaseSpace() {
+	free(flatBase);
+	flatBase = nullptr;
+}
+
+void *MemArena::CreateView(s64 offset, size_t size, void *base) {
+	(void)offset;
+	(void)size;
+	return base;
+}
+
+void MemArena::ReleaseView(s64 offset, void *view, size_t size) {
+	(void)offset;
+	(void)view;
+	(void)size;
+}
+
+void MemArena::ReleaseViewSpace(u8 *base) {
+	(void)base;
+}
+
+u8 *MemArena::Find4GBBase() {
+	if (!flatBase) {
+		flatBase = (u8 *)aligned_alloc(0x10000, FLAT_SIZE);
+		if (flatBase) {
+			memset(flatBase, 0, FLAT_SIZE);
+		}
+	}
+	return flatBase;
+}
+
+#else  // !__SWITCH2__
 
 static uintptr_t memoryBase = 0;
 static uintptr_t memoryCodeBase = 0;
@@ -131,8 +187,8 @@ void *MemArena::CreateView(s64 offset, size_t size, void *base) {
 	}
 	Result rc = svcMapProcessMemory(base, envGetOwnProcessHandle(), (u64)(memoryCodeBase + offset), size);
 	if (R_FAILED(rc)) {
-		printf("Fatal error creating the view... base: %p offset: %p size: %p src: %p err: %d\n",
-			   (void *)base, (void *)offset, (void *)size, (void *)(memoryCodeBase + offset), rc);
+		ERROR_LOG(Log::MemMap, "svcMapProcessMemory(%p, %p, 0x%zx) failed: 0x%x", (void *)base, (void *)(memoryCodeBase + offset),
+				  (size_t)size, rc);
 		return nullptr;
 	}
 	*slot = {(uintptr_t)base, (size_t)offset, size};
@@ -229,4 +285,5 @@ u8 *MemArena::Find4GBBase() {
 	return (u8 *)window->base;
 }
 
+#endif // __SWITCH2__
 #endif // PPSSPP_PLATFORM(SWITCH)

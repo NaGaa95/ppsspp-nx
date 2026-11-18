@@ -636,7 +636,8 @@ void GameScreen::CreateSettingsViews(UI::ViewGroup *rightColumn) {
 		}
 	}
 
-#if PPSSPP_PLATFORM(SWITCH)
+#if PPSSPP_PLATFORM(SWITCH) && !defined(__SWITCH2__)
+	// (not on the Switch 2: kaiHEN starts homebrew only from its loader, so no HOME menu forwarders)
 	if (!inGame_ && FileTypeIsPlayable(info_->fileType, lookups_.firmwareRunsPS1Discs)) {
 		rightColumnItems->Add(new Choice(ga->T("Create forwarder"), ImageID("I_SHORTCUT")))->OnClick.Add([this](UI::EventParams &) {
 			screenManager()->push(new SwitchForwarderScreen(gamePath_, info_->GetTitle()));

@@ -46,6 +46,9 @@ Arm64JitBackend::Arm64JitBackend(JitOptions &jitopt)
 	jo.optimizeForInterpreter = false;
 #ifdef MASKED_PSP_MEMORY
 	jo.enablePointerify = false;
+	// Mapping a static register as a pointer masks it in place, and its context copy is stale until a JIT exit:
+	// later uses in the block (SP after a call) read a masked or stale value.
+	jo.useStaticAlloc = false;
 #endif
 
 	// Since we store the offset, this is as big as it can be.

@@ -5,6 +5,15 @@
 
 #pragma once
 
+// The release asset each build installs (a release carries both).
+#if defined(__SWITCH2__)
+#define SWITCH_UPDATE_ASSET "PPSSPP-NX2.nro"
+#define SWITCH_UPDATE_ASSET_LOWER "ppsspp-nx2.nro"
+#else
+#define SWITCH_UPDATE_ASSET "PPSSPP.nro"
+#define SWITCH_UPDATE_ASSET_LOWER "ppsspp.nro"
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -54,7 +63,7 @@ inline bool SwitchUpdate_ParseRelease(std::string_view data, SwitchReleaseInfo *
 			std::string lowerName = name;
 			std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), [](unsigned char c) { return (char)std::tolower(c); });
 			constexpr std::string_view prefix = "https://github.com/NaGaa95/ppsspp-nx/releases/download/";
-			if (lowerName != "ppsspp.nro" || url.compare(0, prefix.size(), prefix) != 0) {
+			if (lowerName != SWITCH_UPDATE_ASSET_LOWER || url.compare(0, prefix.size(), prefix) != 0) {
 				continue;
 			}
 			found.assetName = std::move(name);
@@ -65,6 +74,6 @@ inline bool SwitchUpdate_ParseRelease(std::string_view data, SwitchReleaseInfo *
 			return true;
 		}
 	}
-	*error = "The latest release does not contain PPSSPP.nro.";
+	*error = "The latest release does not contain " SWITCH_UPDATE_ASSET ".";
 	return false;
 }

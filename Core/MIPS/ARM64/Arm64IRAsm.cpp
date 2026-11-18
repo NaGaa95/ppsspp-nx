@@ -239,8 +239,13 @@ void Arm64JitBackend::GenerateFixedCode(MIPSState *mipsState) {
 			WriteDebugProfilerStatus(IRProfilerStatus::IN_JIT);
 			ApplyRoundingMode(true);
 
+#ifdef MASKED_PSP_MEMORY
+			// Through the core state check: JitAt stops the core on a pc outside PSP memory.
+			B(dispatcherCheckCoreState_);
+#else
 			// Let's just dispatch again, we'll enter the block since we know it's there.
 			B(dispatcherNoCheck_);
+#endif
 
 		SetJumpTarget(bail);
 

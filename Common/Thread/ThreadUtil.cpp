@@ -85,14 +85,43 @@ static uint32_t SwitchThreeCoreMask(uint32_t processMask) {
 	}
 	return mask;
 }
+
+#if defined(__SWITCH2__)
+// The lowest priority the process may use: kaiHEN's host title refuses the Switch's 63.
+static int SwitchLowestPriority() {
+	static const int lowest = [] {
+		uint64_t mask = 0;
+		if (R_SUCCEEDED(svcGetInfo(&mask, InfoType_PriorityMask, CUR_PROCESS_HANDLE, 0)) && mask)
+			return 63 - __builtin_clzll(mask);
+		return 63;
+	}();
+	return lowest;
+}
+#endif
 #endif
 
 void SetCurrentThreadAffinity(ThreadAffinityRole role) {
 #if PPSSPP_PLATFORM(SWITCH)
+#if defined(__SWITCH2__)
+	// Switch 2: emulation, rendering, shader compilation and audio/events get a core each; the rest share the others.
+	const uint32_t processMask = SwitchProcessCoreMask();
+	const int emulationCore = SwitchCoreAt(processMask, 0);
+	const int renderCore = SwitchCoreAt(processMask, 1);
+	const int shaderCore = SwitchCoreAt(processMask, 2);
+	const int audioCore = SwitchCoreAt(processMask, 3);
+	uint32_t workerMask = processMask & ~((1U << emulationCore) | (1U << renderCore) | (1U << shaderCore) | (1U << audioCore));
+	if (!workerMask) {
+		workerMask = 1U << shaderCore;
+	}
+	const int workerCore = __builtin_ctz(workerMask);
+#else
 	const uint32_t processMask = SwitchThreeCoreMask(SwitchProcessCoreMask());
 	const int emulationCore = SwitchCoreAt(processMask, 0);
 	const int renderCore = SwitchCoreAt(processMask, 1);
 	const int workerCore = SwitchCoreAt(processMask, 2);
+	const int shaderCore = workerCore, audioCore = workerCore;
+	const uint32_t workerMask = 1U << workerCore;
+#endif
 
 	int idealCore = -1;
 	uint32_t affinityMask = processMask;
@@ -102,8 +131,8 @@ void SetCurrentThreadAffinity(ThreadAffinityRole role) {
 	case ThreadAffinityRole::PROCESS:
 		break;
 	case ThreadAffinityRole::EVENT:
-		idealCore = workerCore;
-		affinityMask = 1U << workerCore;
+		idealCore = audioCore;
+		affinityMask = 1U << audioCore;
 		priority = 47;
 		break;
 	case ThreadAffinityRole::EMULATION:
@@ -115,8 +144,8 @@ void SetCurrentThreadAffinity(ThreadAffinityRole role) {
 		affinityMask = 1U << renderCore;
 		break;
 	case ThreadAffinityRole::SHADER_COMPILER:
-		idealCore = workerCore;
-		affinityMask = 1U << workerCore;
+		idealCore = shaderCore;
+		affinityMask = 1U << shaderCore;
 		break;
 	case ThreadAffinityRole::PRESENT:
 		idealCore = renderCore;
@@ -124,15 +153,15 @@ void SetCurrentThreadAffinity(ThreadAffinityRole role) {
 		priority = 45;
 		break;
 	case ThreadAffinityRole::AUDIO:
-		idealCore = workerCore;
-		affinityMask = 1U << workerCore;
+		idealCore = audioCore;
+		affinityMask = 1U << audioCore;
 		priority = 40;
 		break;
 	case ThreadAffinityRole::COMPUTE:
 	case ThreadAffinityRole::IO:
 	case ThreadAffinityRole::BACKGROUND:
 		idealCore = workerCore;
-		affinityMask = 1U << workerCore;
+		affinityMask = workerMask;
 		priority = 63;
 		break;
 	case ThreadAffinityRole::RENDER_CORE_COMPUTE:
@@ -151,6 +180,9 @@ void SetCurrentThreadAffinity(ThreadAffinityRole role) {
 		return;
 	}
 	if (priority >= 0) {
+#if defined(__SWITCH2__)
+		priority = priority > SwitchLowestPriority() ? SwitchLowestPriority() : priority;
+#endif
 		svcSetThreadPriority(CUR_THREAD_HANDLE, priority);
 	}
 #else

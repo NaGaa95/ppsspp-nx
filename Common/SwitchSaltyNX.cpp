@@ -7,6 +7,14 @@
 
 #include "SwitchSaltyNX.h"
 
+#if defined(__SWITCH2__)
+// SaltyNX is an Atmosphere sysmodule of the Switch: the Switch 2 build reports nothing to it.
+void saltynx_start(void) {}
+void saltynx_stop(void) {}
+void saltynx_set_resolution(uint32_t, uint32_t) {}
+void saltynx_frame(uint8_t) {}
+#else
+
 #include <switch.h>
 #include "Common/Thread/ThreadUtil.h"
 
@@ -270,3 +278,4 @@ void saltynx_frame(uint8_t api) {
 	}
 	graphics_api.store(api, std::memory_order_relaxed);
 }
+#endif  // !__SWITCH2__

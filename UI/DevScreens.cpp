@@ -882,7 +882,11 @@ void TouchTestScreen::CreateViews() {
 	root_->Add(theTwo);
 
 #if !PPSSPP_PLATFORM(UWP)
+#if defined(__SWITCH2__)
+	static const char *renderingBackend[] = { "OpenGL", "(n/a)", "Direct3D 11", "Vulkan", "Metal", "Zink", "Drako3D" };
+#else
 	static const char *renderingBackend[] = { "OpenGL", "(n/a)", "Direct3D 11", "Vulkan", "Metal", "Zink", "Deko3D" };
+#endif
 	PopupMultiChoice *renderingBackendChoice = root_->Add(new PopupMultiChoice(&g_Config.iGPUBackend, gr->T("Backend"), renderingBackend, (int)GPUBackend::OPENGL, ARRAY_SIZE(renderingBackend), I18NCat::GRAPHICS, screenManager()));
 	renderingBackendChoice->OnChoice.Handle(this, &TouchTestScreen::OnRenderingBackend);
 

@@ -17,6 +17,10 @@ struct PreparedShaders {
 
 PreparedShaders PrepareShaders(bool performance, const std::atomic<bool> &cancel,
 							   const std::string &dll = "/switch/ppsspp-nx/lsfg/Lossless.dll",
+#if defined(__SWITCH2__)
+							   const std::string &cacheRoot = "/switch/ppsspp-nx/cache/drako3d/lsfg-1");
+#else
 							   const std::string &cacheRoot = "/switch/ppsspp-nx/cache/deko3d/lsfg-1");
+#endif
 
 } // namespace Deko3DLSFG
