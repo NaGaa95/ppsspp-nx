@@ -27,6 +27,11 @@ To download fresh development builds for Android, Windows and Mac, [go to the /d
 
 For game compatibility, see [community compatibility feedback](https://report.ppsspp.org/games).
 
+Nintendo Switch and Switch 2
+----------------------------
+
+This fork runs PPSSPP on the Nintendo Switch and the Nintendo Switch 2 (kaiHEN). Each release carries both builds: `PPSSPP.nro` for the Switch and `PPSSPP-NX2.nro` for the Switch 2, to put in `sdmc:/switch/ppsspp-nx/`.
+
 What's new in 1.20.4
 --------------------
 1.20.4 is an unusually big followup release, but given the new multiplayer developments, we need something to cover the longer gap to 1.21.
