@@ -1019,7 +1019,12 @@ static constexpr ConfigSetting graphicsSettings[] = {
 		.Label(I18NCat::GRAPHICS, "Device"),
 #if PPSSPP_PLATFORM(SWITCH)
 	ConfigSetting("SwitchFrameGeneration", SETTING(g_Config, bSwitchFrameGeneration), false, CfgFlag::PER_GAME),
-	ConfigSetting("SwitchFrameGenerationFlowScale", SETTING(g_Config, fSwitchFrameGenerationFlowScale), 0.25f, CfgFlag::PER_GAME),
+#if defined(__SWITCH2__)
+	// (its own key: the Switch reads the same ppsspp.ini, with its own default)
+	ConfigSetting("Switch2FrameGenerationFlowScale", SETTING(g_Config, fSwitchFrameGenerationFlowScale), SWITCH_LSFG_DEFAULT_FLOW_SCALE, CfgFlag::PER_GAME),
+#else
+	ConfigSetting("SwitchFrameGenerationFlowScale", SETTING(g_Config, fSwitchFrameGenerationFlowScale), SWITCH_LSFG_DEFAULT_FLOW_SCALE, CfgFlag::PER_GAME),
+#endif
 	ConfigSetting("SwitchFrameGenerationPerformance", SETTING(g_Config, bSwitchFrameGenerationPerformance), true, CfgFlag::PER_GAME),
 #endif
 #ifdef _WIN32

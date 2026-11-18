@@ -815,7 +815,7 @@ bool Context::ReportQueueFault(const char *operation) {
 
 void Context::UpdateFrameGeneration() {
 	const auto state = SwitchLSFG_PollDeko();
-	const Deko3DLSFG::Config config{state.performance, state.flowScale == .5f ? 2u : 4u};
+	const Deko3DLSFG::Config config{state.performance, state.flowScale == 1.f ? 1u : state.flowScale == .5f ? 2u : 4u};
 	const bool qualityChanged = config.performance != frameGenerationConfig_.performance;
 	const bool changed = qualityChanged || config.flowDenominator != frameGenerationConfig_.flowDenominator ||
 						 state.enabled != frameGenerationState_.enabled;

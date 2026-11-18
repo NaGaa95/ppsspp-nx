@@ -3827,6 +3827,12 @@ void Launcher::FrameGeneration(Entry *entry) {
 		}
 	}
 	Rows("Frame Generation", [&] {
+		// LSFG's optical-flow resolutions.
+		static const char *const flowNames[] = {"Quarter resolution", "Half resolution", "Full resolution"};
+		static constexpr float flowScales[] = {0.25f, 0.5f, 1.0f};
+		static constexpr auto FlowIndex = [] {
+			return g_Config.fSwitchFrameGenerationFlowScale == 1.0f ? 2 : g_Config.fSwitchFrameGenerationFlowScale == 0.5f ? 1 : 0;
+		};
 		std::vector<Row> rows{
 			{"LSFG 2x", g_Config.bSwitchFrameGeneration ? "On" : "Off",
 			 [&](int) {
@@ -3841,9 +3847,9 @@ void Launcher::FrameGeneration(Entry *entry) {
 				 }
 			 },
 			 [&] { g_Config.bSwitchFrameGeneration = false; }},
-			{"Flow resolution", g_Config.fSwitchFrameGenerationFlowScale == 0.5f ? "Half resolution" : "Quarter resolution",
-			 [&](int) { g_Config.fSwitchFrameGenerationFlowScale = g_Config.fSwitchFrameGenerationFlowScale == 0.5f ? 0.25f : 0.5f; },
-			 [&] { g_Config.fSwitchFrameGenerationFlowScale = 0.25f; }},
+			{"Flow resolution", flowNames[FlowIndex()],
+			 [&](int d) { g_Config.fSwitchFrameGenerationFlowScale = flowScales[(FlowIndex() + (d < 0 ? 2 : 1)) % 3]; },
+			 [&] { g_Config.fSwitchFrameGenerationFlowScale = SWITCH_LSFG_DEFAULT_FLOW_SCALE; }},
 			{"Performance mode", g_Config.bSwitchFrameGenerationPerformance ? "On" : "Off",
 			 [&](int) { g_Config.bSwitchFrameGenerationPerformance = !g_Config.bSwitchFrameGenerationPerformance; },
 			 [&] { g_Config.bSwitchFrameGenerationPerformance = true; }},

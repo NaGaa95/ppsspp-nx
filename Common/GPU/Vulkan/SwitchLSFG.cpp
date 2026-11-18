@@ -33,6 +33,10 @@ std::atomic_uint32_t s_speedControlState{0};
 uint32_t s_observedSpeedControlState = 0;
 
 float s_flowScale = 0.25f;
+// The optical-flow resolution: quarter, half or full.
+float FlowScale(float configured) {
+	return configured == 1.0f ? 1.0f : configured == 0.5f ? 0.5f : 0.25f;
+}
 bool s_performanceMode = true;
 bool s_deviceFeatureEnabled = false;
 VkInstance s_instance = VK_NULL_HANDLE;
@@ -169,7 +173,7 @@ bool TryCreateRuntime(VkQueue queue)
 }
 
 void SwitchLSFG_Configure(bool prepared, float flowScale, bool performanceMode, bool deko3d) {
-	s_flowScale = std::isfinite(flowScale) && flowScale == 0.5f ? 0.5f : 0.25f;
+	s_flowScale = FlowScale(flowScale);
 	s_performanceMode = performanceMode;
 	const bool installed = FileReadable(kShaderDllPath);
 	s_installed.store(installed, std::memory_order_release);
@@ -331,7 +335,7 @@ bool SwitchLSFG_Present(VkQueue queue, const VkPresentInfoKHR& presentInfo, VkRe
 		s_observedSpeedControlState = speedControlState;
 	}
 	const bool requested = enabled && inGame && !fastForward;
-	const float flowScale = g_Config.fSwitchFrameGenerationFlowScale == 0.5f ? 0.5f : 0.25f;
+	const float flowScale = FlowScale(g_Config.fSwitchFrameGenerationFlowScale);
 	if (flowScale != s_flowScale || g_Config.bSwitchFrameGenerationPerformance != s_performanceMode) {
 		DestroyRuntime();
 		s_initAttempted = false;
@@ -409,7 +413,7 @@ SwitchLSFGDekoState SwitchLSFG_PollDeko() {
 					s_sessionOverride.load(std::memory_order_acquire) != 0;
 	state.speedControlState = s_speedControlState.load(std::memory_order_acquire);
 	state.active = state.enabled && GetUIState() == UISTATE_INGAME && !(state.speedControlState & 1);
-	state.flowScale = g_Config.fSwitchFrameGenerationFlowScale == 0.5f ? 0.5f : 0.25f;
+	state.flowScale = FlowScale(g_Config.fSwitchFrameGenerationFlowScale);
 	state.performance = g_Config.bSwitchFrameGenerationPerformance;
 	state.resetSession = s_resetSessionRequested.exchange(false, std::memory_order_acq_rel);
 	s_enabledRequested.store(state.enabled, std::memory_order_release);

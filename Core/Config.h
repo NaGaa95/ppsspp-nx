@@ -171,6 +171,13 @@ struct GestureControlConfig : public ConfigBlock {
 	size_t Size() const override { return sizeof(GestureControlConfig); }  // For sanity checks
 };
 
+// LSFG's optical-flow resolution on the Switch: 0.25 (quarter), 0.5 (half) or 1 (full). Half by default on the Switch 2.
+#if defined(__SWITCH2__)
+constexpr float SWITCH_LSFG_DEFAULT_FLOW_SCALE = 0.5f;
+#else
+constexpr float SWITCH_LSFG_DEFAULT_FLOW_SCALE = 0.25f;
+#endif
+
 struct Config : public ConfigBlock {
 public:
 	~Config();
@@ -329,7 +336,7 @@ public:
 	bool bVSync;
 	bool bLowLatencyPresent;
 	bool bSwitchFrameGeneration = false;
-	float fSwitchFrameGenerationFlowScale = 0.25f;
+	float fSwitchFrameGenerationFlowScale = SWITCH_LSFG_DEFAULT_FLOW_SCALE;
 	bool bSwitchFrameGenerationPerformance = true;
 
 	bool bSoftwareRendering;

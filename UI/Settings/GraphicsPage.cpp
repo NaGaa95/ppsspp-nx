@@ -217,8 +217,16 @@ void BuildGraphicsSettings(SettingsPage *page) {
 #if PPSSPP_PLATFORM(SWITCH)
 	if (g_Config.iGPUBackend == (int)GPUBackend::VULKAN) {
 		page->Bool(&g_Config.bSwitchFrameGeneration, "LSFG 2x").EnabledFunc([] { return !PSP_IsInited() && SwitchLSFG_IsInstalled(); });
-		page->Bool("Half-resolution optical flow", [] { return g_Config.fSwitchFrameGenerationFlowScale == 0.5f; },
-			[](bool half) { g_Config.fSwitchFrameGenerationFlowScale = half ? 0.5f : 0.25f; }).EnabledFunc([] { return !PSP_IsInited(); });
+		page->Custom("Optical flow resolution", [host](UI::ViewGroup *parent) -> UI::View * {
+			static const char *names[] = { "Quarter", "Half", "Full" };
+			static constexpr float scales[] = { 0.25f, 0.5f, 1.0f };
+			static int flow;
+			flow = g_Config.fSwitchFrameGenerationFlowScale == 1.0f ? 2 : g_Config.fSwitchFrameGenerationFlowScale == 0.5f ? 1 : 0;
+			PopupMultiChoice *choice = parent->Add(new PopupMultiChoice(&flow, T(I18NCat::GRAPHICS, "Optical flow resolution"),
+				names, 0, (int)std::size(names), I18NCat::GRAPHICS, host->PageScreenManager()));
+			choice->OnChoice.Add([](UI::EventParams &) { g_Config.fSwitchFrameGenerationFlowScale = scales[flow]; });
+			return choice;
+		}).EnabledFunc([] { return !PSP_IsInited(); });
 		page->Bool(&g_Config.bSwitchFrameGenerationPerformance, "LSFG performance mode").EnabledFunc([] { return !PSP_IsInited(); });
 	}
 #endif
