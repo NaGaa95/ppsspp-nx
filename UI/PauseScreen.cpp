@@ -890,7 +890,7 @@ void GamePauseScreen::CreateViews() {
 		frameGeneration->SetEnabledFunc([this] {
 			float fps = 0.0f;
 			__DisplayGetFPS(nullptr, &fps, nullptr);
-			return !bootPending_ && SwitchLSFG_IsPrepared() && SwitchLSFG_IsAvailable() && fps >= 27.0f && fps <= 33.5f;
+			return !bootPending_ && SwitchLSFG_IsPrepared() && SwitchLSFG_IsAvailable() && SwitchLSFG_DoublesSourceRate(fps);
 		});
 		frameGeneration->OnClick.Add([this](UI::EventParams &) {
 			float fps = 0.0f;

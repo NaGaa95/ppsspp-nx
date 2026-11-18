@@ -338,6 +338,9 @@ public:
 	bool bSwitchFrameGeneration = false;
 	float fSwitchFrameGenerationFlowScale = SWITCH_LSFG_DEFAULT_FLOW_SCALE;
 	bool bSwitchFrameGenerationPerformance = true;
+	// Switch 2, docked: frame generation switches the TV to 120 Hz (1440p or 1080p) so a 60 FPS game is doubled to
+	// 120 FPS. Off, the TV keeps its resolution at 60 Hz and only 30 FPS games are doubled.
+	bool bSwitchFrameGeneration120Hz = false;
 
 	bool bSoftwareRendering;
 	bool bSoftwareDisableDithering;

@@ -68,6 +68,9 @@ public:
 		period_ = period;
 	}
 	double SourceFPS() const { return average_ > 0 ? 1'000'000'000.0 / average_ : 0; }
+	// A 50/60 FPS source, measured over at least 8 frames.
+	bool HighRateSource() const { return samples_ >= 8 && average_ > 0 && average_ < 30'000'000; }
+	bool LowRateSource() const { return samples_ >= 8 && average_ >= 30'000'000; }
 
 private:
 	// 30 ms and 31.5 ms at 60 Hz.

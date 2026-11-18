@@ -1026,6 +1026,9 @@ static constexpr ConfigSetting graphicsSettings[] = {
 	ConfigSetting("SwitchFrameGenerationFlowScale", SETTING(g_Config, fSwitchFrameGenerationFlowScale), SWITCH_LSFG_DEFAULT_FLOW_SCALE, CfgFlag::PER_GAME),
 #endif
 	ConfigSetting("SwitchFrameGenerationPerformance", SETTING(g_Config, bSwitchFrameGenerationPerformance), true, CfgFlag::PER_GAME),
+#if defined(__SWITCH2__)
+	ConfigSetting("SwitchFrameGeneration120Hz", SETTING(g_Config, bSwitchFrameGeneration120Hz), false, CfgFlag::PER_GAME),
+#endif
 #endif
 #ifdef _WIN32
 	ConfigSetting("D3D11Device", SETTING(g_Config, sD3D11Device), "", CfgFlag::DEFAULT)

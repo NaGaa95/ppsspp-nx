@@ -465,6 +465,7 @@ private:
 	Deko3DLSFG::FramePacer framePacer_;
 	Deko3DLSFG::Config frameGenerationConfig_;
 	SwitchLSFGDekoState frameGenerationState_;
+	bool highRefreshRequested_ = false;
 	std::future<Deko3DLSFG::PreparedShaders> framePreparation_;
 	std::thread framePreparationThread_;
 	std::shared_ptr<std::atomic<bool>> framePreparationCancel_;
@@ -585,6 +586,10 @@ bool Context::Init(void *window, std::string *error) {
 }
 
 Context::~Context() {
+#if defined(__SWITCH2__)
+	// (the launcher and the next game start at the TV's resolution)
+	nx2DisplaySetFrameGeneration(false);
+#endif
 	if (framePreparationCancel_) {
 		framePreparationCancel_->store(true, std::memory_order_release);
 	}
@@ -889,6 +894,18 @@ void Context::UpdateFrameGeneration() {
 		framePreparation_ = task->get_future();
 		framePreparationThread_ = std::thread([task] { (*task)(); });
 	}
+#if defined(__SWITCH2__)
+	// Docked with the 120 Hz output option, a 50/60 FPS game moves the output to 1440p: wait until the game is measured
+	// and the window has the size it keeps, rather than make a generator for the TV's resolution that is then replaced.
+	uint32_t windowWidth = 0, windowHeight = 0;
+	const bool resizing = backbuffers_[0] && R_SUCCEEDED(nwindowGetDimensions((NWindow *)window_, &windowWidth, &windowHeight)) &&
+		(windowWidth != (uint32_t)backbuffers_[0]->Width() || windowHeight != (uint32_t)backbuffers_[0]->Height());
+	const bool measuring = state.highRefresh && nx2DisplayRefreshRate() < 120 && !framePacer_.LowRateSource();
+	if (!frameGenerator_ && (resizing || measuring)) {
+		SwitchLSFG_SetDekoStatus(true, false);
+		return;
+	}
+#endif
 	if (!frameGenerator_ && !frameShaderDirectory_.empty()) {
 		Deko3DLSFG::Services services;
 		services.device = device_->device;
@@ -953,8 +970,18 @@ void Context::Present(PresentMode mode) {
 	}
 	presentMode_ = mode;
 #if defined(__SWITCH2__)
-	// Docked, frame generation switches the output to 120 Hz: generation then doubles sources up to 60 fps.
-	nx2DisplaySetFrameGeneration(frameGenerationState_.enabled);
+	// With the 120 Hz output option, docked, a 50/60 FPS game moves the output to 120 Hz (1440p or 1080p) while frame
+	// generation is on. Until UpdateFrameGeneration creates the generator, the game is measured here.
+	if (!generatedDisplay_ && frameGenerationState_.active) {
+		const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+		framePacer_.Observe(now, true, false);
+	}
+	if (!frameGenerationState_.enabled || !frameGenerationState_.highRefresh) {
+		highRefreshRequested_ = false;
+	} else if (frameGenerationState_.active && framePacer_.HighRateSource()) {
+		highRefreshRequested_ = true;
+	}
+	nx2DisplaySetFrameGeneration(highRefreshRequested_);
 	framePacer_.SetRefreshRate(nx2DisplayRefreshRate());
 #endif
 	if (generatedDisplay_ && displayUsed_) {

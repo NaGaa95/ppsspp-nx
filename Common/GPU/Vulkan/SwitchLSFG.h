@@ -11,6 +11,7 @@ struct SwitchLSFGDekoState {
 	uint32_t speedControlState = 0;
 	float flowScale = 0.25f;
 	bool performance = true;
+	bool highRefresh = false;  // the 120 Hz output option (Switch 2)
 };
 SwitchLSFGDekoState SwitchLSFG_PollDeko();
 void SwitchLSFG_SetDekoStatus(bool available, bool highRate);
@@ -34,5 +35,7 @@ bool SwitchLSFG_IsInstalled();
 bool SwitchLSFG_IsAvailable();
 bool SwitchLSFG_IsEnabled();
 bool SwitchLSFG_IsHighRatePassthrough();
+// Whether frame generation doubles a game at sourceFPS: 30 FPS, and 50/60 FPS at 120 Hz (Switch 2).
+bool SwitchLSFG_DoublesSourceRate(float sourceFPS);
 bool SwitchLSFG_RequestEnabled(bool enabled, float sourceFPS);
 void SwitchLSFG_ResetSession();

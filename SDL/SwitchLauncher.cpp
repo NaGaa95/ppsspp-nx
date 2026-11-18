@@ -16,6 +16,9 @@
 
 #include <SDL3/SDL.h>
 #include <switch.h>
+#if defined(__SWITCH2__)
+#include "Common/nx2_platform.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -102,7 +105,13 @@ constexpr int HEIGHT = 720;
 constexpr size_t MAX_ARTWORK = 64;
 constexpr size_t MAX_DECODED = 4;
 constexpr size_t ARTWORK_UPLOAD_BYTES = 512 * 1024;
-constexpr size_t MAX_TEXT_BYTES = 12 * 1024 * 1024;
+constexpr size_t MAX_TEXT_BYTES = 12 * 1024 * 1024;  // for text up to 1080p: see TextBudget
+
+// Text textures are at output resolution: scale the 1080p budget by area.
+size_t TextBudget(float fontScale) {
+	const float scale = std::max(1.5f, fontScale) / 1.5f;
+	return (size_t)((float)MAX_TEXT_BYTES * scale * scale);
+}
 
 bool LoadLauncherConfig(IniFile &config) { return config.Load(Path(CONFIG_PATH)) || config.Load(Path(std::string(CONFIG_PATH) + ".bak")); }
 
@@ -338,6 +347,157 @@ struct RowPage {
 	std::function<bool()> close;
 };
 
+#if defined(__SWITCH2__)
+// Joy-Con mouse (HID Nmouse, both Joy-Cons and a USB mouse merged): a cursor whose click is sent as an SDL finger.
+class JoyConMouse {
+public:
+	~JoyConMouse() {
+		Stop();
+		if (filterSet_) {
+			SDL_SetEventFilter(nullptr, nullptr);
+		}
+	}
+
+	void Start(SDL_WindowID window) {
+		if (thread_.joinable()) {
+			return;
+		}
+		window_ = window;
+		stop_.store(false, std::memory_order_release);
+		if (!filterSet_) {
+			// Once: SDL_SetEventFilter drops the queued events, and the filter passes everything while the mouse is off.
+			SDL_SetEventFilter(&JoyConMouse::Filter, this);
+			filterSet_ = true;
+		}
+		thread_ = std::thread([this] { Run(); });
+	}
+
+	// Before a game starts: it gets the touch screen and the shoulder buttons back.
+	void Stop() {
+		if (!thread_.joinable()) {
+			return;
+		}
+		stop_.store(true, std::memory_order_release);
+		thread_.join();
+		down_.store(false, std::memory_order_relaxed);
+		movedAt_.store(0, std::memory_order_relaxed);
+		x_.store(-1, std::memory_order_relaxed);
+	}
+
+	bool InUse() const {
+		const uint64_t moved = movedAt_.load(std::memory_order_relaxed);
+		return down_.load(std::memory_order_relaxed) || (moved && SDL_GetTicks() - moved < SHOWN_MS);
+	}
+
+	// An arrow at the cursor, drawn last.
+	void Draw(SDL_Renderer *renderer) const {
+		const int x = x_.load(std::memory_order_relaxed), y = y_.load(std::memory_order_relaxed);
+		if (x < 0 || !InUse()) {
+			return;
+		}
+		const float fx = (float)x, fy = (float)y;
+		const SDL_FColor edge{20 / 255.f, 24 / 255.f, 32 / 255.f, .92f}, fill{.98f, .99f, 1.f, 1.f};
+		const SDL_Vertex outline[] = {{{fx - 1.5f, fy - 2.5f}, edge, {0, 0}}, {{fx - 1.5f, fy + 21.f}, edge, {0, 0}},
+									  {{fx + 16.f, fy + 15.5f}, edge, {0, 0}}};
+		const SDL_Vertex arrow[] = {{{fx, fy}, fill, {0, 0}}, {{fx, fy + 17.f}, fill, {0, 0}}, {{fx + 12.5f, fy + 13.f}, fill, {0, 0}}};
+		SDL_Rect clip{};
+		const bool clipped = SDL_RenderClipEnabled(renderer) && SDL_GetRenderClipRect(renderer, &clip);
+		SDL_SetRenderClipRect(renderer, nullptr);
+		SDL_RenderGeometry(renderer, nullptr, outline, 3, nullptr, 0);
+		SDL_RenderGeometry(renderer, nullptr, arrow, 3, nullptr, 0);
+		if (clipped) {
+			SDL_SetRenderClipRect(renderer, &clip);
+		}
+	}
+
+private:
+	static constexpr SDL_FingerID FINGER = 0x4A434D53;
+	static constexpr uint64_t SHOWN_MS = 4000;
+
+	void Push(SDL_EventType type, int x, int y, float dx = 0.f, float dy = 0.f) const {
+		SDL_Event event{};
+		event.type = type;
+		event.tfinger.timestamp = SDL_GetTicksNS();
+		event.tfinger.touchID = FINGER;
+		event.tfinger.fingerID = FINGER;
+		event.tfinger.x = std::clamp((float)x / WIDTH, 0.f, 1.f);
+		event.tfinger.y = std::clamp((float)y / HEIGHT, 0.f, 1.f);
+		event.tfinger.dx = dx;
+		event.tfinger.dy = dy;
+		event.tfinger.pressure = type == SDL_EVENT_FINGER_UP ? 0.f : 1.f;
+		event.tfinger.windowID = window_;
+		SDL_PushEvent(&event);
+	}
+
+	void Run() {
+		if (R_FAILED(hidInitializeNmouse(nullptr, 0, WIDTH, HEIGHT, HidNmousePointerType_Default))) {
+			return;
+		}
+		hidSetMergedNmouseSourceTypes(HidNmouseType_JoyLeft | HidNmouseType_JoyRight | HidNmouseType_StandardMouse);
+		uint64_t lastSample = 0;
+		int lastX = -1, lastY = -1;
+		while (!stop_.load(std::memory_order_acquire)) {
+			HidNmouseHandle handle{};
+			HidNmouseState state{};
+			size_t total = 0;
+			const bool present = R_SUCCEEDED(hidGetMergedNmouseHandle(&handle)) &&
+								 R_SUCCEEDED(hidGetNmouseStates(handle, &state, 1, &total)) && total;
+			if (present && state.sampling_number != lastSample) {
+				lastSample = state.sampling_number;
+				const int x = std::clamp((int)state.x, 0, WIDTH - 1), y = std::clamp((int)state.y, 0, HEIGHT - 1);
+				const bool moved = lastX >= 0 && (x != lastX || y != lastY);
+				const bool held = (state.buttons & HidMouseButton_Left) != 0;
+				const bool wasDown = down_.load(std::memory_order_relaxed);
+				if (moved) {
+					const uint64_t now = SDL_GetTicks();
+					movedAt_.store(now ? now : 1, std::memory_order_relaxed);
+				}
+				x_.store(x, std::memory_order_relaxed);
+				y_.store(y, std::memory_order_relaxed);
+				// A click counts only while the cursor shows, so a Joy-Con in hand keeps its shoulder buttons.
+				if (held && !wasDown && InUse()) {
+					down_.store(true, std::memory_order_relaxed);
+					Push(SDL_EVENT_FINGER_DOWN, x, y);
+				} else if (!held && wasDown) {
+					down_.store(false, std::memory_order_relaxed);
+					Push(SDL_EVENT_FINGER_UP, x, y);
+				} else if (wasDown && moved) {
+					Push(SDL_EVENT_FINGER_MOTION, x, y, (float)(x - lastX) / WIDTH, (float)(y - lastY) / HEIGHT);
+				}
+				lastX = x;
+				lastY = y;
+			}
+			svcSleepThread(present ? 4'000'000 : 50'000'000);
+		}
+		hidFinalizeNmouse();
+	}
+
+	// While the cursor is in use, L/R/ZL/ZR only click.
+	static bool SDLCALL Filter(void *userdata, SDL_Event *event) {
+		if (!static_cast<const JoyConMouse *>(userdata)->InUse()) {
+			return true;
+		}
+		if ((event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || event->type == SDL_EVENT_GAMEPAD_BUTTON_UP) &&
+			(event->gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER || event->gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) {
+			return false;
+		}
+		if (event->type == SDL_EVENT_GAMEPAD_AXIS_MOTION &&
+			(event->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || event->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)) {
+			return false;
+		}
+		return true;
+	}
+
+	std::thread thread_;
+	std::atomic_bool stop_{false}, down_{false};
+	std::atomic_int x_{-1}, y_{-1};
+	std::atomic<uint64_t> movedAt_{0};
+	SDL_WindowID window_ = 0;
+	bool filterSet_ = false;
+};
+
+#endif
+
 class Launcher {
 public:
 	~Launcher();
@@ -452,6 +612,9 @@ private:
 
 	SDL_Window *window_ = nullptr;
 	SDL_Renderer *renderer_ = nullptr;
+#if defined(__SWITCH2__)
+	JoyConMouse joyConMouse_;
+#endif
 	SDL_Texture *roundTexture_ = nullptr;
 	SDL_AudioDeviceID audioDevice_ = 0;
 	SDL_AudioStream *audio_ = nullptr;
@@ -509,6 +672,9 @@ private:
 	AppletOperationMode operationMode_ = AppletOperationMode_Handheld;
 	bool classic_ = false;
 	bool animations_ = true;
+#if defined(__SWITCH2__)
+	bool joyConMouseEnabled_ = true;
+#endif
 	bool playGamePreview_ = true;
 	bool titles_ = true;
 	bool badges_ = true;
@@ -1409,6 +1575,9 @@ void Launcher::LaunchFile(const Path &path) {
 }
 
 Launcher::~Launcher() {
+#if defined(__SWITCH2__)
+	joyConMouse_.Stop();
+#endif
 	{
 		std::lock_guard<std::mutex> guard(decodeMutex_);
 		stopWorker_ = true;
@@ -1462,6 +1631,9 @@ bool Launcher::Init() {
 	}
 	appearance_->Get("Classic", &classic_);
 	appearance_->Get("Animations", &animations_);
+#if defined(__SWITCH2__)
+	appearance_->Get("JoyConMouse", &joyConMouseEnabled_);
+#endif
 	appearance_->Get("PlayGamePreview", &playGamePreview_);
 	appearance_->Get("ShowTitles", &titles_);
 	appearance_->Get("ShowRegionFlags", &showRegions_);
@@ -1500,6 +1672,11 @@ bool Launcher::Init() {
 	SDL_SetRenderVSync(renderer_, 1);
 	SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
 	InitRoundTexture();
+#if defined(__SWITCH2__)
+	if (joyConMouseEnabled_) {
+		joyConMouse_.Start(SDL_GetWindowID(window_));
+	}
+#endif
 	plReady_ = R_SUCCEEDED(plInitialize(PlServiceType_User));
 	if (!LoadFonts()) {
 		return false;
@@ -1590,6 +1767,9 @@ void Launcher::SaveAppearance() {
 	}
 	appearance_->Set("Classic", classic_);
 	appearance_->Set("Animations", animations_);
+#if defined(__SWITCH2__)
+	appearance_->Set("JoyConMouse", joyConMouseEnabled_);
+#endif
 	appearance_->Set("PlayGamePreview", playGamePreview_);
 	appearance_->Set("ShowTitles", titles_);
 	appearance_->Set("ShowRegionFlags", showRegions_);
@@ -1976,7 +2156,8 @@ void Launcher::Text(float x, float y, UiText rawvalue, int size, SDL_Color color
 	auto it = text_.find(key);
 	if (it == text_.end()) {
 		const auto bitmap = textEngine_->Render(value, (int)std::lround(size * fontScale_));
-		while (!text_.empty() && (textBytes_ + bitmap.rgba.size() > MAX_TEXT_BYTES || text_.size() >= 512)) {
+		const size_t budget = TextBudget(fontScale_);
+		while (!text_.empty() && (textBytes_ + bitmap.rgba.size() > budget || text_.size() >= 512)) {
 			auto victim =
 				std::min_element(text_.begin(), text_.end(), [](const auto &a, const auto &b) { return a.second.use < b.second.use; });
 			textBytes_ -= victim->second.bytes;
@@ -2152,6 +2333,9 @@ void Launcher::Present(const Path &previewGame) {
 			Fill(0, 0, WIDTH, HEIGHT, {0, 0, 0, (uint8_t)(alpha * 255)});
 		}
 	}
+#if defined(__SWITCH2__)
+	joyConMouse_.Draw(renderer_);
+#endif
 	if (!SDL_RenderPresent(renderer_)) {
 		if (!presentFailureLogged_) {
 			const std::string error = StringFromFormat("SDL frame presentation failed: %s", SDL_GetError());
@@ -3853,10 +4037,24 @@ void Launcher::FrameGeneration(Entry *entry) {
 			{"Performance mode", g_Config.bSwitchFrameGenerationPerformance ? "On" : "Off",
 			 [&](int) { g_Config.bSwitchFrameGenerationPerformance = !g_Config.bSwitchFrameGenerationPerformance; },
 			 [&] { g_Config.bSwitchFrameGenerationPerformance = true; }},
+#if defined(__SWITCH2__)
+			{"120 Hz Docked Mode", g_Config.bSwitchFrameGeneration120Hz ? "On" : "Off",
+			 [&](int) { g_Config.bSwitchFrameGeneration120Hz = !g_Config.bSwitchFrameGeneration120Hz; },
+			 [&] { g_Config.bSwitchFrameGeneration120Hz = false; }, true,
+			 std::string(Tr("Docked, with the Drako3D renderer: frame generation switches the TV to 1440p or 1080p at 120 Hz "
+							"for 50/60 FPS games, which LSFG then doubles to 120 FPS. Off, the TV keeps its resolution (up to "
+							"4K at 60 Hz) and LSFG doubles 30 FPS games only."))},
+#endif
 			{"Lossless.dll", File::Exists(Path("/switch/ppsspp-nx/lsfg/Lossless.dll")) ? "Installed" : "Not installed",
 			 [&](int) {
+#if defined(__SWITCH2__)
+				 Message("Lossless Scaling", "Doubles 30 FPS games to 60 FPS, and 60 FPS games to 120 FPS on a 120 Hz display.\n"
+											 "Place your compatible Lossless.dll in /switch/ppsspp-nx/lsfg/.\nThe library is supplied "
+											 "separately.");
+#else
 				 Message("Lossless Scaling", "Vulkan: doubles supported 30 FPS output to 60 FPS.\nPlace your compatible Lossless.dll in "
 											 "/switch/ppsspp-nx/lsfg/.\nThe library is supplied separately.");
+#endif
 			 }},
 		};
 		const bool installed = File::Exists(Path("/switch/ppsspp-nx/lsfg/Lossless.dll"));
@@ -3880,7 +4078,7 @@ void Launcher::FrameGeneration(Entry *entry) {
 void Launcher::Appearance() {
 	Rows("Launcher",
 		 [&] {
-			 return std::vector<Row>{
+			 std::vector<Row> rows{
 				 {"Language", g_Config.sLanguageIni, [&](int) { ChangeLanguage(); }},
 				 {"Theme", classic_ ? "Classic" : "PPSSPP", [&](int) { classic_ = !classic_; }},
 				 {"Animations", animations_ ? "On" : "Off", [&](int) { animations_ = !animations_; }},
@@ -3894,6 +4092,21 @@ void Launcher::Appearance() {
 				 {"SteamGridDB API key", g_Config.sSteamGridDBAPIKey.empty() ? "Not set" : "Configured",
 				  [&](int) { Prompt("SteamGridDB API key", &g_Config.sSteamGridDBAPIKey, true); }},
 			 };
+#if defined(__SWITCH2__)
+			 rows.push_back({"Joy-Con mouse", joyConMouseEnabled_ ? "On" : "Off",
+							 [&](int) {
+								 joyConMouseEnabled_ = !joyConMouseEnabled_;
+								 if (joyConMouseEnabled_) {
+									 joyConMouse_.Start(SDL_GetWindowID(window_));
+								 } else {
+									 joyConMouse_.Stop();
+								 }
+							 },
+							 {}, true,
+							 std::string(Tr("Lets a Joy-Con set down on a surface move a cursor in the launcher (Switch 2). Turn it "
+											"off to keep the Joy-Con's shoulder buttons for the launcher only."))});
+#endif
+			 return rows;
 		 },
 		 -1, {nullptr, -1, {}, {}, "PPSSPP", {}, true});
 	SaveAppearance();
