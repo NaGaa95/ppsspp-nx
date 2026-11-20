@@ -1116,8 +1116,11 @@ void Context::Present(PresentMode mode) {
 #else
 		swapchain_.setSwapInterval(generated || mode == PresentMode::FIFO ? 1 : 0);
 #endif
+		const auto presentStart = std::chrono::steady_clock::now();
 		bool presented = !generated || PresentImage(*frameGenerator_->GeneratedImage(), generatedDisplay_->Width(), generatedDisplay_->Height());
 		presented = presented && PresentImage(generatedDisplay_->image, generatedDisplay_->Width(), generatedDisplay_->Height());
+		framePacer_.PresentTime(
+			std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - presentStart).count());
 		if (!presented) {
 			// No image to present to (or a fault): still hand the frame's work to the GPU and end the frame.
 			Submit(false);

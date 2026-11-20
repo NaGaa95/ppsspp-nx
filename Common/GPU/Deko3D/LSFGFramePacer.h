@@ -59,9 +59,23 @@ public:
 			slow_ = 0;
 			result.reset = true;
 		}
+		if (rate_ == 0) {
+			// Generating, the interval is the display's pace: a source that keeps up alone again shows in its own time.
+			const uint64_t work = interval > presentTime_ ? interval - presentTime_ : interval;
+			fast_ = work && work < period_ ? fast_ + 1 : 0;
+			if (fast_ >= 60) {
+				rate_ = 1;
+				fast_ = slow_ = 0;
+				result.reset = true;
+				result.highRate = true;
+				return result;
+			}
+		}
 		result.generate = rate_ == 0;
 		return result;
 	}
+	// How long the previous frame spent in its presents (blocked by the display, twice when a frame was generated).
+	void PresentTime(uint64_t ns) { presentTime_ = ns; }
 	void Reset() {
 		const uint64_t period = period_;
 		*this = {};
@@ -80,7 +94,8 @@ private:
 	uint64_t period_ = 16'666'667;
 	uint64_t last_ = 0;
 	double average_ = 0;
-	unsigned samples_ = 0, slow_ = 0;
+	uint64_t presentTime_ = 0;
+	unsigned samples_ = 0, slow_ = 0, fast_ = 0;
 	int rate_ = -1;
 	bool requested_ = false;
 };
