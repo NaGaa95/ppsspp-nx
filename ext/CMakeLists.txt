@@ -109,7 +109,7 @@ add_library(aemu_postoffice_client STATIC
 )
 
 if(USE_LIBNX)
-	target_compile_definitions(aemu_postoffice_client PRIVATE __unix)
+	target_compile_definitions(aemu_postoffice_client PRIVATE __unix ENET_IPV4_ONLY)
 endif()
 
 set(aemu_postoffice_server_obj

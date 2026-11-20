@@ -1825,6 +1825,10 @@ void __NetAdhocInit() {
 			config.port = AEMU_POSTOFFICE_PORT;
 			// Disable ENet until the adhocctl side is ready
 			config.enable_enet = false;
+#if PPSSPP_PLATFORM(SWITCH)
+			// Horizon has no IPv6 sockets, which the dual-stack default address needs.
+			config.ip_addr = "0.0.0.0";
+#endif
 
 			aemu_postoffice_server::Server relay_server(config);
 			if (relay_server.pump() == aemu_postoffice_server::ServerPumpStatus::LISTEN_SOCK_DEAD) {
