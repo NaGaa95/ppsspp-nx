@@ -169,7 +169,9 @@ void TextureCacheDeko3D::BuildTexture(TexCacheEntry *const entry) {
 	} else if (plan.scaleFactor > 1 || plan.saveTexture) {
 		format = Draw::DataFormat::R8G8B8A8_UNORM;
 	}
-	if (g_Config.iTexFiltering == TEX_FILTER_AUTO_MAX_QUALITY && plan.w <= 256 && plan.h <= 256 && plan.depth == 1 && !plan.doReplace) {
+	// (not a palette applied in the shader: its texels are 8-bit indices)
+	if (g_Config.iTexFiltering == TEX_FILTER_AUTO_MAX_QUALITY && plan.w <= 256 && plan.h <= 256 && plan.depth == 1 && !plan.doReplace &&
+		!plan.decodeToClut8) {
 		format = Draw::DataFormat::R8G8B8A8_UNORM;
 	}
 	const int levelsToLoad = plan.depth > 1 ? 1 : std::min(plan.levelsToCreate, plan.levelsToLoad);
