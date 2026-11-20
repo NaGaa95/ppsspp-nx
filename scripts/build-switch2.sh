@@ -86,7 +86,7 @@ grep -Fq "Switch 2" "$MESA_PREFIX/lib/cmake/Vulkan/VulkanConfig.cmake" || { echo
 [[ -f "$MESA_PREFIX/lib/cmake/uam2rt/uam2rtConfig.cmake" ]] || { echo "No uam2rt in $MESA_PREFIX" >&2; exit 1; }
 
 JOBS="${JOBS:-16}"
-SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION:-1.1.1}"
+SWITCH_RELEASE_VERSION="${PPSSPP_SWITCH_RELEASE_VERSION:-1.1.2}"
 
 case "$JOBS" in
 	''|*[!0-9]*) echo "JOBS must be a positive integer" >&2; exit 2 ;;
