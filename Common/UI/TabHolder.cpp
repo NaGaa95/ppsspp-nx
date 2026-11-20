@@ -20,7 +20,7 @@ TabHolder::TabHolder(Orientation orientation, float stripSize, TabHolderFlags fl
 
 		if (flags & TabHolderFlags::BackButton) {
 			ViewGroup *container = new LinearLayout(ORIENT_HORIZONTAL, new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT));
-			Choice *c = new Choice(ImageID("I_NAVIGATE_BACK"), new LinearLayoutParams(ITEM_HEIGHT, ITEM_HEIGHT));
+			Choice *c = new Choice(ImageID("I_CHEVRON_LEFT"), new LinearLayoutParams(ITEM_HEIGHT, ITEM_HEIGHT));
 			c->OnClick.Add([](EventParams &e) {
 				e.bubbleResult = DR_BACK;
 			});
@@ -44,9 +44,8 @@ TabHolder::TabHolder(Orientation orientation, float stripSize, TabHolderFlags fl
 			Add(tabScroll_);
 		}
 	} else {
-		SetPadding(Margins(12, 0, 0, 0));
 		tabContainer_ = new LinearLayout(ORIENT_VERTICAL, new LayoutParams(stripSize, FILL_PARENT));
-		tabContainer_->Add(new Spacer(8.0f));
+		tabContainer_->Add(new Spacer(12.0f));
 		tabContainer_->SetSpacing(0.0f);
 		tabStrip_ = new ChoiceStrip(orientation, new LinearLayoutParams(FILL_PARENT, FILL_PARENT));
 		tabStrip_->SetTopTabs(true);
@@ -126,7 +125,7 @@ void TabHolder::AddBack(UIScreen *parent) {
 	if (tabContainer_) {
 		auto di = GetI18NCategory(I18NCat::DIALOG);
 		tabContainer_->Add(new UI::Spacer(8.0f));
-		Choice *backButton = tabContainer_->Add(new Choice(di->T("Back"), ImageID("I_NAVIGATE_BACK"), new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, 0.0f, Margins(0, 0, 10, 10))));
+		Choice *backButton = tabContainer_->Add(new Choice(di->T("Back"), ImageID("I_CHEVRON_LEFT"), new LinearLayoutParams(FILL_PARENT, WRAP_CONTENT, 0.0f, Margins(0, 0, 10, 10))));
 		backButton->SetRoundCorners(RoundCorners::All);
 		backButton->OnClick.Handle<UIScreen>(parent, &UIScreen::OnBack);
 	}

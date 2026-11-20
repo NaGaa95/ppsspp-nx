@@ -239,7 +239,8 @@ in a directory), and reports the failed disc reads with the timings.
 
 To get past menus, `--press=SECONDS:MASK[:DURATION],...` holds buttons at emulated times (`MASK` is a sceCtrl
 mask, `0x8` START and `0x4000` CROSS, held 0.15 seconds by default), and `--screenshot-at=SECONDS:FILE,...` saves
-screenshots along the way.
+screenshots along the way. `--record-dump-at=SECONDS:FILE,...` records a GE frame dump of the frame after each
+time, so a glitch found in a screenshot series can be dumped from the same run (the times are deterministic).
 
 For audio, `--dump-audio=FILE.wav` records the mixed output (before the game volume setting) for the whole run.
 An audio glitch you can hear usually shows in the waveform: a click is a jump between neighbouring samples, and
@@ -294,6 +295,31 @@ It costs nothing when off. The native JITs (macOS, Linux and Android by signal, 
 shows as emitter and IR pass functions; profile 20 emulated seconds or more to see the game itself.
 To compare two builds by where the time goes, profile one game at a time: several at once wait on each
 other's GPU work, which moves the shares.
+
+### Timing the JIT compiler
+
+`--jit-bench=N` (app and headless, IR JITs) recompiles every block in the cache after N flips: five times
+timing each block's frontend, IR passes, backend and finalize, then five times timing only whole blocks,
+as games compile. It logs the best of each, per block, and two things to check a change by: a hash of the
+IR the passes made, which a change to the passes or the frontend shouldn't change, and how much host code
+the blocks came to, which a change to a backend shouldn't change. (A hash of the code would change from
+launch to launch with ASLR, which moves the addresses in it. Even the size can move by a few bytes when a
+change moves static data.) It also logs how long clearing the cache took, a stall of its own when a game
+fills the code space.
+
+```bash
+PPSSPPHeadless --cpu=jit-ir --log --graphics=software --jit-bench=300 --timeout-wall=60 --state=GAME.ppst GAME.iso 2>&1 | grep "JIT bench"
+python Tools/android_run.py -- --jit-bench=300 --state=/sdcard/PSP/PPSSPP_STATE/GAME.ppst /sdcard/PSP/GAME.iso   # then adb logcat
+```
+
+Only compare runs that compiled the same number of blocks: a savestate load keeps the blocks from before
+it where memory didn't change, so the set depends on when the load happened. A desktop gives the same time
+to about 1%, a phone only to a few percent from launch to launch, so take the best of a few launches there.
+For where the time goes inside the compiler, use a sampling profiler (simpleperf on Android) rather than
+frame profiler scopes: on some phones reading the clock costs far more than a pass takes. A Galaxy S8's
+kernel traps the counter reads, at about 0.28 µs each, which makes a scope cost about 0.7 µs while the
+profiler is on (the `Profiler` unit test prints both). For the same reason, games' blocks are timed only
+whole; the JIT debug overlay times the phases while it shows.
 
 ### Finding stalls with the frame profiler
 

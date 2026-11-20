@@ -115,7 +115,7 @@ public:
 
 protected:
 	std::string_view GetTitle() const override;
-	void CreateSettingsViews(UI::ViewGroup *parent) override;
+	void CreateSettingsViews(UI::ViewGroup *parent, bool inPopup) override;
 	void CreateContentViews(UI::ViewGroup *parent) override;
 	void update() override;
 

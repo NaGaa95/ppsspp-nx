@@ -22,6 +22,8 @@
 #include "Core/CwCheat.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
+#include "Core/MemMap.h"
+#include "Core/SaveState.h"
 #include "Core/ELF/ParamSFO.h"
 #include "Core/System.h"
 #include "Core/Util/GameDB.h"
@@ -88,14 +90,16 @@ static void DrawJitStats(UIContext *ctx, const Bounds &bounds) {
 			w.F("Cleared because full: %d\n", stats.irArenaFullClears);
 		}
 		w.F("Invalidations: %d (%d blocks)\n", stats.invalidations, stats.invalidatedBlocks);
+		w.F("Large invalidations checking all blocks: %d (%d blocks changed)\n", stats.changedCodeChecks, stats.changedCodeBlocks);
 
 		const MIPSComp::JitCompileTimes &t = MIPSComp::g_jitCompileTimes;
 		if (t.blocks > 0) {
-			const double perBlock = 1e-3 / t.blocks;  // ns -> us per block
 			w.F("Compiled %lld blocks, %lld MIPS -> %lld IR instructions, %0.1f ms\n",
-				(long long)t.blocks, (long long)t.mipsInstructions, (long long)t.irInstructions, t.TotalNanos() * 1e-6);
-			w.F("Per block (us): frontend %0.1f, passes %0.1f, backend %0.1f, finalize %0.1f, slowest %0.1f\n",
-				t.frontendNanos * perBlock, t.passNanos * perBlock, t.backendNanos * perBlock, t.finalizeNanos * perBlock,
+				(long long)t.blocks, (long long)t.mipsInstructions, (long long)t.irInstructions, t.CompileNanos() * 1e-6);
+			// Phases are only timed while this shows.
+			const double perBlock = 1e-3 / std::max<int64_t>(1, t.phaseBlocks);  // ns -> us per block
+			w.F("Per block (us), of the %lld compiled while this shows: frontend %0.1f, passes %0.1f, backend %0.1f, finalize %0.1f. Slowest %0.1f\n",
+				(long long)t.phaseBlocks, t.frontendNanos * perBlock, t.passNanos * perBlock, t.backendNanos * perBlock, t.finalizeNanos * perBlock,
 				t.maxBlockNanos * 1e-3);
 			w.F("Per MIPS instruction: %0.2f us\n", t.TotalNanos() * 1e-3 / std::max<int64_t>(1, t.mipsInstructions));
 			w.F("Invalidation: %0.1f ms, full clears: %d, %0.1f ms\n", t.invalidateNanos * 1e-6, t.clears, t.clearNanos * 1e-6);
@@ -342,6 +346,23 @@ static const char *CPUCoreAsString(int core) {
 	}
 }
 
+// The GPU driver version, where the backend has one.
+static std::string CrashDriverString(Draw::DrawContext *draw) {
+	switch (GetGPUBackend()) {
+	case GPUBackend::VULKAN:
+		return draw->GetInfoString(Draw::InfoField::DRIVER);
+	case GPUBackend::OPENGL:
+		// GL_RENDERER (the GPU model, where VENDORSTRING is GL_VENDOR), then GL_VERSION, which carries the driver version.
+		return draw->GetInfoString(Draw::InfoField::DRIVER) + ", " + draw->GetInfoString(Draw::InfoField::APIVERSION);
+	default:
+#ifdef _WIN32
+		return System_GetProperty(SYSPROP_GPUDRIVER_VERSION);
+#else
+		return "";
+#endif
+	}
+}
+
 // Draws a block of lines, and returns where the next block goes.
 static int DrawCrashTextBlock(UIContext *ctx, FontID font, std::string_view text, int x, int y) {
 	text = StripSpaces(text);
@@ -357,6 +378,10 @@ void DrawCrashDump(UIContext *ctx, const Path &gamePath) {
 	auto sy = GetI18NCategory(I18NCat::SYSTEM);
 	FontID ubuntu24("UBUNTU24");
 	std::string discID = g_paramSFO.GetDiscID();
+	const std::string discVersion = g_paramSFO.GetValueString("DISC_VERSION");
+	if (!discVersion.empty()) {
+		discID += " v" + discVersion;
+	}
 
 	std::string activeFlags = PSP_CoreParameter().compat.GetActiveFlagsString();
 	if (activeFlags.empty()) {
@@ -425,6 +450,12 @@ void DrawCrashDump(UIContext *ctx, const Path &gamePath) {
 	std::string apiName = draw->GetInfoString(Draw::InfoField::APINAME);
 	// Off the CPU thread, so peek.
 	std::string emulatedTime = NiceTimeFormat((int)(CoreTiming::PeekGlobalTimeUs() / 1000000));
+	std::string driver = CrashDriverString(draw);
+	if (!driver.empty()) {
+		driver = "Driver: " + driver + "\n";
+	}
+	const char *model = g_Config.iPSPModel == PSP_MODEL_FAT ? "PSP-1000" : "PSP-2000/3000";
+	const bool loadedState = SaveState::HasLoadedState();
 
 	// First column
 	y += 65;
@@ -441,7 +472,9 @@ void DrawCrashDump(UIContext *ctx, const Path &gamePath) {
 %s (%s)
 %s v%d (%s)
 %s (%s)
+%s%s, %d MB RAM
 Emulated time: %s
+Savestate loaded: %s
 %s
 )",
 ExceptionTypeAsString(info.type),
@@ -449,7 +482,9 @@ discID.c_str(), g_paramSFO.GetValueString("TITLE").c_str(),
 versionString, build,
 sysName.c_str(), sysVersion, GetCompilerABI(),
 gpuName.c_str(), apiName.c_str(),
+driver.c_str(), model, (int)(Memory::g_MemorySize >> 20),
 emulatedTime.c_str(),
+loadedState ? "Yes" : "No",
 crcStr
 );
 
@@ -527,6 +562,9 @@ Invalid / Unknown (%d)
 	if (GetLockedCPUSpeedMhz()) {
 		tips += "* Set CPU clock to default (0)\n";
 	}
+	if (loadedState) {
+		tips += "* Try from a fresh boot, without\n  loading a savestate\n";
+	}
 	if (checkingISO) {
 		tips += "* (waiting for CRC...)\n";
 	} else if (!isoOK) {
@@ -539,15 +577,22 @@ Invalid / Unknown (%d)
 		tips = "Things to try:\n" + tips;
 	}
 
+	std::string plugins = HLEPlugins::HasEnabled() ? HLEPlugins::EnabledNames() : "N";
+	if (plugins.empty()) {
+		plugins = "Y";
+	}
+
 	x += columnWidth + 10;
 	y = 85;
 	snprintf(statbuf, sizeof(statbuf),
 		"CPU Core: %s (flags: %08x)\n"
 		"Locked CPU freq: %d MHz\n"
+		"Fast memory: %s, Ignore bad memory accesses: %s\n"
 		"Cheats: %s, Plugins: %s\n%s\n\n%s",
 		CPUCoreAsString(g_Config.iCpuCore), g_Config.uJitDisableFlags,
 		GetLockedCPUSpeedMhz(),
-		CheatsInEffect() ? "Y" : "N", HLEPlugins::HasEnabled() ? "Y" : "N", activeFlags.c_str(), tips.c_str());
+		g_Config.bFastMemory ? "Y" : "N", g_Config.bIgnoreBadMemAccess ? "Y" : "N",
+		CheatsInEffect() ? "Y" : "N", plugins.c_str(), activeFlags.c_str(), tips.c_str());
 
 	ctx->Draw()->DrawTextShadow(ubuntu24, statbuf, x, y, 0xFFFFFFFF);
 	ctx->Flush();

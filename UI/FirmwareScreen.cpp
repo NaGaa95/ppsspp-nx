@@ -33,7 +33,9 @@
 #include "Core/System.h"
 #include "Core/Util/PathUtil.h"
 
+#include "UI/BackgroundAudio.h"
 #include "UI/FirmwareScreen.h"
+#include "UI/GameInfoCache.h"
 #include "UI/InstallUpdateScreen.h"
 #include "UI/MiscViews.h"
 
@@ -60,6 +62,7 @@ void FirmwareScreen::StartScan(bool eraseFirst) {
 		[state = scan_, nandRoot = nandRoot_, eraseFirst]() {
 		if (eraseFirst) {
 			EraseInstalledFirmware(nandRoot, &state->eraseError);
+			state->erased = true;
 		}
 		ReadInstalledFirmwareInfo(nandRoot, &state->info);
 		// Everything above is published by this store.
@@ -76,6 +79,10 @@ void FirmwareScreen::update() {
 	}
 	if (!scan_->eraseError.empty()) {
 		ERROR_LOG(Log::Loader, "Failed to erase the firmware: %s", scan_->eraseError.c_str());
+	}
+	if (scan_->erased) {
+		// Back to our own UI sounds.
+		g_BackgroundAudio.SFX().ReloadSamples();
 	}
 	info_ = scan_->info;
 	scan_.reset();
@@ -158,7 +165,7 @@ void FirmwareScreen::CreateContentViews(UI::ViewGroup *parent) {
 	content->Add(new InfoItem(st->T("Size"), NiceSizeFormat(info_.totalSize)));
 }
 
-void FirmwareScreen::CreateSettingsViews(UI::ViewGroup *parent) {
+void FirmwareScreen::CreateSettingsViews(UI::ViewGroup *parent, bool inPopup) {
 	using namespace UI;
 
 	auto sy = GetI18NCategory(I18NCat::SYSTEM);
@@ -235,7 +242,10 @@ void FirmwareScreen::BrowseForUpdater() {
 	auto iz = GetI18NCategory(I18NCat::INSTALLZIP);
 	System_BrowseForFile(GetRequesterToken(), iz->T("Install PSP firmware update"), BrowseFileType::BOOTABLE,
 		[this](std::string_view value, int) {
-		screenManager()->push(new InstallUpdateScreen(Path(value), "", false));
+		const Path path(value);
+		std::shared_ptr<GameInfo> info = g_gameInfoCache->GetInfo(nullptr, path, GameInfoFlags::PARAM_SFO, nullptr, GameInfoFlags::EMPTY, TaskPriority::HIGH);
+		info->WaitUntilReady(GameInfoFlags::PARAM_SFO);
+		screenManager()->push(new InstallUpdateScreen(path, info->GetTitle(), false));
 	});
 }
 

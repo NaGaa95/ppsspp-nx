@@ -57,6 +57,11 @@ InstallZipScreen::InstallZipScreen(const Path &zipPath) : UITwoPaneBaseDialogScr
 			ZipClose(zipFile);
 		}
 	}
+
+	if (zipFileInfo_.contents == ZipFileContents::SAVE_DATA) {
+		// The existing save may have changed since the cache last looked at it (the game wrote it, say).
+		g_gameInfoCache->PurgeType(IdentifiedFileType::PSP_SAVEDATA_DIRECTORY);
+	}
 }
 
 std::string_view InstallZipScreen::GetTitle() const {
@@ -67,7 +72,7 @@ std::string_view InstallZipScreen::GetTitle() const {
 	return iz->T("ZIP file");
 }
 
-void InstallZipScreen::CreateSettingsViews(UI::ViewGroup *parent) {
+void InstallZipScreen::CreateSettingsViews(UI::ViewGroup *parent, bool inPopup) {
 	using namespace UI;
 
 	auto di = GetI18NCategory(I18NCat::DIALOG);
@@ -379,6 +384,13 @@ void InstallZipScreen::update() {
 				doneView_->SetVisibility(Visibility::V_VISIBLE);
 			}
 		} else if (installStarted_) {
+			if (!installRefreshed_) {
+				installRefreshed_ = true;
+				if (zipFileInfo_.contents == ZipFileContents::SAVE_DATA) {
+					// So the existing data shows what was just imported, and so does the savedata manager.
+					g_gameInfoCache->PurgeType(IdentifiedFileType::PSP_SAVEDATA_DIRECTORY);
+				}
+			}
 			if (doneView_) {
 				doneView_->SetLevelAndText(NoticeLevel::SUCCESS, iz->T("Installed!"));
 				doneView_->SetVisibility(Visibility::V_VISIBLE);

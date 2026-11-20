@@ -298,6 +298,8 @@ void ThreadManager::Init(int numRealCores, int numLogicalCoresPerCpu) {
 }
 
 void ThreadManager::EnqueueTask(Task *task) {
+#if !PPSSPP_PLATFORM(SWITCH) || !defined(__LIBRETRO__)
+	// libnx can't detach threads, so in the libretro core dedicated tasks go to the IO blocking threads below.
 	if (task->Type() == TaskType::DEDICATED_THREAD) {
 #if PPSSPP_PLATFORM(SWITCH)
 		ReapDedicatedThreads(global_);
@@ -322,6 +324,7 @@ void ThreadManager::EnqueueTask(Task *task) {
 #endif
 		return;
 	}
+#endif
 
 	_assert_msg_(IsInitialized(), "ThreadManager not initialized");
 

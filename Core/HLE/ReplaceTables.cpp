@@ -2070,6 +2070,39 @@ static int Hook_gtavcs_plane_control_2(MIPSState *mips) {
 	return GTAVCSPlaneGasPedal(mips, 0x6AC);
 }
 
+// SOCOM: Fireteam Bravo 3 reduces the scene to a 4x4 block at the top left of a small framebuffer, and on
+// levels with brightness adaptation (mission 4), this function, called from its GE interrupt handler, sums
+// that block's RGB to set the ambient light. Without a readback, those levels get very dark (#6963). The hook
+// is past the function's checks that adaptation is on, where a1 holds the buffer (rows of 0x200 bytes).
+// Data a frame or so old is fine for this, so the readback doesn't wait for the GPU.
+static int Hook_socomftb3_read_luminance(MIPSState *mips) {
+	const u32 fb_address = mips->r[MIPS_REG_A1];
+	const u32 size = 3 * 0x200 + 4 * 4;
+	if (Memory::IsVRAMAddress(fb_address)) {
+		gpu->PerformDelayedReadbackToMemory(fb_address, size);
+		NotifyMemInfo(MemBlockFlags::WRITE, fb_address, size, "socomftb3_read_luminance");
+	}
+	return 0;
+}
+
+// Split/Second draws the area around the sun from the scene into an 8x8 565 framebuffer, through a CLUT that
+// leaves dark pixels black, and the next frame this function (which also queues that pass) counts the non-zero
+// pixels to set the lens flare's visibility (#15785). The hook is just before the count, where a0 points to the
+// buffer's description: its address at 0x10, its stride in pixels at 0x18. Without a readback, the count never
+// changes and the flare shows through buildings. A frame or two old is fine for a fading flare.
+static int Hook_splitsecond_sun_visibility(MIPSState *mips) {
+	const u32 desc = mips->r[MIPS_REG_A0];
+	if (!Memory::IsValidRange(desc, 0x1C)) {
+		return 0;
+	}
+	const u32 fb_address = Memory::ReadUnchecked_U32(desc + 0x10);
+	const u32 size = 7 * Memory::ReadUnchecked_U32(desc + 0x18) * 2 + 8 * 2;
+	if (Memory::IsVRAMAddress(fb_address) && Memory::IsValidRange(fb_address, size)) {
+		gpu->PerformDelayedReadbackToMemory(fb_address, size);
+		NotifyMemInfo(MemBlockFlags::WRITE, fb_address, size, "splitsecond_sun_visibility");	}
+	return 0;
+}
+
 #define JITFUNC(f) (&MIPSComp::MIPSFrontendInterface::f)
 
 // Can either replace with C functions or functions emitted in Asm/ArmAsm.
@@ -2222,6 +2255,8 @@ static const ReplacementTableEntry entries[] = {
 	{ "syphonfilter_steer", &Hook_syphonfilter_steer_turn_rate, 0, REPFLAG_HOOK, 0x1610 },
 	{ "syphonfilterls_fade", &Hook_syphonfilterls_fade_hold, 0, REPFLAG_HOOK, 0x78 },
 	{ "syphonfilterls_fade", &Hook_syphonfilterls_fade_hold, 0, REPFLAG_HOOK, 0x18C },
+	{ "socomftb3_read_luminance", &Hook_socomftb3_read_luminance, 0, REPFLAG_HOOK, 0x4C },
+	{ "splitsecond_sun_visibility", &Hook_splitsecond_sun_visibility, 0, REPFLAG_HOOK, 0x744 },
 	{}
 };
 

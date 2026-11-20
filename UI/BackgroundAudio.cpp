@@ -1,3 +1,4 @@
+#include <cstring>
 #include <memory>
 #include <string>
 #include <mutex>
@@ -21,7 +22,11 @@
 #include "Core/System.h"
 #include "Core/Config.h"
 #include "UI/GameInfoCache.h"
+#include "Core/Dialog/PSPDialog.h"
+#include "Core/ConfigValues.h"
+#include "Core/Util/VideoPlayer.h"
 #include "UI/BackgroundAudio.h"
+#include "UI/FirmwareSounds.h"
 
 struct WavData {
 	int num_channels = -1;
@@ -219,9 +224,19 @@ bool WavData::Read(RIFFReader &file_) {
 	return true;
 }
 
+// A game's sound in the game list, looping.
+class BackgroundSoundReader {
+public:
+	virtual ~BackgroundSoundReader() {}
+	// Fills buffer with len stereo samples. False if there's nothing to play.
+	virtual bool Read(int *buffer, int len) = 0;
+	// Where in its loop it is, for a sound that a video follows. -1 if none does.
+	virtual double PositionSeconds() const { return -1.0; }
+};
+
 // Really simple looping in-memory AT3 player that also takes care of reading the file format.
 // Turns out that AT3 files used for this are modified WAVE files so fairly easy to parse.
-class AT3PlusReader {
+class AT3PlusReader : public BackgroundSoundReader {
 public:
 	explicit AT3PlusReader(const std::string &data) : file_((const uint8_t *)&data[0], (int32_t)data.size()) {
 		if (!wave_.Read(file_)) {
@@ -256,7 +271,7 @@ public:
 
 	bool IsOK() const { return decoder_ && wave_.raw_data_size > 0; }
 
-	bool Read(int *buffer, int len) {
+	bool Read(int *buffer, int len) override {
 		if (!IsOK()) {
 			return false;
 		}
@@ -320,6 +335,52 @@ private:
 	AudioDecoder *decoder_ = nullptr;
 };
 
+// Already decoded 44.1 kHz stereo, looping: the sound muxed into an ICON1.PMF.
+class PCMLoopReader : public BackgroundSoundReader {
+public:
+	explicit PCMLoopReader(std::vector<int16_t> &&pcm) : pcm_(std::move(pcm)) {}
+
+	bool Read(int *buffer, int len) override {
+		if (pcm_.size() < 2) {
+			return false;
+		}
+		for (int i = 0; i < len * 2; i += 2) {
+			buffer[i] = pcm_[pos_];
+			buffer[i + 1] = pcm_[pos_ + 1];
+			pos_ += 2;
+			if (pos_ + 1 >= pcm_.size()) {
+				pos_ = 0;
+			}
+		}
+		return true;
+	}
+
+	double PositionSeconds() const override {
+		return (double)(pos_ / 2) / 44100.0;
+	}
+
+private:
+	std::vector<int16_t> pcm_;
+	size_t pos_ = 0;
+};
+
+// Some games have no SND0.AT3, and mux their sound into ICON1.PMF instead. Decoding all of it
+// takes a moment, too long for the UI thread or the audio lock.
+class PMFAudioDecodeTask : public Task {
+public:
+	PMFAudioDecodeTask(std::string &&pmf, int generation) : pmf_(std::move(pmf)), generation_(generation) {}
+	TaskType Type() const override { return TaskType::CPU_COMPUTE; }
+	TaskPriority Priority() const override { return TaskPriority::NORMAL; }
+	void Run() override {
+		std::vector<int16_t> pcm = pmf_decode_audio((const uint8_t *)pmf_.data(), pmf_.size());
+		g_BackgroundAudio.OnPMFAudioDecoded(generation_, std::move(pcm));
+	}
+
+private:
+	std::string pmf_;
+	int generation_;
+};
+
 BackgroundAudio g_BackgroundAudio;
 
 BackgroundAudio::BackgroundAudio() {
@@ -328,7 +389,7 @@ BackgroundAudio::BackgroundAudio() {
 }
 
 BackgroundAudio::~BackgroundAudio() {
-	delete at3Reader_;
+	delete sndReader_;
 	delete[] buffer_;
 }
 
@@ -338,12 +399,13 @@ void BackgroundAudio::Clear(bool hard) {
 		volumeFader_ = 1.0f;
 		return;
 	}
-	if (at3Reader_) {
-		delete at3Reader_;
-		at3Reader_ = nullptr;
+	if (sndReader_) {
+		delete sndReader_;
+		sndReader_ = nullptr;
 	}
 	playbackOffset_ = 0;
 	sndLoadPending_ = false;
+	pmfDecodePending_ = false;
 }
 
 void BackgroundAudio::SetGame(const Path &path) {
@@ -353,6 +415,8 @@ void BackgroundAudio::SetGame(const Path &path) {
 		return;
 	}
 
+	loadGeneration_++;
+	pmfDecodePending_ = false;
 	if (path.empty()) {
 		Clear(false);
 		sndLoadPending_ = false;
@@ -368,10 +432,10 @@ void BackgroundAudio::SetGame(const Path &path) {
 }
 
 bool BackgroundAudio::ReadSamples(int frames) {
-	if (!at3Reader_) {
+	if (!sndReader_) {
 		return false;
 	}
-	if (!at3Reader_->Read(buffer_, frames)) {
+	if (!sndReader_->Read(buffer_, frames)) {
 		Clear(true);
 		return false;
 	}
@@ -433,7 +497,7 @@ void BackgroundAudio::Update() {
 	}
 	std::lock_guard<std::mutex> lock(mutex_);
 	// Wait for the selection to settle before reading from storage.
-	if (!sndLoadPending_ || time_now_d() - gameLastChanged_ <= 0.5 || at3Reader_ || !g_gameInfoCache) {
+	if (!sndLoadPending_ || time_now_d() - gameLastChanged_ <= 0.5 || sndReader_ || !g_gameInfoCache) {
 		return;
 	}
 
@@ -449,11 +513,63 @@ void BackgroundAudio::Update() {
 	if (!gameInfo->sndFileData.empty()) {
 		auto reader = std::make_unique<AT3PlusReader>(gameInfo->sndFileData);
 		if (reader->IsOK()) {
-			at3Reader_ = reader.release();
+			sndReader_ = reader.release();
 			lastPlaybackTime_ = 0.0;
 		}
+		sndLoadPending_ = false;
+		return;
 	}
+	infoLock.unlock();
+
+	// No SND0.AT3. Some games mux their sound into ICON1.PMF instead.
+	gameInfo = g_gameInfoCache->TryGetInfo(bgGamePath_, GameInfoFlags::SND | GameInfoFlags::ICON1_PMF);
+	if (!gameInfo) {
+		return;
+	}
+	infoLock = std::unique_lock<std::mutex>(gameInfo->lock, std::try_to_lock);
+	if (!infoLock.owns_lock() || !(gameInfo->hasFlags & GameInfoFlags::ICON1_PMF)) {
+		return;
+	}
+	std::string pmf = gameInfo->icon1pmf;
+	infoLock.unlock();
 	sndLoadPending_ = false;
+	if (!pmf.empty() && pmf_has_audio((const uint8_t *)pmf.data(), pmf.size())) {
+		pmfDecodePending_ = true;
+		g_threadManager.EnqueueTask(new PMFAudioDecodeTask(std::move(pmf), loadGeneration_));
+	}
+}
+
+double BackgroundAudio::PreviewVideoTime(const Path &game, bool pmfHasAudio, double ownTime) {
+	if (!pmfHasAudio || g_Config.iUIVolume <= 0) {
+		return ownTime;
+	}
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (game != bgGamePath_) {
+		return ownTime;
+	}
+	if (sndReader_) {
+		// The PMF's own sound: the video follows it. Not the SND0.AT3 of a game that has both.
+		const double position = sndReader_->PositionSeconds();
+		return position >= 0.0 ? position : ownTime;
+	}
+	if (sndLoadPending_ || pmfDecodePending_) {
+		return -1.0;
+	}
+	return ownTime;
+}
+
+void BackgroundAudio::OnPMFAudioDecoded(int generation, std::vector<int16_t> &&pcm) {
+	std::lock_guard<std::mutex> lock(mutex_);
+	if (generation != loadGeneration_) {
+		return;
+	}
+	pmfDecodePending_ = false;
+	if (sndReader_ || pcm.size() < 4) {
+		return;
+	}
+	INFO_LOG(Log::Audio, "Playing the sound in %s's ICON1.PMF (%.1f s)", bgGamePath_.c_str(), pcm.size() / 2 / 44100.0);
+	sndReader_ = new PCMLoopReader(std::move(pcm));
+	lastPlaybackTime_ = 0.0;
 }
 
 inline int16_t ConvertU8ToI16(uint8_t value) {
@@ -569,9 +685,7 @@ static Sample *LoadMp3(const uint8_t *data, size_t size) {
 	if (samples.empty()) {
 		return nullptr;
 	}
-	int16_t *sampleData = new int16_t[samples.size()];
-	memcpy(sampleData, samples.data(), samples.size() * sizeof(int16_t));
-	return new Sample(sampleData, 2, (int)samples.size() / 2, sampleRate);
+	return new Sample(samples, 2, sampleRate);
 }
 
 Sample *Sample::Load(const std::string &path) {
@@ -700,6 +814,18 @@ void SoundEffectMixer::Play(UI::UISound sfx, float multiplier) {
 	queue_.push_back(PlayInstance{ sfx, 0, (int)(255.0f * multiplier), false });
 }
 
+void SoundEffectMixer::Stop(UI::UISound sfx) {
+	std::lock_guard<std::mutex> guard(mutex_);
+	auto matches = [sfx](const PlayInstance &play) { return play.sound == sfx; };
+	queue_.erase(std::remove_if(queue_.begin(), queue_.end(), matches), queue_.end());
+	plays_.erase(std::remove_if(plays_.begin(), plays_.end(), matches), plays_.end());
+}
+
+void SoundEffectMixer::UnloadSample(UI::UISound sound) {
+	std::lock_guard<std::mutex> guard(mutex_);
+	samples_[(size_t)sound].reset();
+}
+
 void SoundEffectMixer::UpdateSample(UI::UISound sound, Sample *sample) {
 	if (sample) {
 		std::lock_guard<std::mutex> guard(mutex_);
@@ -740,11 +866,27 @@ public:
 		return TaskPriority::NORMAL;
 	}
 	void Run() override {
-		mixer_->LoadSamplesOnThread();
+		mixer_->RunSampleLoads();
 	}
 private:
 	SoundEffectMixer *mixer_;
 };
+
+// One load at a time, so two can't interleave and leave a mix of both settings. A reload asked for
+// while one runs makes it load once more when it's done.
+void SoundEffectMixer::RunSampleLoads() {
+	while (true) {
+		{
+			std::lock_guard<std::mutex> guard(loadMutex_);
+			if (!loadRequested_) {
+				loadRunning_ = false;
+				return;
+			}
+			loadRequested_ = false;
+		}
+		LoadSamplesOnThread();
+	}
+}
 
 void SoundEffectMixer::Init() {
 	samples_.resize((size_t)UI::UISound::COUNT);
@@ -757,7 +899,32 @@ void SoundEffectMixer::Init() {
 		}
 	});
 
+	// The system dialogs in games tick and click like on a PSP, with the PSP firmware's sounds.
+	// They're part of the game, so they go with the game's volume.
+	SetUtilityDialogSoundCallback([](UtilityDialogSound sound) {
+		SoundEffectMixer &sfx = g_BackgroundAudio.SFX();
+		if (!sfx.FirmwareExtras() || !g_Config.bEnableSound) {
+			return;
+		}
+		const float volume = Volume100ToMultiplier(g_Config.iGameVolume);
+		switch (sound) {
+		case UtilityDialogSound::CURSOR: sfx.Play(UI::UISound::SELECT, volume); break;
+		case UtilityDialogSound::CONFIRM: sfx.Play(UI::UISound::CONFIRM, volume); break;
+		case UtilityDialogSound::CANCEL: sfx.Play(UI::UISound::BACK, volume); break;
+		}
+	});
+
 	// Load samples in the background.
+	ReloadSamples();
+}
+
+void SoundEffectMixer::ReloadSamples() {
+	std::lock_guard<std::mutex> guard(loadMutex_);
+	loadRequested_ = true;
+	if (loadRunning_) {
+		return;
+	}
+	loadRunning_ = true;
 	g_threadManager.EnqueueTask(new SampleLoadTask(this));
 }
 
@@ -778,4 +945,29 @@ void SoundEffectMixer::LoadSamplesOnThread() {
 	} else {
 		LoadDefaultSample(UI::UISound::LEADERBOARD_SUBMITTED);
 	}
+
+	// With a firmware dump installed, the sounds can be the PSP's own (see FirmwareSounds.h), in our
+	// menus and in the system dialogs in games.
+	firmwareExtras_ = false;
+	if ((UISoundStyle)g_Config.iUISoundStyle != UISoundStyle::FIRMWARE) {
+		return;
+	}
+	auto useSound = [&](UI::UISound sound, const std::vector<FirmwareSounds::Sound> &sounds, std::string_view name) {
+		const FirmwareSounds::Sound *found = FirmwareSounds::Find(sounds, name);
+		if (!found || found->samples.size() < (size_t)found->channels * 2) {
+			return false;
+		}
+		UpdateSample(sound, new Sample(found->samples, found->channels, found->rateInHz));
+		return true;
+	};
+
+	const std::vector<FirmwareSounds::Sound> xmbSounds = FirmwareSounds::LoadXMBSounds();
+	if (!useSound(UI::UISound::SELECT, xmbSounds, "SE2_Cursor")) {
+		return;  // No firmware: our sounds.
+	}
+	useSound(UI::UISound::CONFIRM, xmbSounds, "SE3_Normal_OK");
+	useSound(UI::UISound::BACK, xmbSounds, "SE4_Cansel");
+	useSound(UI::UISound::TOGGLE_ON, xmbSounds, "SE8_Option");
+	useSound(UI::UISound::TOGGLE_OFF, xmbSounds, "SE8_Option");
+	firmwareExtras_ = true;
 }

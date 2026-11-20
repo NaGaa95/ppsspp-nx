@@ -160,6 +160,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x24d82a8675800808, 220, "ceilf", },
 	{ 0x26cc90cb25af9d27, 476, "log10", },
 	{ 0x275c79791a2bab83, 116, "rezel_cross_download_frame", }, // Rezel Cross
+	{ 0x27606b96aff3d808, 2020, "splitsecond_sun_visibility", }, // Split/Second (EU)
 	{ 0x2774614d57d4baa2, 28, "vsub_q", },
 	{ 0x279c6bf9cf99cc85, 436, "strncpy", },
 	{ 0x2876ed93c5fd1211, 328, "dl_write_matrix_4", },
@@ -353,6 +354,7 @@ static const HardHashTableEntry hardcodedHashes[] = {
 	{ 0x9a06b9d5c16c4c20, 76, "dl_write_clut_ptrload", },
 	{ 0x9b88b739267d189e, 88, "strrchr", },
 	{ 0x9ce53975bb88c0e7, 96, "strncpy", },
+	{ 0x9d457f07ffbc2f59, 204, "socomftb3_read_luminance", }, // SOCOM: Fireteam Bravo 3
 	{ 0x9d4f5f56b52f07f2, 808, "memmove", }, // Jeanne d'Arc (US)
 	{ 0x9e2941c4a5c5e847, 792, "memcpy", }, // LittleBigPlanet (US)
 	{ 0x9e6adef67e76ed5c, 188, "everybodystennis_copy_portrait", }, // Everybody's Tennis (EUR)

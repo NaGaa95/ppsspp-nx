@@ -65,6 +65,12 @@
 #include "GPU/Common/PostShader.h"
 #include "GPU/Debugger/Record.h"
 
+#if PPSSPP_PLATFORM(SWITCH) && defined(__LIBRETRO__)
+#include <switch.h>
+// Missing usleep in the toolchain
+#define usleep(n) svcSleepThread((_s64)n * 1000)
+#endif
+
 struct FrameBufferState {
 	u32 topaddr;
 	GEBufferFormat fmt;
@@ -1148,7 +1154,7 @@ int sceDisplaySetFramebuf(MIPSState *mips, u32 topaddr, int linesize, int pixelf
 
 	if (sync == PSP_DISPLAY_SETBUF_IMMEDIATE) {
 		if ((GEBufferFormat)pixelformat != latchedFramebuf.fmt || linesize != latchedFramebuf.stride) {
-			return hleReportWarning(Log::sceDisplay, SCE_KERNEL_ERROR_INVALID_MODE, "must change latched framebuf first");
+			return hleLogWarning(Log::sceDisplay, SCE_KERNEL_ERROR_INVALID_MODE, "must change latched framebuf first");
 		}
 	}
 

@@ -39,7 +39,6 @@
 #include "Core/ELF/PBPReader.h"
 #include "Core/FileLoaders/PS1EbootFileLoader.h"
 #include "Core/Loaders.h"
-#include "Core/MemMap.h"
 
 #include "UI/GameBrowser.h"
 #include "UI/GameButton.h"
@@ -430,10 +429,6 @@ static bool IsValidPBP(const Path &path, bool allowHomebrew) {
 	if (!allowHomebrew && sfo.GetValueString("DISC_ID").empty())
 		return false;
 
-	// PS1 games, which need the Media Engine.
-	if (sfo.GetValueString("CATEGORY") == "ME" && !Memory::CanCreateMESpace())
-		return false;
-
 	return true;
 }
 
@@ -711,7 +706,9 @@ void GameBrowser::Refresh() {
 
 	if (!lastText_.empty()) {
 		Add(new Spacer());
-		Add(new Choice(lastText_, ImageID("I_LINK_OUT"), new UI::LinearLayoutParams(UI::WRAP_CONTENT, UI::WRAP_CONTENT, Margins(10, 0, 0, 10))))->OnClick.Handle(this, &GameBrowser::LastClick);
+		Choice *lastChoice = Add(new Choice(lastText_, ImageID("I_LINK_OUT"), new UI::LinearLayoutParams(UI::WRAP_CONTENT, UI::WRAP_CONTENT, Margins(10, 0, 0, 10))));
+		lastChoice->SetRoundCorners(RoundCorners::All);
+		lastChoice->OnClick.Handle(this, &GameBrowser::LastClick);
 	}
 
 	// The new buttons are all visible, so filter them again if a search is active.

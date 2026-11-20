@@ -466,11 +466,13 @@ jobs:
       run: |
         # test.py takes the newest build*/PPSSPPHeadless, so hand it one that runs the cross build
         # under emulation. The wall clock is raised because everything is slower under qemu.
+        # The Media Engine is off: none of these tests use it, and under qemu emulating it makes
+        # them about 28 times slower (it costs next to nothing natively).
         mkdir -p build-qemu
         printf '#!/bin/bash\nexec %s -L /usr/%s "$(dirname "$0")/../build-%s/PPSSPPHeadless" "$@"\n' \
           '${{ matrix.qemu }}' '${{ matrix.triple }}' '${{ matrix.extra }}' > build-qemu/PPSSPPHeadless
         chmod +x build-qemu/PPSSPPHeadless
-        python3 test.py -g --graphics=software --cpu=jit-ir --timeout=60 \
+        python3 test.py -g --graphics=software --cpu=jit-ir --timeout=60 --me-core=false \
           --known-failures=${{ matrix.extra }}
 
     - name: Package build
@@ -638,3 +640,33 @@ jobs:
     - name: Execute headless tests
       run: |
         python test.py -g --graphics=software
+
+  build_libretro_switch:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        submodules: recursive
+
+    - name: Fix git detected dubious ownership in repository
+      run: |
+        chown -R $(id -u):$(id -g) $PWD
+
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@d62db5f07c26379fc4b4e0916f098a92573c3b03 # v1.2.23
+      with:
+        key: libretro-switch
+
+    - name: Build
+      run: |
+        cd libretro
+        make platform=libnx -j$(nproc)
+
+    - name: Package build
+      if: success()
+      uses: actions/upload-artifact@v7
+      with:
+        name: ppsspp-libretro-switch
+        path: libretro/ppsspp_libretro_libnx.a

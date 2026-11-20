@@ -134,14 +134,22 @@ namespace MIPSComp {
 		// Calls to InvalidateCacheAt that hit at least one block, and the blocks they hit.
 		int invalidations = 0;
 		int invalidatedBlocks = 0;
+		// Large icache invalidations, which hash every block to find overwritten code, and the blocks dropped.
+		int changedCodeChecks = 0;
+		int changedCodeBlocks = 0;
 	};
 
 	// Time spent compiling, totalled since startup. The IR JITs fill it in.
 	struct JitCompileTimes {
+		// Blocks are timed by phase only while that's shown (the JIT overlay) or benchmarked: reading
+		// the clock can cost 0.3 us. These are the phases of those blocks.
 		int64_t frontendNanos = 0;  // MIPS to IR
 		int64_t passNanos = 0;  // The IR passes
 		int64_t backendNanos = 0;  // IR to host code, or into the IR arena
 		int64_t finalizeNanos = 0;  // The block table and linking
+		int64_t phaseBlocks = 0;
+		// The other blocks, whole.
+		int64_t unphasedNanos = 0;
 		int64_t clearNanos = 0;  // Clearing the whole cache
 		int64_t invalidateNanos = 0;
 		int64_t maxBlockNanos = 0;
@@ -150,8 +158,11 @@ namespace MIPSComp {
 		int64_t irInstructions = 0;  // After the passes
 		int clears = 0;
 
+		int64_t CompileNanos() const {
+			return frontendNanos + passNanos + backendNanos + finalizeNanos + unphasedNanos;
+		}
 		int64_t TotalNanos() const {
-			return frontendNanos + passNanos + backendNanos + finalizeNanos + clearNanos + invalidateNanos;
+			return CompileNanos() + clearNanos + invalidateNanos;
 		}
 	};
 	extern JitCompileTimes g_jitCompileTimes;
@@ -176,6 +187,8 @@ namespace MIPSComp {
 		virtual void BenchmarkCompile() {}
 		// Invalidates every block not entirely inside one of the (address, size) ranges.
 		virtual void InvalidateCacheExcept(const std::vector<std::pair<u32, u32>> &keep) = 0;
+		// Drops every block whose guest code no longer matches what it was compiled from.
+		virtual void InvalidateChangedBlocks() {}
 		virtual void DoState(PointerWrap &p) = 0;
 		virtual void RunLoopUntil(u64 globalticks) = 0;
 		// Runs until the downcount runs out, without CoreTiming. For the Media Engine, which the IR

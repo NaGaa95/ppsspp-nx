@@ -62,6 +62,12 @@
 
 #include "ext/aemu_postoffice/client/postoffice_client.h"
 #include "ext/aemu_postoffice/adhocctl/client/adhocctl.h"
+#if PPSSPP_PLATFORM(SWITCH) && defined(__LIBRETRO__)
+#undef __BSD_VISIBLE
+#define __BSD_VISIBLE 1
+#include <switch.h>
+#define TCP_MAXSEG 2
+#endif // PPSSPP_PLATFORM(SWITCH)
 
 #ifdef _WIN32
 #undef errno

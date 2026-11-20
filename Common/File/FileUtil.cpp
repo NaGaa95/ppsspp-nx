@@ -434,7 +434,7 @@ std::string ResolvePath(std::string_view path) {
 	delete [] buf;
 	return output;
 
-#elif PPSSPP_PLATFORM(IOS)
+#elif PPSSPP_PLATFORM(IOS) || (PPSSPP_PLATFORM(SWITCH) && defined(__LIBRETRO__))
 	// Resolving has wacky effects on documents paths.
 	return std::string(path);
 #else

@@ -192,7 +192,7 @@ namespace MIPSInt {
 				}
 				if (alignedAddr <= PC + 4 && alignedAddr + size >= PC - 4) {
 					// This is probably rare so we don't use a static bool.
-					WARN_LOG_ONCE(icacheInvalidatePC, Log::JIT, "Invalidating address near PC: %08x (%08x + %d) at PC=%08x", addr, R(rs), imm, PC);
+					WARN_LOG(Log::JIT, "Invalidating address near PC: %08x (%08x + %d) at PC=%08x", addr, R(rs), imm, PC);
 				}
 			}
 			break;
@@ -740,7 +740,8 @@ namespace MIPSInt {
 				} else if (fs == 0) {
 					R(rt) = MIPSState::FCR0_VALUE;
 				} else {
-					WARN_LOG_REPORT(Log::CPU, "ReadFCR: Unexpected reg %d", fs);
+					// Not interesting - almost certainly executing garbage as code. Previously we reported.
+					WARN_LOG(Log::CPU, "ReadFCR: Unexpected reg %d", fs);
 					R(rt) = 0;
 				}
 				break;
@@ -767,7 +768,8 @@ namespace MIPSInt {
 						ApplyHostRoundingMode(mips);
 					}
 				} else {
-					WARN_LOG_REPORT(Log::CPU, "WriteFCR: Unexpected reg %d (value %08x)", fs, value);
+					// Not interesting - almost certainly executing garbage as code. Previously we reported.
+					WARN_LOG(Log::CPU, "WriteFCR: Unexpected reg %d (value %08x)", fs, value);
 				}
 				DEBUG_LOG(Log::CPU, "FCR%i written to, value %08x", fs, value);
 				break;

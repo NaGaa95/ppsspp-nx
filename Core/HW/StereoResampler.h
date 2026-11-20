@@ -83,8 +83,8 @@ private:
 	SwitchAudioGapFade gapFade_;
 	std::atomic<bool> gapResetPending_{false};
 #endif
-	std::atomic<u32> indexW_;
-	std::atomic<u32> indexR_;
+	std::atomic<u32> indexW_{};
+	std::atomic<u32> indexR_{};
 	float numLeftI_ = 0.0f;
 
 	u32 frac_ = 0;

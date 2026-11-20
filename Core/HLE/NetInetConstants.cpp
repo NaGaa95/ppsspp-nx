@@ -1,5 +1,9 @@
 #include "ppsspp_config.h"
 
+#if PPSSPP_PLATFORM(SWITCH)
+#define __LINUX_ERRNO_EXTENSIONS__ 1
+#endif
+
 #include <string>
 #include "Common/Net/SocketCompat.h"
 #include "Common/StringUtils.h"

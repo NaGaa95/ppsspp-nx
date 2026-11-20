@@ -15,6 +15,15 @@
 
 #include "Common/GPU/OpenGL/GLFeatures.h"
 
+// The EXT spellings come from EXT_clip_cull_distance, which the Switch's GL
+// headers do not carry - the core names are there and hold the same values.
+#if !defined(GL_MAX_CLIP_DISTANCES_EXT) && defined(GL_MAX_CLIP_DISTANCES)
+#define GL_MAX_CLIP_DISTANCES_EXT GL_MAX_CLIP_DISTANCES
+#endif
+#if !defined(GL_MAX_CULL_DISTANCES_EXT) && defined(GL_MAX_CULL_DISTANCES)
+#define GL_MAX_CULL_DISTANCES_EXT GL_MAX_CULL_DISTANCES
+#endif
+
 #include "Common/Log.h"
 
 #if defined(USING_GLES2)
@@ -387,6 +396,11 @@ bool CheckGLExtensions() {
 	gl_extensions.ARB_explicit_attrib_location = g_set_gl_extensions.count("GL_ARB_explicit_attrib_location") != 0;
 	gl_extensions.ARB_texture_non_power_of_two = g_set_gl_extensions.count("GL_ARB_texture_non_power_of_two") != 0;
 	gl_extensions.ARB_shader_stencil_export = g_set_gl_extensions.count("GL_ARB_shader_stencil_export") != 0;
+	// AMD's legacy TeraScale 1 drivers (GL 3.3, like the Radeon HD 4200) advertise this, but the GLSL compiler
+	// rejects the #extension directive.
+	if (gl_extensions.gpuVendor == GPU_VENDOR_AMD && !gl_extensions.IsGLES && !gl_extensions.VersionGEThan(4, 0)) {
+		gl_extensions.ARB_shader_stencil_export = false;
+	}
 	gl_extensions.ARB_timer_query = g_set_gl_extensions.count("GL_ARB_timer_query") != 0;
 	gl_extensions.ARB_texture_compression_bptc = g_set_gl_extensions.count("GL_ARB_texture_compression_bptc") != 0;
 	gl_extensions.ARB_texture_compression_rgtc = g_set_gl_extensions.count("GL_ARB_texture_compression_rgtc") != 0;

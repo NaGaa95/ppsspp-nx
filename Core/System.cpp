@@ -29,6 +29,7 @@
 #endif
 #endif
 
+#include <climits>
 #include <mutex>
 
 #include "ext/lua/lapi.h"
@@ -338,6 +339,13 @@ static void ShowCompatWarnings(const Compatibility &compat) {
 	} else {
 		g_OSD.CancelById("defaultclock");
 	}
+
+	if (!compat.flags().RequireDefaultCPUClock && g_Config.iLockedCPUSpeed != 0) {
+		auto sy = GetI18NCategory(I18NCat::SYSTEM);
+		g_OSD.Show(OSDType::MESSAGE_WARNING, ApplySafeSubstitutions(sy->T("SystemClockSpeedChanged", "PSP system clock speed is set to %1 MHz"), g_Config.iLockedCPUSpeed), 5.0f, "clockspeed");
+	} else {
+		g_OSD.CancelById("clockspeed");
+	}
 }
 
 extern const std::string INDEX_FILENAME;
@@ -469,10 +477,16 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 			INFO_LOG(Log::Loader, "ELF, using full PSP-2000 memory access");
 			Memory::g_MemorySize = Memory::RAM_DOUBLE_SIZE;
 		}
-		// The XMB is an ELF too, with no title of its own.
-		const std::string vshTitle = GetVSHTitle(fileLoader->GetPath());
+		// The XMB is an ELF too, with no PARAM.SFO. It gets an ID like a game's, with the firmware's version.
+		std::string vshVersion;
+		const std::string vshTitle = GetVSHTitle(fileLoader->GetPath(), &vshVersion);
 		if (!vshTitle.empty()) {
 			gameTitle = vshTitle;
+			g_paramSFO.SetValue("TITLE", vshTitle, 128);
+			g_paramSFO.SetValue("DISC_ID", VSH_DISC_ID, 16);
+			if (!vshVersion.empty()) {
+				g_paramSFO.SetValue("DISC_VERSION", vshVersion, 8);
+			}
 		}
 		break;
 	}
@@ -485,6 +499,16 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 		}
 		break;
 	case IdentifiedFileType::PSP_PS1_PBP:
+		if (!Memory::CanCreateMESpace()) {
+			// The firmware's PS1 emulator plays its sound on the ME, which 32-bit's masked memory has no room for.
+			auto er = GetI18NCategory(I18NCat::ERRORS);
+#if PPSSPP_PLATFORM(UWP)
+			*errorString = er->T("PS1NotSupportedXbox", "PS1 games can't run on Xbox yet.");
+#else
+			*errorString = er->T("PS1NotSupported32Bit", "PS1 games need a 64-bit version of PPSSPP, and this one is 32-bit.");
+#endif
+			return false;
+		}
 		// Title and disc ID; the PS1 image itself is read by the firmware's POPS manager.
 		LoadParamSFOFromPBP(fileLoader);
 		break;
@@ -699,10 +723,12 @@ static bool CPU_Init(FileLoader *fileLoader, IdentifiedFileType type, std::strin
 	}
 
 	if (g_CoreParameter.updateRecent) {
-		g_recentFiles.Add(g_CoreParameter.fileToStart.ToString());
-		// A UMD Video disc picked from the game list boots the XMB (which Add skips) to play it.
+		// A UMD Video disc, however it was picked, boots the XMB with it in the drive to play it. That's
+		// the disc being played, so only the disc goes in Recents, not the XMB as well.
 		if (!g_CoreParameter.mountIso.empty() && g_CoreParameter.umdAutoboot.has_value()) {
 			g_recentFiles.Add(g_CoreParameter.mountIso.ToString());
+		} else {
+			g_recentFiles.Add(g_CoreParameter.fileToStart.ToString());
 		}
 	}
 

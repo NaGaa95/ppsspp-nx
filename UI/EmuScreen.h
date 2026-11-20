@@ -38,6 +38,7 @@ struct DisplayLayoutConfig;
 
 class AsyncImageFileView;
 class ImposeHomeScreen;
+class GameBootAnimation;
 class ChatMenu;
 class ImDebugger;
 struct ImCommand;
@@ -90,6 +91,8 @@ private:
 	void UpdateGameOutput();
 	DeviceOrientation GameLayoutOrientation() const;
 	const DisplayLayoutConfig &GameLayoutConfig() const;
+	// Where the PSP's 480x272 screen is drawn, in UI coordinates.
+	Bounds PSPScreenBounds() const;
 	void OnDevTools(UI::EventParams &params);
 	void OpenChat(bool focus);
 
@@ -150,6 +153,8 @@ private:
 	UI::Button *backButton_ = nullptr;
 	// On the crash screen while reporting is off.
 	UI::Button *reportCrashButton_ = nullptr;
+	// Under it, when cheats or plugins keep it disabled.
+	UI::TextView *reportCrashBlocked_ = nullptr;
 	// The current crash has been seen (and reported, if reporting is on).
 	bool crashSeen_ = false;
 	bool crashReported_ = false;
@@ -181,6 +186,8 @@ private:
 
 	// The HOME button's quit screen (as impose draws it on a PSP).
 	std::unique_ptr<ImposeHomeScreen> imposeHome_;
+	// The PSP's game start intro, while a game boots (see GameBootAnimation).
+	std::unique_ptr<GameBootAnimation> gameBoot_;
 };
 
 bool MustRunBehind();

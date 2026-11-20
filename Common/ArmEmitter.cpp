@@ -735,6 +735,10 @@ void ARMXEmitter::B(ARMReg src)
 }
 
 bool ARMXEmitter::BLInRange(const void *fnptr) const {
+	// BL with an immediate stays in ARM mode. A Thumb function (bit 0 set, as all of ours are when the
+	// library is built as Thumb, like on Android) has to be reached through BLX with a register.
+	if ((intptr_t)fnptr & 1)
+		return false;
 	ptrdiff_t distance = (intptr_t)fnptr - (intptr_t(code) + 8);
 	if (distance <= -0x2000000 || distance >= 0x2000000)
 		return false;
@@ -747,6 +751,7 @@ void ARMXEmitter::BL(const void *fnptr)
 	ptrdiff_t distance = (intptr_t)fnptr - (intptr_t(code) + 8);
 	_assert_msg_(distance > -0x2000000 && distance < 0x2000000,
                      "BL out of range (%p calls %p)", code, fnptr);
+	_assert_msg_(((intptr_t)fnptr & 1) == 0, "BL to Thumb code (%p calls %p)", code, fnptr);
 	Write32(condition | 0x0B000000 | ((distance >> 2) & 0x00FFFFFF));
 }
 void ARMXEmitter::BL(ARMReg src)
@@ -3103,9 +3108,9 @@ void ARMXEmitter::VCVTF16F32(ARMReg Dest, ARMReg Src) {
 
 // Always clear code space with breakpoints, so that if someone accidentally executes
 // uninitialized, it just breaks into the debugger.
-void ARMXCodeBlock::PoisonMemory(int offset) {
+void ARMXCodeBlock::PoisonMemory(int offset, int end) {
 	// TODO: this isn't right for ARM!
-	memset(region + offset, 0xCC, region_size - offset);
+	memset(region + offset, 0xCC, end - offset);
 	ResetCodePtr(offset);
 }
 

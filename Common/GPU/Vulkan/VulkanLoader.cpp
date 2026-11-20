@@ -46,12 +46,6 @@ extern "C" PFN_vkVoidFunction SwitchVulkanGetInstanceProcAddr(VkInstance instanc
 #include <adrenotools/driver.h>
 #endif
 
-#if PPSSPP_PLATFORM(ANDROID)
-#include <cstring>
-#include <android/api-level.h>
-#include <sys/system_properties.h>
-#endif
-
 namespace PPSSPP_VK {
 PFN_vkCreateInstance vkCreateInstance;
 PFN_vkDestroyInstance vkDestroyInstance;
@@ -278,6 +272,7 @@ bool g_vulkanAvailabilityChecked = false;
 bool g_vulkanMayBeAvailable = false;
 static std::string g_nativeLibDir;
 
+#if !PPSSPP_PLATFORM(SWITCH) || !defined(__LIBRETRO__)
 static PFN_vkVoidFunction LoadInstanceFunc(VkInstance instance, const char *name) {
 	PFN_vkVoidFunction funcPtr = vkGetInstanceProcAddr(instance, name);
 	if (!funcPtr) {
@@ -325,6 +320,21 @@ static PFN_vkVoidFunction LoadDeviceFuncCore(VkDevice device, const char *name, 
 
 #define LOAD_GLOBAL_FUNC(x) x = (PFN_ ## x)dlsym(vulkanLibrary, #x); if (!x) {INFO_LOG(Log::G3D,"Missing (global): %s", #x);}
 #define LOAD_GLOBAL_FUNC_LOCAL(lib, x) (PFN_ ## x)dlsym(lib, #x);
+
+#else // !PPSSPP_PLATFORM(SWITCH)
+// Just random stubs
+#define RTLD_NOW 0
+#define RTLD_LOCAL 1
+#define dlopen(...) NULL
+#define dlclose(...)
+#define LOAD_INSTANCE_FUNC(instance, x) x = (PFN_ ## x)NULL;
+#define LOAD_INSTANCE_FUNC_CORE(instance, x, ext_x, min_core) 
+#define LOAD_DEVICE_FUNC(instance, x) x = (PFN_ ## x)NULL;
+#define LOAD_DEVICE_FUNC_CORE(instance, x, ext_x, min_core)
+#define LOAD_GLOBAL_FUNC(x) x = (PFN_ ## x)NULL;
+
+#define LOAD_GLOBAL_FUNC_LOCAL(lib, x)  (PFN_ ## x)NULL;
+#endif // PPSSPP_PLATFORM(SWITCH)
 
 static const char * const g_deviceNameBlacklist[] = {
 	"NVIDIA:SHIELD Tablet K1",
@@ -374,7 +384,7 @@ static std::string g_failedCustomDriver;
 
 static bool CustomDriverInUse() {
 #if PPSSPP_PLATFORM(ANDROID) && PPSSPP_ARCH(ARM64)
-	return !g_Config.sCustomDriver.empty() && g_Config.sCustomDriver != "Default" && VulkanCustomDriverAllowedByOS();
+	return !g_Config.sCustomDriver.empty() && g_Config.sCustomDriver != "Default";
 #else
 	return false;
 #endif
@@ -398,9 +408,7 @@ static VulkanLibraryHandle VulkanLoadLibrary(std::string *errorString) {
 	void *lib = nullptr;
 
 #if PPSSPP_PLATFORM(ANDROID) && PPSSPP_ARCH(ARM64)
-	if (!g_Config.sCustomDriver.empty() && g_Config.sCustomDriver != "Default" && !VulkanCustomDriverAllowedByOS()) {
-		WARN_LOG(Log::G3D, "Custom driver '%s' ignored, not supported on this Android version", g_Config.sCustomDriver.c_str());
-	} else if (CustomDriverInUse()) {
+	if (CustomDriverInUse()) {
 		const Path driverPath = g_Config.internalDataDirectory / "drivers" / g_Config.sCustomDriver;
 
 		json::JsonReader meta = json::JsonReader((driverPath / "meta.json").c_str());
@@ -1072,23 +1080,6 @@ static const AdrenoEnvVarDef adrenoEnvVarDefs[] = {
 const AdrenoEnvVarDef *GetAdrenoEnvVarDefs(int *count) {
 	*count = ARRAY_SIZE(adrenoEnvVarDefs);
 	return adrenoEnvVarDefs;
-}
-
-bool VulkanCustomDriverAllowedByOS() {
-#if PPSSPP_PLATFORM(ANDROID)
-	// Android 17 internal builds crash in linkernsbypass (used by AdrenoTools), so stay away from 17 until
-	// that's been tested. Preview builds report the previous release's API level, with a codename other than "REL".
-	const int apiLevel = android_get_device_api_level();
-	if (apiLevel >= 37) {
-		return false;
-	}
-	char codename[PROP_VALUE_MAX]{};
-	__system_property_get("ro.build.version.codename", codename);
-	if (apiLevel >= 36 && strcmp(codename, "REL") != 0) {
-		return false;
-	}
-#endif
-	return true;
 }
 
 void VulkanApplyCustomDriverEnvVars(AdrenoEnvVar envVars) {

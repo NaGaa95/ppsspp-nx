@@ -1195,6 +1195,9 @@ static const struct retro_controller_info ports[] =
    { NULL, 0 }
 };
 
+// RetroLogCallback's handle, so retro_deinit() can remove it
+static int log_callback_handle = -1;
+
 void retro_init(void)
 {
    TimeInit();
@@ -1212,9 +1215,8 @@ void retro_init(void)
       // log always shows up in the debugger's Output window when debugging the core in-process with
       // RetroArch, regardless of where RetroArch itself routes the ExternalCallback log messages.
       g_logManager.EnableOutput(LogOutput::DebugString);
-      // AddExternalLogCallback() enables LogOutput::ExternalCallback itself. Never removed - this
-      // callback lives as long as the core does.
-      g_logManager.AddExternalLogCallback(&RetroLogCallback, (void *)log_cb);
+      // AddExternalLogCallback() enables LogOutput::ExternalCallback itself. Removed in retro_deinit().
+      log_callback_handle = g_logManager.AddExternalLogCallback(&RetroLogCallback, (void *)log_cb);
    }
 
    VsyncSwapIntervalReset();
@@ -1321,6 +1323,8 @@ void retro_init(void)
 void retro_deinit(void)
 {
    g_threadManager.Teardown();
+   g_logManager.RemoveExternalLogCallback(log_callback_handle);
+   log_callback_handle = -1;
    g_logManager.Shutdown();
    log_cb = NULL;
 
@@ -1367,7 +1371,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    PSP_CoreParameter().pixelWidth  = PSP_CoreParameter().renderWidth  = info->geometry.base_width;
    PSP_CoreParameter().pixelHeight = PSP_CoreParameter().renderHeight = info->geometry.base_height;
 
-	if (ctx && ctx->GetGPUCore() == GPUCORE_GLES) {
+	if (ctx && ctx->GetGPUCore() == GPUCORE_VULKAN) {
 		// Reserve room for both eyes so changing VR mode needs no context reset.
 		info->geometry.max_width *= 2;
 		if (VRActive()) {
@@ -1620,6 +1624,11 @@ bool retro_load_game(const struct retro_game_info *game) {
    // set cpuCore from libretro setting variable
    coreParam.cpuCore         =  (CPUCore)g_Config.iCpuCore;
    coreParam.bUseVertexDecoderJit = System_GetPropertyBool(SYSPROP_CAN_JIT);
+#if PPSSPP_PLATFORM(SWITCH)
+   // Only use the vertex decoder JIT together with the CPU JIT.
+   if (coreParam.cpuCore != CPUCore::JIT)
+      coreParam.bUseVertexDecoderJit = false;
+#endif
 
    g_pendingBoot = true;
 
@@ -1668,10 +1677,6 @@ void retro_unload_game(void) {
 			PSP_Shutdown(true);
 	}
 	g_VFS.Clear();
-
-	if (ctx && ctx->GetGPUCore() == GPUCORE_GLES && ctx->GetDrawContext()) {
-		Libretro::DestroyVR();
-	}
 
 	delete ctx;
 	ctx = nullptr;
@@ -2073,7 +2078,7 @@ void retro_cheat_set(unsigned index, bool enabled, const char *code) {
 int64_t System_GetPropertyInt(SystemProperty prop) {
    switch (prop) {
       case SYSPROP_DEVICE_TYPE:
-         return Libretro::VRRequested() && g_Config.iGPUBackend == (int)GPUBackend::OPENGL ? DEVICE_TYPE_VR : DEVICE_TYPE_DESKTOP;
+         return Libretro::VRRequested() && g_Config.iGPUBackend == (int)GPUBackend::VULKAN ? DEVICE_TYPE_VR : DEVICE_TYPE_DESKTOP;
       case SYSPROP_AUDIO_SAMPLE_RATE:
          return SAMPLERATE;
 #if PPSSPP_PLATFORM(ANDROID)

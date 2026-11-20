@@ -72,6 +72,17 @@ bool RiscVJitBackend::CompileBlock(int block_num, u32 startPC, const IRInst *ins
 		case IROp::ExitToReg:
 			sizeEstimate += 128;
 			break;
+		// The range check and the call-out for hardware registers.
+		case IROp::LoadKernel8:
+		case IROp::LoadKernel8Ext:
+		case IROp::LoadKernel16:
+		case IROp::LoadKernel16Ext:
+		case IROp::LoadKernel32:
+		case IROp::StoreKernel8:
+		case IROp::StoreKernel16:
+		case IROp::StoreKernel32:
+			sizeEstimate += 96;
+			break;
 		default:
 			sizeEstimate += 32;
 			break;
@@ -314,8 +325,8 @@ bool RiscVJitBackend::DescribeCodePtr(const u8 *ptr, std::string &name) const {
 }
 
 void RiscVJitBackend::ClearAllBlocks() {
-	ClearCodeSpace(jitStartOffset_);
-	FlushIcacheSection(region + jitStartOffset_, region + region_size - jitStartOffset_);
+	const size_t end = ClearCodeSpace(jitStartOffset_);
+	FlushIcacheSection(region + jitStartOffset_, region + end);
 	EraseAllLinks(-1);
 }
 

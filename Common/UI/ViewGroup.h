@@ -378,6 +378,7 @@ public:
 		settings_.columnWidth = columnWidth;
 		settings_.rowHeight = rowHeight;
 	}
+	void SetRoundCorners(RoundCorners outerCorners = RoundCorners::All) override;
 
 private:
 	GridLayoutSettings settings_;

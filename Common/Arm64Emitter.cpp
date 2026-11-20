@@ -4,6 +4,7 @@
 
 #include "ppsspp_config.h"
 
+#include <algorithm>
 #include <limits>
 #include <vector>
 #include <cmath>
@@ -376,15 +377,16 @@ void ARM64XEmitter::FlushIcacheSections(const u8 *const *starts, const u8 *const
 		isize = 64;
 		dsize = 64;
 	} else {
-		u64 ctr_el0;
-		static size_t icache_line_size = 0xffff, dcache_line_size = 0xffff;
-		__asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr_el0));
-		isize = 4 << ((ctr_el0 >> 0) & 0xf);
-		dsize = 4 << ((ctr_el0 >> 16) & 0xf);
-
-		// use the global minimum cache line size
-		icache_line_size = isize = icache_line_size < isize ? icache_line_size : isize;
-		dcache_line_size = dsize = dcache_line_size < dsize ? dcache_line_size : dsize;
+		// Read once: a kernel can trap the read (about 0.45 us on a Galaxy S8). That's read on one
+		// core, and a kernel that doesn't make up a safe value may have cores with smaller lines, so
+		// no more than 64 bytes (the cores we know of), which only costs a few more flushes on others.
+		static const u64 ctr_el0 = [] {
+			u64 value;
+			__asm__ volatile("mrs %0, ctr_el0" : "=r"(value));
+			return value;
+		}();
+		isize = std::min<size_t>(64, 4 << ((ctr_el0 >> 0) & 0xf));
+		dsize = std::min<size_t>(64, 4 << ((ctr_el0 >> 16) & 0xf));
 	}
 
 	for (int i = 0; i < count; i++) {
@@ -4488,12 +4490,12 @@ void ARM64XEmitter::SUBSI2R(ARM64Reg Rd, ARM64Reg Rn, u64 imm, ARM64Reg scratch)
 	}
 }
 
-void ARM64CodeBlock::PoisonMemory(int offset) {
+void ARM64CodeBlock::PoisonMemory(int offset, int end) {
 	// So we can adjust region to writable space.  Might be zero.
 	ptrdiff_t writable = m_writable - m_code;
 
 	u32 *ptr = (u32 *)(region + offset + writable);
-	u32 *maxptr = (u32 *)(region + region_size - offset + writable);
+	u32 *maxptr = (u32 *)(region + end + writable);
 	// If our memory isn't a multiple of u32 then this won't write the last remaining bytes with anything
 	// Less than optimal, but there would be nothing we could do but throw a runtime warning anyway.
 	// AArch64: 0xD4200000 = BRK 0

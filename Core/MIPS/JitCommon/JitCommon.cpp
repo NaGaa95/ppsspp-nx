@@ -30,10 +30,10 @@
 #include "Common/Serialize/Serializer.h"
 #include "Common/Serialize/SerializeFuncs.h"
 
-#include "Core/Util/DisArm64.h"
-
 #include "Core/Core.h"
 #include "Core/MemMap.h"
+#include "Core/Util/DisArm64.h"
+
 #include "Core/MIPS/IR/IRJit.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/MIPS/JitCommon/JitState.h"
@@ -56,16 +56,12 @@ namespace MIPSComp {
 	JitCompileTimes g_jitCompileTimes;
 
 	void JitAt(MIPSState *mips) {
-		// TODO: We could probably check for a bad pc here, and fire an exception. Could spare us from some crashes.
-		// Although, we just tried to load from this address to check for a JIT block, and if we're here, that succeeded..
-#if PPSSPP_ARCH(ARM64) && defined(MASKED_PSP_MEMORY)
-		// With masked memory, a pc outside PSP memory passes the dispatcher's block lookup with no fault, and its block
-		// could never be found: report the jump like the IR interpreter does (the dispatcher then stops).
+		// The dispatcher's block shadow lookup folds the mirror bits (and more on 32-bit), so a bad pc can
+		// get here without faulting. The dispatchers check coreState after this returns.
 		if (!mips->space->IsValid4AlignedAddress(mips->pc)) {
 			Core_ExecException(mips->pc, mips->pc, ExecExceptionType::JUMP);
 			return;
 		}
-#endif
 		mips->jit->Compile(mips->pc);
 	}
 

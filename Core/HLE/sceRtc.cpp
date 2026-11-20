@@ -41,12 +41,12 @@
 #include "Core/HLE/sceKernel.h"
 #include "Core/HLE/sceRtc.h"
 
-#ifdef HAVE_LIBNX
+#if PPSSPP_PLATFORM(SWITCH)
 // I guess that works...
 #define setenv(x, y, z) (void*)0
 #define tzset() (void*)0
 #define unsetenv(x) (void*)0
-#endif // HAVE_LIBNX
+#endif // PPSSPP_PLATFORM(SWITCH)
 
 // This is a base time that everything is relative to.
 // This way, time doesn't move strangely with savestates, turbo speed, etc.

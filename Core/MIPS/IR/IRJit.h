@@ -65,6 +65,10 @@ public:
 	void UpdateHash() {
 		hash_ = CalculateHash();
 	}
+	// The guest code differs from what the block was compiled from.
+	bool CodeChanged() const {
+		return CalculateHash() != hash_;
+	}
 	bool OverlapsRange(u32 addr, u32 size) const;
 
 	void GetRange(u32 *start, u32 *size) const {
@@ -189,6 +193,7 @@ public:
 	void ClearCache() override;
 	void InvalidateCacheAt(u32 em_address, int length = 4) override;
 	void InvalidateCacheExcept(const std::vector<std::pair<u32, u32>> &keep) override;
+	void InvalidateChangedBlocks() override;
 	void UpdateFCR31() override;
 	void GetStats(JitStats *stats) const override;
 	void BenchmarkCompile() override;
@@ -218,6 +223,8 @@ protected:
 	virtual bool HasBlockProfile() const { return false; }
 	virtual void FinalizeTargetBlock(int block_num) {}
 	virtual void InvalidateTargetBlock(int block_num) {}
+	// Bytes of host code compiled since the cache was cleared, for the bench. 0 without any.
+	virtual size_t TargetCodeBytes() const { return 0; }
 	void InvalidateBlock(int block_num);
 
 	JitOptions jo;
@@ -237,6 +244,10 @@ protected:
 	int codeFullClears_ = 0;
 	int invalidations_ = 0;
 	int invalidatedBlocks_ = 0;
+	int changedCodeChecks_ = 0;
+	int changedCodeBlocks_ = 0;
+	// Time the compile phases (see JitCompileTimes).
+	bool benchmarking_ = false;
 
 	friend class IRJitDebugInterface;
 };

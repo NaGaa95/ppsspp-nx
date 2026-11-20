@@ -49,7 +49,13 @@
 #include "Core/HDRemaster.h"
 #include "Core/HLE/HLE.h"
 
-enum {
+#if PPSSPP_PLATFORM(SWITCH)
+// Defined in Misc.cpp
+extern size_t strnlen(const char *s, size_t maxlen);
+#endif // PPSSPP_PLATFORM(SWITCH)
+
+enum
+{
 	// Do nothing after the syscall.
 	HLE_AFTER_NOTHING           = 0x00,
 	// Reschedule immediately after the syscall.
@@ -131,6 +137,7 @@ static const HLEModuleMeta g_moduleMeta[] = {
 	{"SceHttp_Library", "sceHttp"},
 	{"sceMpeg_library", "sceMpeg", DisableHLEFlags::sceMpeg},
 	{"sceMp3_Library", "sceMp3", DisableHLEFlags::sceMp3},
+	{"sceAac_Library", "sceAac", DisableHLEFlags::sceAac},
 	{"sceNetAdhocctl_Library"},
 	{"sceNetAdhocDownload_Library"},
 	{"sceNetAdhocDiscover_Library", "sceNetAdhocDiscover", DisableHLEFlags::sceNetAdhocDiscover},

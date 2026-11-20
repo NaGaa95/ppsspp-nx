@@ -48,6 +48,8 @@
 #include "Core/Util/PSARUnpack.h"
 #include "UI/Background.h"
 #include "UI/FirmwareScreen.h"
+#include "UI/GameBootAnimation.h"
+#include "UI/ImposeHome.h"
 #include "UI/GameSettingsScreen.h"
 #include "UI/MemStickScreen.h"
 #include "UI/MiscScreens.h"
@@ -223,6 +225,16 @@ static void BuildPSPSettingsPage(SettingsPage *page) {
 	page->Setting(&g_Config.iTimeFormat);
 	page->Setting(&g_Config.bDayLightSavings);
 	page->Setting(&g_Config.iButtonPreference);
+
+	// How much of PPSSPP looks like the PSP's own system software. The firmware styles take the art
+	// from an installed firmware dump, so they're greyed out without one. (The UI sound theme is on
+	// the audio page.)
+	page->Setting(&g_Config.iHomeScreenStyle).EnabledFunc([] {
+		return ImposeHomeScreen::FirmwareArtAvailable();
+	});
+	page->Setting(&g_Config.bGameBootAnimation).EnabledFunc([] {
+		return GameBootAnimation::Available();
+	});
 }
 
 void BuildSystemSettings(SettingsPage *page, SystemPageState *state) {
@@ -240,7 +252,7 @@ void BuildSystemSettings(SettingsPage *page, SystemPageState *state) {
 	page->Header("Emulation");
 
 	page->Setting(&g_Config.bForceLagSync).Disabled(&g_Config.bAutoFrameSkip).Hint({I18NCat::SYSTEM, "LowLatencyCPUTiming Tip", "Runs emulation in step with real time instead of a frame at a time, for less audio, input and network delay. Uses a little more CPU, and goes back to normal timing when the device is too busy. Previously called \"Force real clock sync\"."});
-	page->Setting(&g_Config.iLockedCPUSpeed);
+	page->Setting(&g_Config.iLockedCPUSpeed).Hint({I18NCat::SYSTEM, "SystemClockSpeed Tip", "Changing the clock speed can affect performance and stability"});
 	page->Setting(&g_Config.bFastMemory).OnChange([](UI::EventParams &e) {
 		OnJitAffectingSetting();
 	});

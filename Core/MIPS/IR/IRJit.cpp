@@ -190,6 +190,27 @@ void IRJit::InvalidateCacheAt(u32 em_address, int length) {
 	g_jitCompileTimes.invalidateNanos += (int64_t)((time_now_fast_ticks() - start) * fast_ticks_to_nanos());
 }
 
+void IRJit::InvalidateChangedBlocks() {
+	const uint64_t start = time_now_fast_ticks();
+	int changed = 0;
+	for (int block_num = 0; block_num < blocks_.GetNumBlocks(); ++block_num) {
+		const JitBlock *block = blocks_.GetBlock(block_num);
+		if (block->IsValid() && block->CodeChanged()) {
+			InvalidateBlock(block_num);
+			changed++;
+		}
+	}
+	const int64_t nanos = (int64_t)((time_now_fast_ticks() - start) * fast_ticks_to_nanos());
+	DEBUG_LOG(Log::JIT, "Checked %d blocks in %.2f ms, %d had changed code", blocks_.GetNumBlocks(), nanos / 1000000.0, changed);
+	changedCodeChecks_++;
+	changedCodeBlocks_ += changed;
+	if (changed) {
+		invalidations_++;
+		invalidatedBlocks_ += changed;
+	}
+	g_jitCompileTimes.invalidateNanos += nanos;
+}
+
 void IRJit::InvalidateBlock(int block_num) {
 	JitBlock *block = blocks_.GetBlock(block_num);
 	// Before Destroy, which forgets the block's address. Blocks linked to it jump straight in.
@@ -279,16 +300,32 @@ void IRJit::BenchmarkCompile() {
 	JitCompileTimes best{};
 	int64_t bestTotal = INT64_MAX;
 	std::vector<IRInst> instructions;
+	// Of the IR the passes made, to tell whether a change to them changed what they make.
+	uint64_t irHash = 0;
+	size_t codeBytes = 0;
+	benchmarking_ = true;
+	// Clearing a full cache is a stall of its own (a game hits it when the code space fills up).
+	int64_t bestClear = INT64_MAX;
 	for (int run = 0; run < RUNS; run++) {
+		const Instant clearStart = Instant::Now();
 		ClearCache();
+		bestClear = std::min(bestClear, clearStart.ElapsedNanos());
 		const JitCompileTimes before = g_jitCompileTimes;
 		for (u32 start : starts) {
 			u32 mipsBytes;
 			if (CompileBlock(start, instructions, mipsBytes) != CompileResult::OK) {
 				ERROR_LOG(Log::JIT, "JIT bench: the cache filled up, stopping");
 				ClearCache();
+				benchmarking_ = false;
 				return;
 			}
+			if (run == 0) {
+				irHash = XXH3_64bits_withSeed(instructions.data(), instructions.size() * sizeof(IRInst), irHash);
+			}
+		}
+		if (run == 0) {
+			// A hash of the code would change with ASLR, which moves the addresses it has in it.
+			codeBytes = TargetCodeBytes();
 		}
 		const JitCompileTimes &after = g_jitCompileTimes;
 		JitCompileTimes t{};
@@ -305,7 +342,25 @@ void IRJit::BenchmarkCompile() {
 			best = t;
 		}
 	}
-	NOTICE_LOG(Log::JIT, "JIT bench: %0.3f ns per timer tick", fast_ticks_to_nanos());
+	benchmarking_ = false;
+
+	// And as games compile, without timing the phases: what reading the clock for them costs.
+	int64_t bestWhole = INT64_MAX;
+	for (int run = 0; run < RUNS; run++) {
+		ClearCache();
+		const Instant start = Instant::Now();
+		for (u32 pc : starts) {
+			u32 mipsBytes;
+			if (CompileBlock(pc, instructions, mipsBytes) != CompileResult::OK) {
+				ERROR_LOG(Log::JIT, "JIT bench: the cache filled up, stopping");
+				ClearCache();
+				return;
+			}
+		}
+		bestWhole = std::min(bestWhole, start.ElapsedNanos());
+	}
+	NOTICE_LOG(Log::JIT, "JIT bench: %0.3f ns per timer tick, IR hash %016llx, %d bytes of code, clearing the cache %0.2f ms", fast_ticks_to_nanos(), (unsigned long long)irHash, (int)codeBytes, bestClear * 1e-6);
+	NOTICE_LOG(Log::JIT, "JIT bench best without the phases: %0.2f ms, %0.2f us/block", bestWhole * 1e-6, bestWhole * 1e-3 / starts.size());
 	NOTICE_LOG(Log::JIT, "JIT bench best: %d blocks, %d MIPS -> %d IR instructions, %0.2f ms, %0.2f us/block (frontend %0.2f, passes %0.2f, backend %0.2f, finalize %0.2f)",
 		(int)starts.size(), (int)best.mipsInstructions, (int)best.irInstructions, bestTotal * 1e-6, bestTotal * 1e-3 / starts.size(),
 		best.frontendNanos * 1e-3 / starts.size(), best.passNanos * 1e-3 / starts.size(), best.backendNanos * 1e-3 / starts.size(), best.finalizeNanos * 1e-3 / starts.size());
@@ -322,13 +377,13 @@ IRJit::CompileResult IRJit::CompileBlock(u32 em_address, std::vector<IRInst> &in
 	_dbg_assert_(compilerEnabled_);
 
 	JitCompileTimes &times = g_jitCompileTimes;
-	frontend_.DoJit(em_address, instructions, mipsBytes);
+	// Each phase ends where the next starts, to read the clock as little as possible.
+	const bool timePhases = benchmarking_ || g_Config.iDebugOverlay == (int)DebugOverlay::JIT_STATS;
+	const uint64_t start = timePhases ? 0 : time_now_fast_ticks();
+	frontend_.DoJit(em_address, instructions, mipsBytes, timePhases);
 	_dbg_assert_(!instructions.empty());
-	times.frontendNanos += frontend_.LastFrontendNanos();
-	times.passNanos += frontend_.LastPassNanos();
 	times.mipsInstructions += mipsBytes / 4;
 	times.irInstructions += instructions.size();
-	// Each phase ends where the next starts, to read the clock as little as possible.
 	const uint64_t backendStart = frontend_.LastEnd();
 	const double nanosPerTick = fast_ticks_to_nanos();
 
@@ -339,27 +394,35 @@ IRJit::CompileResult IRJit::CompileBlock(u32 em_address, std::vector<IRInst> &in
 
 	int block_num = blocks_.AllocateBlock(em_address, mipsBytes, (u32)instructions.size());
 	JitBlock *b = blocks_.GetBlock(block_num);
-	if (mipsTracer.tracing_enabled) {
-		// Hash, then only update page stats, don't link yet.
-		// TODO: Should we always hash?  Then we can reuse blocks.
-		b->UpdateHash();
-	}
+	// For the tracer, and so InvalidateChangedBlocks() can tell the code was overwritten.
+	b->UpdateHash();
 
 	// Caller handles a full arena or code space.
 	const CompileResult result = CompileTargetBlock(block_num, instructions);
-	const uint64_t finalizeStart = time_now_fast_ticks();
-	const int64_t backendNanos = (int64_t)((finalizeStart - backendStart) * nanosPerTick);
-	times.backendNanos += backendNanos;
+	const uint64_t finalizeStart = timePhases ? time_now_fast_ticks() : 0;
+	if (result == CompileResult::OK) {
+		// Updates stats, also enters the block in the block shadow.
+		blocks_.FinalizeBlock(block_num);
+		FinalizeTargetBlock(block_num);
+	}
+	const uint64_t end = time_now_fast_ticks();
+	int64_t blockNanos;
+	if (timePhases) {
+		const int64_t backendNanos = (int64_t)((finalizeStart - backendStart) * nanosPerTick);
+		const int64_t finalizeNanos = (int64_t)((end - finalizeStart) * nanosPerTick);
+		times.frontendNanos += frontend_.LastFrontendNanos();
+		times.passNanos += frontend_.LastPassNanos();
+		times.backendNanos += backendNanos;
+		times.finalizeNanos += finalizeNanos;
+		times.phaseBlocks++;
+		blockNanos = frontend_.LastFrontendNanos() + frontend_.LastPassNanos() + backendNanos + finalizeNanos;
+	} else {
+		blockNanos = (int64_t)((end - start) * nanosPerTick);
+		times.unphasedNanos += blockNanos;
+	}
 	if (result != CompileResult::OK)
 		return result;
-
-	// Updates stats, also enters the block in the block shadow.
-	blocks_.FinalizeBlock(block_num);
-	FinalizeTargetBlock(block_num);
-	const int64_t finalizeNanos = (int64_t)((time_now_fast_ticks() - finalizeStart) * nanosPerTick);
-	times.finalizeNanos += finalizeNanos;
 	times.blocks++;
-	const int64_t blockNanos = frontend_.LastFrontendNanos() + frontend_.LastPassNanos() + backendNanos + finalizeNanos;
 	times.maxBlockNanos = std::max(times.maxBlockNanos, blockNanos);
 	return CompileResult::OK;
 }
@@ -396,6 +459,8 @@ void IRJit::GetStats(JitStats *stats) const {
 	stats->codeFullClears = codeFullClears_;
 	stats->invalidations = invalidations_;
 	stats->invalidatedBlocks = invalidatedBlocks_;
+	stats->changedCodeChecks = changedCodeChecks_;
+	stats->changedCodeBlocks = changedCodeBlocks_;
 }
 
 int IRInterpreterJit::GetBlockCodeSize(int block_num) const {
@@ -452,6 +517,11 @@ inline void IRInterpreterJit::RunBlocksUntilDowncount() {
 				return;
 			}
 		} else {
+			// The shadow lookup folds mirror bits, so a bad pc can land here.
+			if (!mips->space->IsValid4AlignedAddress(mips->pc)) {
+				Core_ExecException(mips->pc, mips->pc, ExecExceptionType::JUMP);
+				return;
+			}
 			RestoreHostRoundingMode();
 #ifdef _DEBUG
 			compilerEnabled_ = true;

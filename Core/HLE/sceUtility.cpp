@@ -208,6 +208,21 @@ static void NotifyLoadStatusMp3(int state, u32 loadAddr, u32 totalSize) {
 	LoadFirmwareModules(0x304, "sceMp3", DisableHLEFlags::sceMp3, modules, ARRAY_SIZE(modules));
 }
 
+// libaac.prx imports the same as libmp3.prx: the kernel and sceAudiocodec.
+static void NotifyLoadStatusAac(int state, u32 loadAddr, u32 totalSize) {
+	if (state == -1) {
+		UnloadFirmwareModules(0x306);
+		return;
+	}
+	if (state != 1 || !(GetEffectiveDisableHLEFlags() & DisableHLEFlags::sceAac)) {
+		return;
+	}
+	static const FirmwareModule modules[] = {
+		{ "flash0:/kd/libaac.prx", "sceAac_Library" },
+	};
+	LoadFirmwareModules(0x306, "sceAac", DisableHLEFlags::sceAac, modules, ARRAY_SIZE(modules));
+}
+
 static void NotifyLoadStatusAvcodec(int state, u32 loadAddr, u32 totalSize) {
 	JpegNotifyLoadStatus(state);
 }
@@ -286,6 +301,7 @@ static DisableHLEFlags UtilityModuleLibraryFlag(u32 module) {
 	case 0x302: return DisableHLEFlags::sceAtrac;    // av_atrac3plus
 	case 0x303: return DisableHLEFlags::sceMpeg;     // av_mpegbase
 	case 0x304: return DisableHLEFlags::sceMp3;      // av_mp3
+	case 0x306: return DisableHLEFlags::sceAac;      // av_aac
 	case 0x308: return DisableHLEFlags::sceMp4;      // av_mp4
 	default: return (DisableHLEFlags)0;
 	}
@@ -320,7 +336,7 @@ static const ModuleLoadInfo moduleLoadInfo[] = {
 	ModuleLoadInfo(0x303, 0x0000c000, "av_mpegbase", mpegBaseModuleDeps, &NotifyLoadStatusMpegBase),
 	ModuleLoadInfo(0x304, 0x00004000, "av_mp3", &NotifyLoadStatusMp3),
 	ModuleLoadInfo(0x305, 0x0000a300, "av_vaudio"),
-	ModuleLoadInfo(0x306, 0x00004000, "av_aac"),
+	ModuleLoadInfo(0x306, 0x00004000, "av_aac", &NotifyLoadStatusAac),
 	ModuleLoadInfo(0x307, 0x00000000, "av_g729"),
 	ModuleLoadInfo(0x308, 0x0003c000, "av_mp4", mp4ModuleDeps, &NotifyLoadStatusMp4),
 	ModuleLoadInfo(0x3fe, 0x00000000, "me_stuff"),
@@ -365,7 +381,8 @@ static void CleanupDialogThreads(bool force = false) {
 			accessThread = nullptr;
 			accessThreadState = "cleaned up";
 		} else if (force) {
-			ERROR_LOG_REPORT(Log::sceUtility, "Utility access thread still running, state: %s, dialog=%d/%d", accessThreadState, (int)currentDialogType, currentDialogActive);
+			// Expected with MsgDialogAutoStatus (Ghost Recon: Predator), where the next dialog can start during a shutdown.
+			WARN_LOG(Log::sceUtility, "Utility access thread still running, state: %s, dialog=%d/%d", accessThreadState, (int)currentDialogType, currentDialogActive);
 
 			// Try to force shutdown anyway.
 			accessThread->Terminate();
@@ -1197,8 +1214,8 @@ static int sceUtilityGetNetParam(int id, int param, u32 dataAddr) {
 	}
 
 	if (!g_netApctlInited) {
-		// Is this allowed?
-		WARN_LOG_REPORT_ONCE(getnetparam_early, Log::sceNet, "sceUtilityGetNetParam called before initializing netApctl!");
+		// Is this allowed? It does seem so, it's done by the XMB, and X-Men and Marvel games.
+		WARN_LOG(Log::sceNet, "sceUtilityGetNetParam called before initializing netApctl!");
 	}
 
 	// TODO: Replace the temporary netApctlInfo with netConfInfo, since some of netApctlInfo contents supposed to be taken from netConfInfo during ApctlInit, while sceUtilityGetNetParam can be used before Apctl Initialized

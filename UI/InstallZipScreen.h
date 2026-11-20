@@ -39,7 +39,7 @@ public:
 
 protected:
 	void BeforeCreateViews() override;
-	void CreateSettingsViews(UI::ViewGroup *parent) override;
+	void CreateSettingsViews(UI::ViewGroup *parent, bool inPopup) override;
 	void CreateContentViews(UI::ViewGroup *parent) override;
 	std::string_view GetTitle() const override;
 	ViewLayoutMode LayoutMode() const override {
@@ -63,6 +63,7 @@ private:
 	ZipFileInfo zipFileInfo_{};
 	bool returnToHomebrew_ = true;
 	bool installStarted_ = false;
+	bool installRefreshed_ = false;  // Cached info about what the install replaced has been dropped.
 	bool deleteZipFile_ = false;
 };
 

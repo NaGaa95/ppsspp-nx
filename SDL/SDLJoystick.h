@@ -19,9 +19,13 @@ public:
 	void releaseRightStickFaceButtons();
 #endif
 
+	// Call before the config loads.
+	static void RemapLegacyAxisMappings();
+
 private:
 	void setUpController(SDL_JoystickID deviceID);
 	void setUpControllers();
+	static InputAxis getAxisForGamepadAxis(SDL_GamepadAxis axis);
 	int getDeviceIndex(int instanceId);
 	void releaseAllKeys();
 #if PPSSPP_PLATFORM(SWITCH)

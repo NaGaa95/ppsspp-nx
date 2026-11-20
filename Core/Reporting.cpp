@@ -25,6 +25,8 @@
 #include <set>
 #include <cstdlib>
 #include <cstdarg>
+#include <cstring>
+#include <memory>
 
 // for crc32
 extern "C" {
@@ -38,6 +40,7 @@ extern "C" {
 #include "Common/Serialize/SerializeFuncs.h"
 #include "Common/StringUtils.h"
 #include "Common/System/OSD.h"
+#include "Common/System/System.h"
 #include "Common/Data/Text/I18n.h"
 #include "Common/Net/HTTPClient.h"
 #include "Common/Net/Resolve.h"
@@ -56,8 +59,10 @@ extern "C" {
 #include "Core/FileSystems/MetaFileSystem.h"
 #include "Core/HLE/Plugins.h"
 #include "Core/HLE/sceKernelMemory.h"
+#include "Core/HLE/sceKernelModule.h"
 #include "Core/HLE/scePower.h"
 #include "Core/HW/Display.h"
+#include "Core/Util/PSARUnpack.h"
 #include "GPU/GPUCommon.h"
 #include "GPU/GPUState.h"
 
@@ -424,9 +429,42 @@ namespace Reporting
 		return disc_id + "_" + disc_version;
 	}
 
+	// The container the game image is in, from its header: "cso", "chd", "pbp" or "iso". Empty for
+	// a directory. Cached, since it only changes with the game.
+	static std::string DiscContainer(const Path &path) {
+		static std::mutex cacheLock;
+		static Path cachedPath;
+		static std::string cachedContainer;
+
+		std::lock_guard<std::mutex> guard(cacheLock);
+		if (path == cachedPath) {
+			return cachedContainer;
+		}
+		cachedPath = path;
+		cachedContainer.clear();
+
+		std::unique_ptr<FileLoader> loader(ConstructFileLoader(path));
+		char header[8]{};
+		if (!loader || !loader->Exists() || loader->IsDirectory() || loader->ReadAt(0, 1, 8, header) != 8) {
+			return cachedContainer;
+		}
+		if (!memcmp(header, "CISO", 4)) {
+			cachedContainer = "cso";
+		} else if (!memcmp(header, "MComprHD", 8)) {
+			cachedContainer = "chd";
+		} else if (!memcmp(header, "\0PBP", 4)) {
+			cachedContainer = "pbp";
+		} else {
+			cachedContainer = "iso";
+		}
+		return cachedContainer;
+	}
+
 	void AddGameInfo(UrlEncoder &postdata)
 	{
 		postdata.Add("game", CurrentGameID());
+		postdata.Add("file_type", IdentifiedFileTypeToString(PSP_CoreParameter().fileType));
+		postdata.Add("disc_container", DiscContainer(PSP_CoreParameter().fileToStart));
 		postdata.Add("game_title", StripTrailingNull(g_paramSFO.GetValueString("TITLE")));
 		postdata.Add("sdkver", sceKernelGetCompiledSdkVersion());
 		postdata.Add("module_name", lastModuleName);
@@ -445,6 +483,20 @@ namespace Reporting
 		postdata.Add("gpu_full", gpuFull);
 		postdata.Add("cpu", cpu_info.Summarize());
 		postdata.Add("platform", GetPlatformIdentifer());
+#if PPSSPP_PLATFORM(ANDROID)
+		// On Android, SYSPROP_NAME is the device: "MANUFACTURER:MODEL".
+		postdata.Add("os", StringFromFormat("Android API %d", (int)System_GetPropertyInt(SYSPROP_SYSTEMVERSION)));
+		postdata.Add("device_model", System_GetProperty(SYSPROP_NAME));
+#else
+		postdata.Add("os", System_GetProperty(SYSPROP_NAME));
+		postdata.Add("device_model", System_GetProperty(SYSPROP_DEVICE_MODEL));
+#endif
+		postdata.Add("os_build", System_GetProperty(SYSPROP_SYSTEMBUILD));
+
+		// Empty when there's no full firmware install (nothing, or just fonts pulled off a disc).
+		InstalledFirmwareInfo firmware;
+		ReadInstalledFirmwareInfo(g_Config.nandRootDirectory, &firmware, false);
+		postdata.Add("firmware", firmware.version);
 	}
 
 	void AddConfigInfo(UrlEncoder &postdata)
@@ -458,8 +510,11 @@ namespace Reporting
 	void AddGameplayInfo(UrlEncoder &postdata)
 	{
 		// Just to get an idea of how long they played.
-		if (PSP_GetBootState() == BootState::Complete)
+		if (PSP_GetBootState() == BootState::Complete) {
 			postdata.Add("ticks", (const uint64_t)CoreTiming::GetTicks(currentMIPS));
+			// Emulated seconds. Ticks alone don't say this, since games change the CPU clock.
+			postdata.Add("seconds_played", (double)CoreTiming::PeekGlobalTimeUs() / 1000000.0);
+		}
 
 		float vps, fps;
 		__DisplayGetAveragedFPS(&vps, &fps);
@@ -552,7 +607,7 @@ namespace Reporting
 		return false;
 #endif
 		// Disabled when using certain hacks, because they make for poor reports.
-		if (CheatsInEffect() || HLEPlugins::HasEnabled())
+		if (CheatsOrPluginsInEffect())
 			return false;
 		if (GetLockedCPUSpeedMhz() != 0)
 			return false;
@@ -565,6 +620,10 @@ namespace Reporting
 		// The problem is, these aren't useful because the hashes end up different for different people.
 		// TODO: Should really hash the ELF instead of the path, but then that affects savestates/cheats.
 		if (PSP_GetBootState() == BootState::Complete && g_paramSFO.GetValueString("DISC_VERSION").empty())
+			return false;
+		// Firmware updaters only run far enough to crash: their VSH libraries want memory partitions a
+		// game boot doesn't set up. They're for installing the firmware (InstallUpdateScreen), not running.
+		if (PSP_GetBootState() != BootState::Off && g_paramSFO.GetValueString("DISC_ID") == "MSTKUPDATE")
 			return false;
 
 		return !everUnsupported;
@@ -642,12 +701,22 @@ namespace Reporting
 		return !IsEnabled() && IsSupported();
 	}
 
-	void ReportCrash(const MIPSExceptionInfo &info, bool userRequested) {
-		if (userRequested ? !CanReportCrashManually() : !MessageAllowed()) {
-			return;
-		}
+	bool CheatsOrPluginsInEffect() {
+		return CheatsInEffect() || HLEPlugins::HasEnabled();
+	}
 
-		// The message is what the server groups reports by, so the details only go in the value.
+	bool CrashReportsOff() {
+		// The VSH crashes too often for its reports to be worth having.
+		return __KernelIsRunningVSH();
+	}
+
+	// Crashes reported this run, by game ID and formatted crash. Resuming, resetting or loading a
+	// state often runs straight back into the same crash, which the server doesn't need twice.
+	static std::mutex reportedCrashesLock;
+	static std::set<std::string> reportedCrashes;
+
+	// The message is what the server groups reports by, so the details only go in formatted.
+	static bool FormatCrash(const MIPSExceptionInfo &info, const char **outMessage, std::string *outFormatted) {
 		const char *message = nullptr;
 		char formatted[1024];
 		switch (info.type) {
@@ -672,7 +741,43 @@ namespace Reporting
 			snprintf(formatted, sizeof(formatted), message, info.info.c_str(), info.pc, info.ra);
 			break;
 		default:
+			return false;
+		}
+		*outMessage = message;
+		*outFormatted = formatted;
+		return true;
+	}
+
+	static std::string CrashKey(const std::string &formatted) {
+		return CurrentGameID() + " " + formatted;
+	}
+
+	bool CrashAlreadyReported(const MIPSExceptionInfo &info) {
+		const char *message;
+		std::string formatted;
+		if (!FormatCrash(info, &message, &formatted)) {
+			return false;
+		}
+		std::lock_guard<std::mutex> guard(reportedCrashesLock);
+		return reportedCrashes.count(CrashKey(formatted)) != 0;
+	}
+
+	void ReportCrash(const MIPSExceptionInfo &info, bool userRequested) {
+		// Checked directly too: currentSupported, which MessageAllowed() relies on, can be stale.
+		if (CrashReportsOff() || CheatsOrPluginsInEffect() || (userRequested ? !CanReportCrashManually() : !MessageAllowed())) {
 			return;
+		}
+
+		const char *message;
+		std::string formatted;
+		if (!FormatCrash(info, &message, &formatted)) {
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> guard(reportedCrashesLock);
+			if (!reportedCrashes.insert(CrashKey(formatted)).second) {
+				return;
+			}
 		}
 
 		std::string value = formatted;
