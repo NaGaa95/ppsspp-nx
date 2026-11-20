@@ -56,6 +56,8 @@ constexpr unsigned IMAGE_DESCRIPTORS = 65536;
 constexpr unsigned SAMPLER_DESCRIPTORS = 1024;
 constexpr uint32_t UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024;
 constexpr uint32_t COMMAND_CHUNK_SIZE = 1024 * 1024;
+// Readbacks reuse one CPU-cached buffer up to this size (reading uncached memory is slow); a larger one is made per call.
+constexpr uint32_t READBACK_KEEP_SIZE = 16 * 1024 * 1024;
 constexpr uint32_t SCRATCH_PER_WARP = 32 * 1024;
 constexpr uint32_t TEXTURE_SLAB_SIZE = 2 * 1024 * 1024;
 constexpr uint32_t SHADER_SLAB_SIZE = 1024 * 1024;
@@ -452,6 +454,7 @@ private:
 	void ReclaimMemory();
 	void TrimFrameMemory(Frame &frame);
 	bool EnsureSwapchain();
+	dk::MemBlock ReadbackBuffer(uint32_t bytes, dk::UniqueMemBlock &temporary);
 	bool Apply();
 	Image *Color(Framebuffer *fbo);
 	Image *DepthImage(Framebuffer *fbo);
@@ -462,6 +465,7 @@ private:
 	unsigned frameIndex_ = 0;
 	int frameCount_ = 0;
 	bool reportedQueueFault_ = false;
+	dk::UniqueMemBlock readback_;
 	int swapchainRetryFrame_ = -1;
 	bool active_ = false, stateDirty_ = true, depthClamp_ = false;
 	bool resourcesStopped_ = false;
@@ -718,6 +722,20 @@ bool Context::EnsureSwapchain() {
 	}
 	stateDirty_ = true;
 	return true;
+}
+
+// The readback buffer (CPU cached). Readbacks wait for the GPU, so it is free again once they return.
+dk::MemBlock Context::ReadbackBuffer(uint32_t bytes, dk::UniqueMemBlock &temporary) {
+	constexpr uint32_t flags = DkMemBlockFlags_CpuCached | DkMemBlockFlags_GpuCached;
+	if (bytes > READBACK_KEEP_SIZE) {
+		temporary = AllocateOrReclaim(bytes, flags, "readback");
+		return temporary;
+	}
+	if (!readback_ || dkMemBlockGetSize(readback_) < bytes) {
+		readback_ = nullptr;
+		readback_ = AllocateOrReclaim(std::max<uint32_t>(Align(bytes, DK_MEMBLOCK_ALIGNMENT), 1024 * 1024), flags, "readback");
+	}
+	return readback_;
 }
 
 void Context::BeginFrame(DebugFlags flags) {
@@ -1910,7 +1928,8 @@ bool Context::ReadTexture(Texture *texture, int level, void *pixels, int stride)
 	if (stride < w * bpp) {
 		return false;
 	}
-	auto memory = device_->Allocate(w * h * bpp, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "texture readback");
+	dk::UniqueMemBlock temporary;
+	dk::MemBlock memory = ReadbackBuffer(w * h * bpp, temporary);
 	if (!memory) {
 		return false;
 	}
@@ -1922,6 +1941,7 @@ bool Context::ReadTexture(Texture *texture, int level, void *pixels, int stride)
 	Commands().barrier(DkBarrier_Primitives, DkInvalidateFlags_Image);
 	Commands().copyImageToBuffer(view, region, buffer);
 	Submit(true);
+	armDCacheFlush(memory.getCpuAddr(), w * h * bpp);
 	for (int row = 0; row < h; ++row) {
 		memcpy((uint8_t *)pixels + row * stride, (uint8_t *)memory.getCpuAddr() + row * w * bpp, w * bpp);
 	}
@@ -2299,7 +2319,8 @@ bool Context::CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, int x, in
 	if (!source || x + w > source->Width() || y + h > source->Height()) {
 		return false;
 	}
-	auto readback = device_->Allocate(w * h * 4, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "framebuffer readback");
+	dk::UniqueMemBlock temporary;
+	dk::MemBlock readback = ReadbackBuffer(w * h * 4, temporary);
 	if (!readback) {
 		return false;
 	}
@@ -2308,6 +2329,7 @@ bool Context::CopyFramebufferToMemory(Framebuffer *src, Aspect aspect, int x, in
 	Commands().barrier(DkBarrier_Primitives, DkInvalidateFlags_Image);
 	Commands().copyImageToBuffer(source->view, region, buffer);
 	Submit(true);
+	armDCacheFlush(readback.getCpuAddr(), w * h * 4);
 	const uint8_t *data = (const uint8_t *)readback.getCpuAddr();
 	if (aspect == Aspect::COLOR_BIT) {
 		ConvertFromRGBA8888((uint8_t *)pixels, data, stride, w, w, h, format);
