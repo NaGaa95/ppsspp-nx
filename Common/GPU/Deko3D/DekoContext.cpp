@@ -1803,7 +1803,8 @@ bool Context::Apply() {
 }
 
 void Context::SetScissorRect(int x, int y, int w, int h) {
-	DkScissor scissor{(uint32_t)std::max(0, x), (uint32_t)std::max(0, y), (uint32_t)std::max(0, w), (uint32_t)std::max(0, h)};
+	const int left = std::max(0, x), top = std::max(0, y);
+	DkScissor scissor{(uint32_t)left, (uint32_t)top, (uint32_t)std::max(0, w - (left - x)), (uint32_t)std::max(0, h - (top - y))};
 	scissor_ = scissor;
 	Commands().setScissors(0, scissor);
 }
