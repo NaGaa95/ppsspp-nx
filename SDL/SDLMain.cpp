@@ -96,6 +96,7 @@ SDLJoystick *joystick = NULL;
 
 #if PPSSPP_PLATFORM(SWITCH)
 #include <switch.h>
+#include "SDL/SwitchAudio.h"
 #include "Common/GPU/Vulkan/SwitchLSFG.h"
 #include "Common/GPU/Deko3D/DekoContext.h"
 #include "UI/SwitchForwarderInstaller.h"
@@ -793,6 +794,14 @@ static void PollSDLMicrophone() {
 
 // Must be called after NativeInit().
 static void InitSDLAudioDevice(const std::string &name = "") {
+#if PPSSPP_PLATFORM(SWITCH)
+	// audout keeps less audio queued than devkitPro's SDL driver, the fallback.
+	g_retFmt = { SDL_AUDIO_S16, 2, SwitchAudio::kSampleRate };
+	g_audioFramesPerBuffer = SwitchAudio::kPeriodFrames;
+	if (SwitchAudio::Start()) {
+		return;
+	}
+#endif
 	SDL_AudioSpec fmt{};
 	fmt.freq = g_sampleRate;
 	fmt.format = SDL_AUDIO_S16;
@@ -878,6 +887,9 @@ static void InitSDLAudioDevice(const std::string &name = "") {
 }
 
 static void StopSDLAudioDevice() {
+#if PPSSPP_PLATFORM(SWITCH)
+	SwitchAudio::Stop();
+#endif
 	if (audioStream) {
 		SDL_DestroyAudioStream(audioStream);
 		audioStream = nullptr;

@@ -1203,7 +1203,7 @@ else()
 			UI/SwitchUpdate.h
 			UI/SwitchUpdateRelease.h
 			UI/SwitchUpdate.cpp)
-		list(APPEND targetExtra SDL/SwitchLauncher.h SDL/SwitchLauncher.cpp SDL/SwitchText.h SDL/SwitchText.cpp SDL/SwitchTextDrawer.h SDL/SwitchTextDrawer.cpp)
+		list(APPEND targetExtra SDL/SwitchAudio.h SDL/SwitchAudio.cpp SDL/SwitchLauncher.h SDL/SwitchLauncher.cpp SDL/SwitchText.h SDL/SwitchText.cpp SDL/SwitchTextDrawer.h SDL/SwitchTextDrawer.cpp)
 		set_property(SOURCE SDL/SDLMain.cpp SDL/SwitchLauncher.cpp SDL/SwitchText.cpp UI/SwitchUpdate.cpp UI/SwitchForwarderScreen.cpp APPEND PROPERTY COMPILE_DEFINITIONS PPSSPP_SWITCH_SDL_LAUNCHER)
 		find_package(PkgConfig REQUIRED)
 		pkg_check_modules(SWITCH_TEXT REQUIRED IMPORTED_TARGET freetype2 harfbuzz fribidi)
