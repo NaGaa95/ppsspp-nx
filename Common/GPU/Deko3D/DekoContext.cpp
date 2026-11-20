@@ -2004,6 +2004,8 @@ void Context::DrawIndexed(int count, int offset) {
 
 void Context::DrawIndexedClippedBatchUP(const void *vertices, int vertexCount, const void *indices, int indexCount,
 										Slice<ClippedDraw> draws, const void *uniforms, size_t size) {
+	Upload vertexUpload{}, indexUpload{};
+	int vertexStride = 0;
 	for (const ClippedDraw &draw : draws) {
 		BindPipeline(draw.pipeline);
 		BindSamplerStates(0, 1, const_cast<SamplerState **>(&draw.samplerState));
@@ -2016,7 +2018,24 @@ void Context::DrawIndexedClippedBatchUP(const void *vertices, int vertexCount, c
 		}
 		UpdateDynamicUniformBuffer(uniforms, size);
 		SetScissorRect(draw.clipx, draw.clipy, draw.clipw, draw.cliph);
-		DrawIndexedUP(vertices, vertexCount, (const uint16_t *)indices + draw.indexOffset, draw.indexCount);
+		if (!Apply()) {
+			continue;
+		}
+		// The draws share the vertices and indices: they are uploaded once (again only for another vertex size).
+		const int stride = pipeline_->layout->desc.stride;
+		if (stride != vertexStride) {
+			vertexStride = stride;
+			vertexUpload = Push(vertices, vertexCount * stride, 16);
+		}
+		if (!indexUpload.cpu) {
+			indexUpload = Push(indices, indexCount * sizeof(uint16_t), 4);
+		}
+		if (!vertexUpload.cpu || !indexUpload.cpu) {
+			return;
+		}
+		Commands().bindVtxBuffer(0, vertexUpload.gpu.addr, vertexUpload.gpu.size);
+		Commands().bindIdxBuffer(DkIdxFormat_Uint16, indexUpload.gpu.addr + draw.indexOffset * sizeof(uint16_t));
+		Commands().drawIndexed(pipeline_->primitive, draw.indexCount, 1, 0, 0, 0);
 	}
 }
 
