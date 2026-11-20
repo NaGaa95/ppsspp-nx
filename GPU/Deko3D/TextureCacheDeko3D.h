@@ -50,6 +50,8 @@ private:
 	std::vector<Draw::ShaderModule *> scalingShaders_;
 	std::vector<TextureScaleScratchDesc> scratchDescs_;
 	std::vector<TextureScaleStageDesc> stageDescs_;
+	// BuildTexture again without scaling or replacement, after running out of GPU memory.
+	bool retryUnscaled_ = false;
 	DrawEngineDeko3D *drawEngine_ = nullptr;
 	std::unordered_map<uint64_t, Draw::SamplerState *> samplerCache_;
 };

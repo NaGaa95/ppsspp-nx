@@ -105,6 +105,9 @@ struct Device {
 								const char *tag = "GPU buffer") {
 		const uint32_t bytes = Align(size, DK_MEMBLOCK_ALIGNMENT);
 		dk::MemBlock block = dk::MemBlockMaker{device, bytes}.setFlags(flags).create();
+		if (!block) {
+			ERROR_LOG(Log::G3D, "deko3d could not allocate %u bytes (%s)", bytes, tag);
+		}
 		return dk::UniqueMemBlock{std::move(block)};
 	}
 };
@@ -300,6 +303,8 @@ struct Frame {
 	size_t commandChunk = 0;
 	std::vector<dk::UniqueMemBlock> uploadMemory;
 	size_t uploadChunk = 0;
+	// The most chunks used since the last trim (TrimFrameMemory).
+	size_t commandPeak = 1, uploadPeak = 1;
 	uint32_t uploadOffset = 0;
 	dk::UniqueMemBlock descriptors;
 	uint32_t imageCount = 0, samplerCount = 0;
@@ -443,6 +448,10 @@ private:
 	void UpdateFrameGeneration();
 	bool PresentImage(const DkImage &image, uint32_t width, uint32_t height);
 	bool ReportQueueFault(const char *operation);
+	dk::UniqueMemBlock AllocateOrReclaim(uint32_t size, uint32_t flags, const char *tag);
+	void ReclaimMemory();
+	void TrimFrameMemory(Frame &frame);
+	bool EnsureSwapchain();
 	bool Apply();
 	Image *Color(Framebuffer *fbo);
 	Image *DepthImage(Framebuffer *fbo);
@@ -453,6 +462,7 @@ private:
 	unsigned frameIndex_ = 0;
 	int frameCount_ = 0;
 	bool reportedQueueFault_ = false;
+	int swapchainRetryFrame_ = -1;
 	bool active_ = false, stateDirty_ = true, depthClamp_ = false;
 	bool resourcesStopped_ = false;
 	bool glslangInitialized_ = false;
@@ -630,14 +640,84 @@ void Context::GrowCommands(void *user, DkCmdBuf buffer, size_t minimum) {
 	Frame &frame = context->Current();
 	++frame.commandChunk;
 	if (frame.commandChunk >= frame.commandMemory.size()) {
-		frame.commandMemory.push_back(
-			context->device_->Allocate(std::max(COMMAND_CHUNK_SIZE, Align((uint32_t)minimum, DK_MEMBLOCK_ALIGNMENT)),
-									   DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "command buffer"));
+		dk::UniqueMemBlock memory = context->AllocateOrReclaim(std::max(COMMAND_CHUNK_SIZE, Align((uint32_t)minimum, DK_MEMBLOCK_ALIGNMENT)),
+															  DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "command buffer");
+		if (!memory) {
+			// deko3d cannot record further. (Not kept, so a later frame tries again.)
+			--frame.commandChunk;
+			return;
+		}
+		frame.commandMemory.push_back(std::move(memory));
 	}
+	frame.commandPeak = std::max(frame.commandPeak, frame.commandChunk + 1);
 	auto &memory = frame.commandMemory[frame.commandChunk];
-	if (memory) {
-		dkCmdBufAddMemory(buffer, memory, 0, dkMemBlockGetSize(memory));
+	dkCmdBufAddMemory(buffer, memory, 0, dkMemBlockGetSize(memory));
+}
+
+dk::UniqueMemBlock Context::AllocateOrReclaim(uint32_t size, uint32_t flags, const char *tag) {
+	dk::UniqueMemBlock block = device_->Allocate(size, flags, tag);
+	if (!block) {
+		ReclaimMemory();
+		block = device_->Allocate(size, flags, tag);
 	}
+	// (UniqueHandle has no move constructor of its own: it takes over the handle)
+	return dk::UniqueMemBlock{static_cast<dk::MemBlock &&>(block)};
+}
+
+// After a failed allocation: free now what the GPU is done with, instead of when its frame slot comes back.
+void Context::ReclaimMemory() {
+	for (unsigned i = 0; i < FRAME_COUNT; ++i) {
+		Frame &frame = frames_[i];
+		const bool current = i == frameIndex_;
+		if (!current) {
+			if (frame.submitted) {
+				if (dkFenceWait(&frame.fence, 0) != DkResult_Success) {
+					continue;
+				}
+				frame.submitted = false;
+			}
+			frame.retired.clear();
+		}
+		// The chunks past those the frame is using (all but the first of an idle frame).
+		const size_t uploads = current ? frame.uploadChunk + 1 : 1, commands = current ? frame.commandChunk + 1 : 1;
+		if (frame.uploadMemory.size() > uploads) {
+			frame.uploadMemory.resize(uploads);
+		}
+		if (frame.commandMemory.size() > commands) {
+			frame.commandMemory.resize(commands);
+		}
+	}
+	device_->texturePool.TrimEmpty();
+	WARN_LOG(Log::G3D, "deko3d ran out of memory: freed idle GPU memory");
+}
+
+// Upload and command chunks a frame slot has not needed since the last trim (a scene load or a large upload added them).
+void Context::TrimFrameMemory(Frame &frame) {
+	if (frame.uploadMemory.size() > frame.uploadPeak) {
+		frame.uploadMemory.resize(frame.uploadPeak);
+	}
+	if (frame.commandMemory.size() > frame.commandPeak) {
+		frame.commandMemory.resize(frame.commandPeak);
+	}
+	frame.uploadPeak = frame.commandPeak = 1;
+}
+
+// A swapchain that could not be made (out of memory on a resize) is tried again once per frame.
+bool Context::EnsureSwapchain() {
+	if (swapchain_) {
+		return true;
+	}
+	if (swapchainRetryFrame_ == frameCount_) {
+		return false;
+	}
+	swapchainRetryFrame_ = frameCount_;
+	std::string error;
+	if (!Swapchain(&error)) {
+		ERROR_LOG(Log::G3D, "%s", error.c_str());
+		return false;
+	}
+	stateDirty_ = true;
+	return true;
 }
 
 void Context::BeginFrame(DebugFlags flags) {
@@ -655,6 +735,10 @@ void Context::BeginFrame(DebugFlags flags) {
 	frame.retired.clear();
 	if ((frameCount_ & 63) == 0) {
 		device_->texturePool.TrimEmpty();
+	}
+	// Each frame slot once every 1024 frames.
+	if ((frameCount_ & 1023) < (int)FRAME_COUNT) {
+		TrimFrameMemory(frame);
 	}
 	frame.commands.clear();
 	resourceBindings_.Invalidate();
@@ -680,21 +764,20 @@ Upload Context::Allocate(uint32_t size, uint32_t alignment) {
 	Frame &frame = Current();
 	frame.uploadOffset = Align(frame.uploadOffset, alignment);
 	if (frame.uploadChunk >= frame.uploadMemory.size()) {
-		frame.uploadMemory.push_back(device_->Allocate(std::max(UPLOAD_CHUNK_SIZE, Align(size, DK_MEMBLOCK_ALIGNMENT)),
-													   DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "upload chunk"));
+		dk::UniqueMemBlock block = AllocateOrReclaim(std::max(UPLOAD_CHUNK_SIZE, Align(size, DK_MEMBLOCK_ALIGNMENT)),
+													 DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "upload chunk");
+		if (!block) {
+			return {};
+		}
+		frame.uploadMemory.push_back(std::move(block));
 	}
-	if (!frame.uploadMemory[frame.uploadChunk]) {
-		return {};
-	}
+	frame.uploadPeak = std::max(frame.uploadPeak, frame.uploadChunk + 1);
 	if (frame.uploadOffset + size > dkMemBlockGetSize(frame.uploadMemory[frame.uploadChunk])) {
 		++frame.uploadChunk;
 		frame.uploadOffset = 0;
 		return Allocate(size, alignment);
 	}
 	auto &block = frame.uploadMemory[frame.uploadChunk];
-	if (!block) {
-		return {};
-	}
 	Upload result{{block.getGpuAddr() + frame.uploadOffset, size}, (uint8_t *)block.getCpuAddr() + frame.uploadOffset};
 	frame.uploadOffset += size;
 	return result;
@@ -940,6 +1023,9 @@ bool Context::PresentImage(const DkImage &image, uint32_t width, uint32_t height
 		return false;
 	}
 	if (acquired_ < 0) {
+		if (!EnsureSwapchain()) {
+			return false;
+		}
 		acquired_ = device_->queue.acquireImage(swapchain_);
 	}
 	if (acquired_ < 0 || acquired_ >= (int)backbuffers_.size()) {
@@ -1012,11 +1098,15 @@ void Context::Present(PresentMode mode) {
 #else
 		swapchain_.setSwapInterval(generated || mode == PresentMode::FIFO ? 1 : 0);
 #endif
-		if (generated && !PresentImage(*frameGenerator_->GeneratedImage(), generatedDisplay_->Width(), generatedDisplay_->Height())) {
-			return;
-		}
-		if (!PresentImage(generatedDisplay_->image, generatedDisplay_->Width(), generatedDisplay_->Height())) {
-			return;
+		bool presented = !generated || PresentImage(*frameGenerator_->GeneratedImage(), generatedDisplay_->Width(), generatedDisplay_->Height());
+		presented = presented && PresentImage(generatedDisplay_->image, generatedDisplay_->Width(), generatedDisplay_->Height());
+		if (!presented) {
+			// No image to present to (or a fault): still hand the frame's work to the GPU and end the frame.
+			Submit(false);
+			if (ReportQueueFault("present")) {
+				return;
+			}
+			device_->queue.flush();
 		}
 	} else {
 #if defined(__SWITCH2__)
@@ -1117,15 +1207,15 @@ Texture *Context::CreateImage(const TextureDesc &desc, bool render, bool zeroFil
 	// A 512-byte layout uses a generic mapping. Other layouts can retype whole GPU pages.
 	if (!render && !zeroFill && alignment == 512 && size <= TEXTURE_SLAB_SIZE / 2) {
 		texture->pooledMemory = device_->texturePool.Allocate(size, alignment, TEXTURE_SLAB_SIZE, [&](uint32_t bytes) {
-			return device_->Allocate(bytes, imageFlags, "texture slab");
+			return AllocateOrReclaim(bytes, imageFlags, "texture slab");
 		});
 		if (!texture->pooledMemory) {
 			return nullptr;
 		}
 		texture->image.initialize(layout, texture->pooledMemory.Storage(), texture->pooledMemory.Offset());
 	} else {
-		texture->memory = device_->Allocate(size, imageFlags | (zeroFill ? DkMemBlockFlags_ZeroFillInit : 0),
-										   render ? "render target" : "texture");
+		texture->memory = AllocateOrReclaim(size, imageFlags | (zeroFill ? DkMemBlockFlags_ZeroFillInit : 0),
+											render ? "render target" : "texture");
 		if (!texture->memory) {
 			return nullptr;
 		}
@@ -1940,7 +2030,7 @@ bool Context::Swapchain(std::string *error) {
 		desc.depth = desc.mipLevels = 1;
 		desc.format = DataFormat::R8G8B8A8_UNORM;
 		image->Dimensions(desc);
-		image->memory = device_->Allocate((uint32_t)layout.getSize(), DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, "swapchain image");
+		image->memory = AllocateOrReclaim((uint32_t)layout.getSize(), DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, "swapchain image");
 		if (!image->memory) {
 			image->Release();
 			*error = "Could not allocate deko3d backbuffers";
@@ -1964,6 +2054,11 @@ bool Context::Swapchain(std::string *error) {
 	depth.format = DataFormat::D24_S8;
 	backDepth_.reset(static_cast<Image *>(CreateImage(depth, true)));
 	if (!backDepth_) {
+		// (all or nothing: EnsureSwapchain makes it again)
+		swapchain_ = nullptr;
+		for (auto &image : backbuffers_) {
+			image.reset(nullptr);
+		}
 		*error = "Could not allocate the deko3d depth buffer";
 		return false;
 	}
@@ -2010,7 +2105,7 @@ Image *Context::Color(Framebuffer *framebuffer) {
 		return generatedDisplay_.ptr;
 	}
 	if (acquired_ < 0) {
-		if (ReportQueueFault("acquire")) {
+		if (ReportQueueFault("acquire") || !EnsureSwapchain()) {
 			return nullptr;
 		}
 		acquired_ = device_->queue.acquireImage(swapchain_);
