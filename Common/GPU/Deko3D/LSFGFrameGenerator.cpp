@@ -202,8 +202,14 @@ bool Generator::AllocateImages() {
 		if (image.role == graph::ImageRole::history || image.role == graph::ImageRole::generated) {
 			flags |= DkImageFlags_Usage2DEngine;
 		}
+		// deko3d lays out 6..8 rows with one-gob tiles but describes the image with two, which would reach
+		// into the next image of the pool: ask for the tile of the layout.
+		if (image.extent.height <= 8) {
+			flags |= DkImageFlags_CustomTileSize;
+		}
 		dk::ImageLayoutMaker{services_.device}
 			.setFlags(flags)
+			.setTileSize(DkTileSize_OneGob)
 			.setFormat(ImageFormat(image.format))
 			.setDimensions(image.extent.width, image.extent.height)
 			.initialize(layouts[i]);

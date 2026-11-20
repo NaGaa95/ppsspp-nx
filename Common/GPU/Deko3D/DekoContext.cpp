@@ -1203,7 +1203,8 @@ Texture *Context::CreateImage(const TextureDesc &desc, bool render, bool zeroFil
 	texture->identity = device_->nextImage++;
 	dk::ImageLayout layout;
 	uint32_t flags = 0;
-	if (!DataFormatIsBlockCompressed(desc.format, nullptr)) {
+	const bool compressed = DataFormatIsBlockCompressed(desc.format, nullptr);
+	if (!compressed) {
 		flags |= DkImageFlags_Usage2DEngine;
 	}
 	if (desc.format == DataFormat::R8G8B8A8_UNORM || desc.format == DataFormat::R16G16B16A16_FLOAT) {
@@ -1212,10 +1213,16 @@ Texture *Context::CreateImage(const TextureDesc &desc, bool render, bool zeroFil
 	if (render) {
 		flags |= DkImageFlags_UsageRender | DkImageFlags_HwCompression;
 	}
+	// deko3d lays out 6..8 rows (of blocks) with one-gob tiles but describes the first level with two,
+	// so its descriptor and uploads reach into the next pooled texture. Ask for the tile of the layout.
+	if (desc.depth == 1 && (compressed ? (desc.height + 3) / 4 : desc.height) <= 8) {
+		flags |= DkImageFlags_CustomTileSize;
+	}
 	dk::ImageLayoutMaker{device_->device}
 		.setType(desc.depth > 1 ? DkImageType_3D : DkImageType_2D)
 		.setFlags(flags)
 		.setFormat(Format(desc.format))
+		.setTileSize(DkTileSize_OneGob)
 		.setDimensions(desc.width, desc.height, desc.depth)
 		.setMipLevels(desc.mipLevels)
 		.initialize(layout);
