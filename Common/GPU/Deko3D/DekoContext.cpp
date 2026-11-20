@@ -1334,13 +1334,11 @@ void Context::UpdateTextureLevels(Texture *source, const uint8_t **data, Texture
 		if (!upload.cpu) {
 			return;
 		}
-		if (callback) {
-			if (!callback(upload.cpu, data[level], w, h, d, rowPitch, slicePitch)) {
-				continue;
-			}
-		} else if (data[level]) {
+		// A callback returns false to have the level's data uploaded as it is.
+		const bool written = callback && callback(upload.cpu, data[level], w, h, d, rowPitch, slicePitch);
+		if (!written && data[level]) {
 			memcpy(upload.cpu, data[level], slicePitch * d);
-		} else {
+		} else if (!written) {
 			memset(upload.cpu, 0, slicePitch * d);
 		}
 		DkImageView view = texture->view;
